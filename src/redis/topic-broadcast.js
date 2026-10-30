@@ -56,6 +56,7 @@ import { MAX_REGISTRY_PENDING_REQUESTS } from '../shared/caps.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { openSubscriber } from '../shared/redis-subscriber.js';
+import { defineOptions, interval, option } from '../shared/options.js';
 
 /** Relay message kinds (the `k` field on every envelope). */
 const KIND_REQUEST = 'treq';
@@ -90,6 +91,22 @@ function positive(v, fallback) {
  * @property {(err: unknown) => void} [onError] - Observe a relay-subscriber failure (the subscriber tears down so a later broadcast re-subscribes).
  */
 
+const validateOptions = defineOptions({
+	factory: 'createTopicBroadcast',
+	label: 'topic-broadcast',
+	types: 'TopicBroadcastOptions in redis/topic-broadcast.d.ts'
+}, {
+	keyPrefix: option.known,
+	// Both pace a timer: the presence refresh and the per-request deadline.
+	heartbeat: interval({ min: 0, exclusiveMin: true }),
+	requestTimeoutMs: interval({ min: 0, exclusiveMin: true }),
+	presenceTtlMs: option.positiveNumber,
+	maxEnvelopeBytes: option.known,
+	breaker: option.collaborator,
+	metrics: option.collaborator,
+	onError: option.function
+});
+
 /**
  * Create the topic-broadcast cluster coordinator. Attach it to the platform the
  * way the other Redis plugins are wired (`platform.topicBroadcast =
@@ -115,6 +132,7 @@ function positive(v, fallback) {
  * ```
  */
 export function createTopicBroadcast(client, options = {}) {
+	validateOptions(options);
 	const redis = client.redis;
 	const instanceId = randomBytes(8).toString('hex');
 	// Stacks on the client's own keyPrefix (mirrors the connection registry) so

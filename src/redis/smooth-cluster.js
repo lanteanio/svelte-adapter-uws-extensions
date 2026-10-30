@@ -67,6 +67,7 @@ import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { openSubscriber } from '../shared/redis-subscriber.js';
 import { guardBreaker } from '../shared/breaker-admission.js';
+import { defineOptions, option } from '../shared/options.js';
 
 /** Relay message kinds (the `k` field on every envelope). */
 const KIND_COMMAND = 'cmd';
@@ -104,6 +105,19 @@ function positive(v, fallback) {
  *   failure (the subscriber tears down so a later relay re-subscribes).
  */
 
+const validateOptions = defineOptions({
+	factory: 'createSmoothCluster',
+	label: 'smooth cluster',
+	types: 'SmoothClusterOptions in redis/smooth-cluster.d.ts'
+}, {
+	// Both are Redis PX lifetimes.
+	leaseMs: option.positiveInteger,
+	snapshotTtlMs: option.positiveInteger,
+	maxEnvelopeBytes: option.known,
+	breaker: option.collaborator,
+	onError: option.function
+});
+
 /**
  * Create the cluster coordinator. Attach it to the platform the same way the
  * other Redis plugins are wired (`platform.smooth = createSmoothCluster(client)`)
@@ -116,6 +130,7 @@ function positive(v, fallback) {
  * @param {SmoothClusterOptions} [options]
  */
 export function createSmoothCluster(client, options = {}) {
+	validateOptions(options);
 	const redis = client.redis;
 	const channel = client.key('smooth:events');
 	const instanceId = randomBytes(8).toString('hex');

@@ -18,6 +18,7 @@
  */
 
 import { evalCached } from '../shared/eval-cached.js';
+import { defineOptions, option } from '../shared/options.js';
 
 /**
  * Lua: refresh the fence's TTL only if our value still owns the key.
@@ -68,6 +69,14 @@ return 0
  * @property {(taskId: string, fence: string) => Promise<void>} release
  */
 
+const validateOptions = defineOptions({
+	factory: 'createRedisFence',
+	label: 'redis fence',
+	types: 'RedisFenceOptions in redis/fence.d.ts'
+}, {
+	keyPrefix: option.known
+});
+
 /**
  * Create a Redis fence provider. Pass the returned object as the
  * `fence` option of `createTaskRunner`.
@@ -77,6 +86,7 @@ return 0
  * @returns {RedisFenceProvider}
  */
 export function createRedisFence(client, options = {}) {
+	validateOptions(options);
 	if (options.keyPrefix !== undefined && typeof options.keyPrefix !== 'string') {
 		throw new Error('redis fence: keyPrefix must be a string');
 	}

@@ -40,6 +40,7 @@ import {
 	assertAlarmFailure, assertAlarmGeneration, assertAlarmRequeue
 } from '../shared/alarm-generation.js';
 import { ALARM_GENERATION_SCRIPT } from './_alarm-scripts.js';
+import { defineOptions, option } from '../shared/options.js';
 
 const COMMAND = 'orderedAlarmGenerationV2';
 const LABEL = 'redis alarm store';
@@ -84,6 +85,17 @@ const DEFAULT_DUE_BATCH = 100;
  * @property {() => Promise<void>} destroy
  */
 
+const validateOptions = defineOptions({
+	factory: 'createAlarmStore',
+	label: 'redis alarm store',
+	types: 'RedisAlarmStoreOptions in redis/alarm-store.d.ts'
+}, {
+	keyPrefix: option.known,
+	dueBatch: option.known,
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 /**
  * Create a Redis-backed durable alarm store. Wire it into the realtime layer with
  * `configureAlarm({ store: createAlarmStore(client), leader: () => leader.isLeader() })`.
@@ -93,6 +105,7 @@ const DEFAULT_DUE_BATCH = 100;
  * @returns {RedisAlarmStore}
  */
 export function createAlarmStore(client, options = {}) {
+	validateOptions(options);
 	if (options.keyPrefix !== undefined && typeof options.keyPrefix !== 'string') {
 		throw new Error('redis alarm store: keyPrefix must be a string');
 	}

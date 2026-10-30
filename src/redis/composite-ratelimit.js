@@ -39,6 +39,7 @@ import { wallEpoch } from '../shared/runtime.js';
 import { createEmergencyScaleReader, createEmergencyScaleOps } from './emergency-scale.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import { assertWholeExpiry, defineOptions, option } from '../shared/options.js';
 
 // Same version discipline as the single-dimension limiter: a layout change
 // moves to a fresh key space and old keys age out via TTL.
@@ -285,6 +286,19 @@ return out
  *   refill across dimensions on allow.
  */
 
+const validateOptions = defineOptions({
+	factory: 'createCompositeRateLimit',
+	label: 'redis composite ratelimit',
+	types: 'CompositeRateLimitOptions in redis/ratelimit.d.ts'
+}, {
+	dimensions: option.known,
+	tenant: option.known,
+	localFloorOnStorageFailure: option.known,
+	emergency: option.known,
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 /**
  * Create a composite multi-dimension rate limiter.
  *
@@ -302,6 +316,7 @@ export function createCompositeRateLimit(client, options) {
 	if (!options || typeof options !== 'object') {
 		throw new Error('redis composite ratelimit: options object is required');
 	}
+	validateOptions(options);
 	const dims = options.dimensions;
 	if (!dims || typeof dims !== 'object' || Array.isArray(dims)) {
 		throw new Error('redis composite ratelimit: dimensions must be an object of name -> { points, interval, keyBy }');
@@ -333,6 +348,10 @@ export function createCompositeRateLimit(client, options) {
 		if (typeof blockDuration !== 'number' || !Number.isFinite(blockDuration) || blockDuration < 0) {
 			throw new Error(`redis composite ratelimit: dimension '${name}' blockDuration must be a non-negative number`);
 		}
+		// Both reach PEXPIRE inside the check script, after earlier dimensions
+		// were already written, so a fractional one half-applies every check.
+		assertWholeExpiry(`redis composite ratelimit: dimension '${name}' interval`, d.interval, { min: 0 });
+		assertWholeExpiry(`redis composite ratelimit: dimension '${name}' blockDuration`, blockDuration, { min: 0 });
 		if (d.keyBy !== 'ip' && d.keyBy !== 'connection' && typeof d.keyBy !== 'function') {
 			throw new Error(`redis composite ratelimit: dimension '${name}' keyBy is required ('ip', 'connection', or a function) - each dimension must count along its own axis`);
 		}

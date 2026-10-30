@@ -33,6 +33,7 @@ import { execMultiSlot, firstCommandError } from '../shared/cluster.js';
 import { MAX_REDIS_PIPELINE_COMMANDS } from '../shared/caps.js';
 import { createHashFieldTTLProbe } from '../shared/redis-version.js';
 import { randomBytes, wallEpoch } from '../shared/runtime.js';
+import { defineOptions, option, wholeExpiry } from '../shared/options.js';
 
 // Delete only the exact record inspected; a concurrent replacement survives.
 const ERASE_RECORD = `
@@ -105,6 +106,23 @@ const MAX_TOKEN_LENGTH = 4096;
 const DEFAULT_KEY_PREFIX = 'sess:';
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
 
+const validateOptions = defineOptions({
+	factory: 'createDistributedSession',
+	label: 'session',
+	types: 'DistributedSessionOptions in redis/session.d.ts'
+}, {
+	keyPrefix: option.known,
+	// Sent to Redis as PX / PEXPIRE.
+	ttlMs: wholeExpiry(),
+	refreshOnGet: option.boolean,
+	identify: option.known,
+	maxAgeMs: option.known,
+	onLoadError: option.known,
+	forgetUserId: option.known,
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 /**
  * Create a Redis-backed session store with sliding TTL.
  *
@@ -126,6 +144,7 @@ const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
  * ```
  */
 export function createDistributedSession(client, options = {}) {
+	validateOptions(options);
 	if (!client || !client.redis) {
 		throw new Error('session: client (from createRedisClient) is required');
 	}

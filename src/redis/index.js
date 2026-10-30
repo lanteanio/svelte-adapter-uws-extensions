@@ -16,6 +16,7 @@ import { monotonicNow, setTimer, clearTimer } from '../shared/runtime.js';
 import { redactConnectionUrl } from '../shared/sensitive.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import { defineOptions, option } from '../shared/options.js';
 
 // Verify the private completion seam once per connection. If ioredis changes
 // it, keep its native per-command timers instead of risking lost deadlines.
@@ -283,6 +284,18 @@ function boundOfflineQueue(redis, keepOfflineQueue) {
  * @property {() => Promise<void>} quit - Gracefully disconnect and remove the `sveltekit:shutdown` listener
  */
 
+const validateOptions = defineOptions({
+	factory: 'createRedisClient',
+	label: 'redis client',
+	types: 'RedisClientOptions in redis/index.d.ts'
+}, {
+	url: option.string,
+	keyPrefix: option.string,
+	// Only literal false disables the shutdown hook.
+	autoShutdown: option.boolean,
+	options: option.object
+});
+
 /**
  * Create a Redis client.
  *
@@ -300,6 +313,7 @@ function boundOfflineQueue(redis, keepOfflineQueue) {
  * ```
  */
 export function createRedisClient(options = {}) {
+	validateOptions(options);
 	const url = options.url || 'redis://localhost:6379';
 	const keyPrefix = options.keyPrefix || '';
 	const autoShutdown = options.autoShutdown !== false;

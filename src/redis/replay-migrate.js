@@ -25,6 +25,7 @@
 import { scanKeys } from '../shared/redis-scan.js';
 import { createInputDropReporter } from '../shared/input-drops.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+import { defineOptions, option } from '../shared/options.js';
 
 // The sorted-set per-topic buffer key shape: `replay:buf:{<topic>}`. The braces
 // are LITERAL Redis hash-tag characters wrapping the topic (so all of a topic's
@@ -40,6 +41,17 @@ function srcBufKey(client, topic) {
 function dstBufKey(client, topic) {
 	return client.key('replay:streambuf:{' + topic + '}');
 }
+
+const validateOptions = defineOptions({
+	factory: 'migrateReplayToStream',
+	label: 'migrateReplayToStream',
+	types: 'MigrateReplayOptions in redis/replay.d.ts'
+}, {
+	topics: option.known,
+	size: option.known,
+	force: option.known,
+	dryRun: option.known
+});
 
 /**
  * Migrate one or more topics' replay buffers from the sorted-set backend to the
@@ -65,6 +77,7 @@ export async function migrateReplayToStream(client, options = {}) {
 	if (!client || typeof client !== 'object' || !client.redis || typeof client.key !== 'function') {
 		throw new Error('migrateReplayToStream: a redis client (from createRedisClient) is required');
 	}
+	validateOptions(options);
 	const { topics, size = 1000, force = false, dryRun = false } = options;
 	if (topics !== undefined &&
 		(!Array.isArray(topics) || topics.some((t) => typeof t !== 'string' || t.length === 0))) {

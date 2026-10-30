@@ -82,6 +82,7 @@ import { createConsistencyAuditor } from '../shared/auditor.js';
 import { checkRedisPresenceLocalIndex } from '../shared/invariants.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
+import { defineOptions, interval, option, timerCeiling, wholeExpiry } from '../shared/options.js';
 
 const onlineMetricCollectors = new WeakMap();
 function collectOnlineMetric(gauge, mapTopic, counts) {
@@ -149,6 +150,33 @@ export { WsClosedError };
  * @property {{ subscribe: (ws: any, topic: string, ctx: { platform: import('svelte-adapter-uws').Platform }) => Promise<void>, unsubscribe: (ws: any, topic: string, ctx: { platform: import('svelte-adapter-uws').Platform }) => Promise<void>, close: (ws: any, ctx: { platform: import('svelte-adapter-uws').Platform }) => Promise<void> }} hooks
  */
 
+const validateOptions = defineOptions({
+	factory: 'createPresence',
+	label: 'redis presence',
+	types: 'RedisPresenceOptions in redis/presence.d.ts'
+}, {
+	key: option.string,
+	select: option.known,
+	clientUpdateFields: option.known,
+	maxFieldsBytes: option.known,
+	maxTotalFieldsBytes: option.known,
+	maxTopicsPerConnection: option.known,
+	// Paces the diff flush timer.
+	topicThrottle: timerCeiling(),
+	heartbeat: timerCeiling(),
+	// Sent to Redis in milliseconds (HPEXPIRE / PX).
+	ttl: wholeExpiry({ scale: 1000, unit: 'seconds' }),
+	transient: option.stringArray,
+	binary: option.boolean,
+	selfPreservation: option.known,
+	keyspaceNotifications: option.boolean,
+	maxEnvelopeBytes: option.known,
+	// 0 disables the auditor, as in the adapter.
+	consistencyAuditIntervalMs: interval(),
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 /**
  * Create a Redis-backed presence tracker.
  *
@@ -157,6 +185,7 @@ export { WsClosedError };
  * @returns {RedisPresenceTracker}
  */
 export function createPresence(client, options = {}) {
+	validateOptions(options);
 	const ctx = createPresenceState(client, options);
 	const {
 		maxFieldsBytes, maxTotalFieldsBytes, maxTopicsPerConnection, topicThrottle,

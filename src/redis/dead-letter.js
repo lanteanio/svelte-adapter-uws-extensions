@@ -52,6 +52,7 @@ import { monotonicNow } from '../shared/runtime.js';
 import { TENANT_TOPIC_NS, topicInTenant } from '../shared/tenant-topic.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure, firstReportInProcess } from '../shared/diagnostic.js';
+import { defineOptions, option } from '../shared/options.js';
 
 // A forget tombstone lives long enough to catch a webhook delivery that was
 // already in flight when `live.forget` ran and only fails (and would be
@@ -74,6 +75,19 @@ const FORGET_TOMBSTONE_MS = 10 * 60 * 1000;
  *   max retry budget. Default 10 minutes (matches the in-memory store).
  */
 
+const validateOptions = defineOptions({
+	factory: 'createDeadLetter',
+	label: 'redis dead-letter',
+	types: 'RedisDeadLetterOptions in redis/dead-letter.d.ts'
+}, {
+	max: option.known,
+	ttlMs: option.known,
+	forgetUserId: option.known,
+	forgetTombstoneMs: option.known,
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 /**
  * Create a Redis-backed dead-letter store.
  *
@@ -81,6 +95,7 @@ const FORGET_TOMBSTONE_MS = 10 * 60 * 1000;
  * @param {RedisDeadLetterOptions} [options]
  */
 export function createDeadLetter(client, options = {}) {
+	validateOptions(options);
 	if (options.max !== undefined && (!Number.isInteger(options.max) || options.max <= 0)) {
 		throw new Error(`redis dead-letter: max must be a positive integer, got ${options.max}`);
 	}

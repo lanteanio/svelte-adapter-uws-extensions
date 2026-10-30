@@ -35,6 +35,7 @@ import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { openSubscriber, closeConnection } from '../shared/redis-subscriber.js';
 import { operationError } from '../shared/errors.js';
 import { registerAdmissionRate } from '../shared/_publish-rate-admission.js';
+import { defineOptions, option, timerCeiling } from '../shared/options.js';
 
 /**
  * @typedef {Object} ClusterSubject
@@ -67,7 +68,24 @@ const DEFAULT_STALE_AFTER_MS = 12000;
 const DEFAULT_TOP_N = 20;
 const DEFAULT_TOPIC_RATE_PER_SEC = 5000;
 
+const validateOptions = defineOptions({
+	factory: 'createPublishRateAggregator',
+	label: 'publish-rate',
+	types: 'PublishRateAggregatorOptions in redis/publish-rate.d.ts'
+}, {
+	// Compared with the string channel ioredis delivers.
+	channel: option.string,
+	publishInterval: timerCeiling(),
+	staleAfter: option.known,
+	topN: option.known,
+	topicPublishRatePerSec: option.known,
+	subjects: option.known,
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 export function createPublishRateAggregator(client, options = {}) {
+	validateOptions(options);
 	if (!client || !client.redis) {
 		throw new Error('publish-rate: client (from createRedisClient) is required');
 	}

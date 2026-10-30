@@ -30,6 +30,7 @@ import { evalCached } from '../shared/eval-cached.js';
 import { withBreaker } from '../shared/breaker.js';
 import { now, monotonicNow } from '../shared/runtime.js';
 import { createEmergencyScaleReader } from './emergency-scale.js';
+import { assertWholeExpiry, defineOptions, option } from '../shared/options.js';
 
 /** Refill interval for a per-minute budget, in milliseconds. */
 const MINUTE_MS = 60000;
@@ -120,6 +121,20 @@ function buildBudgets(options, label) {
 	};
 }
 
+const validateOptions = defineOptions({
+	factory: 'createUpgradeBucket',
+	label: 'redis upgrade-bucket',
+	types: 'UpgradeBucketOptions in redis/upgrade-bucket.d.ts'
+}, {
+	perMinute: option.known,
+	blockDuration: option.known,
+	elevated: option.known,
+	siege: option.known,
+	emergency: option.known,
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 /**
  * Create a Redis-backed per-IP upgrade-admission bucket.
  *
@@ -144,7 +159,13 @@ function buildBudgets(options, label) {
  * ```
  */
 export function createUpgradeBucket(client, options) {
+	validateOptions(options);
 	const resolve = buildBudgets(options, 'redis upgrade-bucket');
+	// Each budget's block reaches Redis inside a PEXPIRE argument. A fractional
+	// one fails every admit after its HSET, and a failed admit fails open.
+	for (const posture of ['normal', 'elevated', 'siege']) {
+		assertWholeExpiry(`redis upgrade-bucket: ${posture} blockDuration`, resolve(posture).blockDuration, { min: 0 });
+	}
 
 	const redis = client.redis;
 
@@ -240,6 +261,23 @@ async function scanAndClear(redis, pattern) {
 	} while (cursor !== '0');
 }
 
+const validateLocalOptions = defineOptions({
+	factory: 'createLocalUpgradeBucket',
+	label: 'local upgrade-bucket',
+	types: 'LocalUpgradeBucketOptions in redis/upgrade-bucket.d.ts'
+}, {
+	perMinute: option.known,
+	blockDuration: option.known,
+	elevated: option.known,
+	siege: option.known,
+	maxEntries: option.known,
+	// Declared through the shared options type; the local bucket has no
+	// Redis to scale or guard, so these are accepted and unused.
+	emergency: option.known,
+	breaker: option.known,
+	metrics: option.collaborator
+});
+
 /**
  * Create a local (no-Redis) per-IP upgrade-admission bucket.
  *
@@ -253,6 +291,7 @@ async function scanAndClear(redis, pattern) {
  * @returns {UpgradeBucket}
  */
 export function createLocalUpgradeBucket(options) {
+	validateLocalOptions(options);
 	const resolve = buildBudgets(options, 'local upgrade-bucket');
 
 	const maxEntries = options.maxEntries ?? DEFAULT_MAX_LOCAL_ENTRIES;

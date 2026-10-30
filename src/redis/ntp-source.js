@@ -22,6 +22,7 @@
 
 import dgram from 'node:dgram';
 import { setTimer, clearTimer } from '../shared/runtime.js';
+import { defineOptions, option, timerCeiling } from '../shared/options.js';
 
 /** Seconds between the NTP era (1900-01-01) and the Unix epoch (1970-01-01). */
 const NTP_UNIX_OFFSET_SECONDS = 2_208_988_800;
@@ -102,6 +103,18 @@ function parseTransmitEpochMs(reply) {
 	return (seconds - NTP_UNIX_OFFSET_SECONDS) * 1000 + Math.round((fraction / 0x100000000) * 1000);
 }
 
+const validateOptions = defineOptions({
+	factory: 'createNtpSource',
+	label: 'ntp',
+	types: 'NtpSourceOptions in redis/ntp-source.d.ts'
+}, {
+	host: option.known,
+	port: option.known,
+	// The default transport arms its reply timeout with this value.
+	timeoutMs: timerCeiling(),
+	transport: option.known
+});
+
 /**
  * Create an SNTP clock source for `createClusterClock({ ntp })`.
  *
@@ -119,6 +132,7 @@ export function createNtpSource(options = {}) {
 	if (!options || typeof options.host !== 'string' || options.host.length === 0) {
 		throw new Error('ntp: host is required');
 	}
+	validateOptions(options);
 	const host = options.host;
 	const port = options.port ?? DEFAULT_PORT;
 	if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -128,7 +142,7 @@ export function createNtpSource(options = {}) {
 	if (!Number.isFinite(timeoutMs) || timeoutMs < 1) {
 		throw new Error('ntp: timeoutMs must be a positive number (ms)');
 	}
-	if (options.transport !== undefined && (typeof options.transport !== 'object' || typeof options.transport.request !== 'function')) {
+	if (options.transport != null && (typeof options.transport !== 'object' || typeof options.transport.request !== 'function')) {
 		throw new Error('ntp: transport must expose request(packet, host, port, timeoutMs) => Promise<Buffer>');
 	}
 	const transport = options.transport ?? createDgramTransport();

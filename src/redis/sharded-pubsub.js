@@ -47,6 +47,7 @@ import {
 } from '../shared/trace-context.js';
 import { openSubscriber, watchLiveness, closeConnection, isReplyError } from '../shared/redis-subscriber.js';
 import { MULTI_WORKER_RUNTIME, UNSEQUENCED_DELIVERY, carriedSeq, receivedOptions, relayedLocally, relayedBatchLocally, relayEntry } from '../shared/sequence-authority.js';
+import { defineOptions, option } from '../shared/options.js';
 
 // A node.ssubscribe() / sunsubscribe() aimed at a master that does not own the
 // channel's slot never resolves - the command hangs instead of returning a MOVED
@@ -87,6 +88,20 @@ const CANCELLED = Symbol('cancelled');
  * @property {{ subscribe: Function, unsubscribe: Function, close: Function }} hooks
  */
 
+const validateOptions = defineOptions({
+	factory: 'createShardedBus',
+	label: 'sharded bus',
+	types: 'ShardedBusOptions in redis/sharded-pubsub.d.ts'
+}, {
+	channelPrefix: option.known,
+	shardKey: option.known,
+	subscribersAggregator: option.known,
+	maxEnvelopeBytes: option.known,
+	allowSystemTopics: option.boolean,
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 /**
  * Create a sharded Redis pub/sub bus.
  *
@@ -95,6 +110,7 @@ const CANCELLED = Symbol('cancelled');
  * @returns {ShardedBus}
  */
 export function createShardedBus(client, options = {}) {
+	validateOptions(options);
 	const channelPrefix = options.channelPrefix ?? 'uws:sharded:';
 	if (typeof channelPrefix !== 'string') {
 		throw new Error('sharded bus: channelPrefix must be a string');

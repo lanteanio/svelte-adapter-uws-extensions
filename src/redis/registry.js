@@ -54,6 +54,7 @@ import {
 	MAX_REGISTRY_INDEX_VALUES_PER_KEY
 } from '../shared/caps.js';
 import { openSubscriber } from '../shared/redis-subscriber.js';
+import { defineOptions, option, timerCeiling, wholeExpiry } from '../shared/options.js';
 
 /**
  * Lua-atomic compare-and-delete: only removes the registry entry if the
@@ -170,6 +171,24 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 5000;
  */
 const MAX_INBOUND_REQUEST_TIMEOUT_MS = 60_000;
 
+const validateOptions = defineOptions({
+	factory: 'createConnectionRegistry',
+	label: 'registry',
+	types: 'RegistryOptions in redis/registry.d.ts'
+}, {
+	identify: option.known,
+	attributes: option.known,
+	sessionIdentify: option.known,
+	keyPrefix: option.known,
+	// Sent to Redis EXPIRE in seconds.
+	ttl: wholeExpiry({ unit: 'seconds' }),
+	heartbeat: timerCeiling(),
+	requestTimeoutMs: timerCeiling(),
+	maxEnvelopeBytes: option.known,
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 /**
  * Create a cluster-aware connection registry.
  *
@@ -199,6 +218,7 @@ export function createConnectionRegistry(client, options) {
 	if (!options || typeof options !== 'object') {
 		throw new Error('registry: options object is required');
 	}
+	validateOptions(options);
 	const identify = options.identify;
 	if (typeof identify !== 'function') {
 		throw new Error('registry: identify must be a function');

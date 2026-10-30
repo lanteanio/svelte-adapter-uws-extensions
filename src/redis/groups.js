@@ -30,6 +30,7 @@ import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { openSubscriber } from '../shared/redis-subscriber.js';
 import { operationError } from '../shared/errors.js';
+import { defineOptions, option, timerCeiling, wholeExpiry } from '../shared/options.js';
 
 const VALID_ROLES = new Set(['member', 'admin', 'viewer']);
 
@@ -173,6 +174,25 @@ return liveCount
  * @property {() => void} destroy - Stop subscriber
  */
 
+const validateOptions = defineOptions({
+	factory: 'createGroup',
+	label: 'redis group',
+	types: 'RedisGroupOptions in redis/groups.d.ts'
+}, {
+	maxMembers: option.known,
+	// Written to Redis with HMSET.
+	meta: option.object,
+	// Sent to Redis in milliseconds (PEXPIRE), and bounds the settle timers.
+	memberTtl: wholeExpiry({ scale: 1000, unit: 'seconds', also: timerCeiling({ scale: 1000, unit: 'seconds' }) }),
+	maxEnvelopeBytes: option.known,
+	onJoin: option.known,
+	onLeave: option.known,
+	onFull: option.known,
+	onClose: option.known,
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 /**
  * Create a Redis-backed broadcast group.
  *
@@ -182,6 +202,7 @@ return liveCount
  * @returns {RedisGroup}
  */
 export function createGroup(client, name, options = {}) {
+	validateOptions(options);
 	if (!name || typeof name !== 'string') {
 		throw new Error('redis group: name must be a non-empty string');
 	}

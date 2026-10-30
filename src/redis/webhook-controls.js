@@ -27,6 +27,7 @@ import { withBreaker } from '../shared/breaker.js';
 import { evalCached } from '../shared/eval-cached.js';
 import { monotonicNow } from '../shared/runtime.js';
 import { CONSUME_SCRIPT } from './token-bucket-script.js';
+import { defineOptions, option } from '../shared/options.js';
 
 /** Cap on distinct locally-cached breaker keys before the oldest is evicted. */
 const MAX_BREAKER_KEYS = 4096;
@@ -47,6 +48,16 @@ export class WebhookCircuitOpenError extends Error {
 	}
 }
 
+const validateRetryBudgetOptions = defineOptions({
+	factory: 'createRetryBudget',
+	label: 'redis retry budget',
+	types: 'RedisRetryBudgetOptions in redis/webhook-controls.d.ts'
+}, {
+	capacity: option.known,
+	intervalMs: option.known,
+	breaker: option.collaborator
+});
+
 /**
  * Create a Redis-backed retry budget: a windowed token bucket shared across the
  * fleet. `take(key)` consumes one token, resolving to whether a retry may
@@ -61,6 +72,7 @@ export class WebhookCircuitOpenError extends Error {
  * @param {{ capacity?: number, intervalMs?: number, breaker?: object }} [options]
  */
 export function createRetryBudget(client, options = {}) {
+	validateRetryBudgetOptions(options);
 	const capacity = options.capacity ?? 100;
 	const intervalMs = options.intervalMs ?? 10000;
 	if (!Number.isFinite(capacity) || capacity < 1) {
@@ -83,6 +95,17 @@ export function createRetryBudget(client, options = {}) {
 	};
 }
 
+const validateWebhookBreakerOptions = defineOptions({
+	factory: 'createWebhookBreaker',
+	label: 'redis webhook breaker',
+	types: 'RedisWebhookBreakerOptions in redis/webhook-controls.d.ts'
+}, {
+	failureThreshold: option.known,
+	resetMs: option.known,
+	probeConcurrency: option.known,
+	breaker: option.collaborator
+});
+
 /**
  * Create a Redis-backed endpoint-ejection breaker shared across the fleet.
  * Failures increment a shared per-endpoint counter (TTL `resetMs`); when the
@@ -103,6 +126,7 @@ export function createRetryBudget(client, options = {}) {
  * @param {{ failureThreshold?: number, resetMs?: number, probeConcurrency?: number, breaker?: object }} [options]
  */
 export function createWebhookBreaker(client, options = {}) {
+	validateWebhookBreakerOptions(options);
 	const failureThreshold = options.failureThreshold ?? 5;
 	const resetMs = options.resetMs ?? 30000;
 	const probeConcurrency = options.probeConcurrency ?? 1;

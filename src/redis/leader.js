@@ -38,6 +38,7 @@ import { evalCached } from '../shared/eval-cached.js';
 import { LEASE_RENEW_SCRIPT, LEASE_RELEASE_SCRIPT } from '../shared/lease-scripts.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+import { defineOptions, option, timerCeiling, wholeExpiry } from '../shared/options.js';
 
 const DEFAULT_KEY = 'leader';
 const DEFAULT_LEASE_MS = 30_000;
@@ -63,6 +64,24 @@ const DEFAULT_LEASE_MS = 30_000;
  * @property {string} key - The fully-prefixed lease key (useful for diagnostics).
  */
 
+const leaseRenewCeiling = timerCeiling({ scale: 1 / 3 });
+
+const validateOptions = defineOptions({
+	factory: 'createLeader',
+	label: 'leader',
+	types: 'LeaderOptions in redis/leader.d.ts'
+}, {
+	key: option.known,
+	instanceId: option.known,
+	// Sent to Redis as PX / PEXPIRE.
+	leaseMs: wholeExpiry(),
+	renewMs: timerCeiling(),
+	onError: option.known,
+	mapKey: option.known,
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 /**
  * Create a cluster-wide leader-election primitive.
  *
@@ -85,6 +104,7 @@ const DEFAULT_LEASE_MS = 30_000;
  * ```
  */
 export function createLeader(client, options = {}) {
+	validateOptions(options);
 	if (!client || !client.redis) {
 		throw new Error('leader: client (from createRedisClient) is required');
 	}
@@ -109,6 +129,8 @@ export function createLeader(client, options = {}) {
 	if (renewMs >= leaseMs) {
 		throw new Error('leader: renewMs must be < leaseMs (otherwise the lease can expire between renewals)');
 	}
+	// Without an explicit renewMs, a third of the lease paces the renewal timer.
+	if (options.renewMs == null) leaseRenewCeiling('leader: leaseMs', leaseMs);
 	if (options.onError !== undefined && typeof options.onError !== 'function') {
 		throw new Error('leader: onError must be a function');
 	}

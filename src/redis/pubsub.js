@@ -34,6 +34,7 @@ import { openSubscriber, closeConnection } from '../shared/redis-subscriber.js';
 import { guardBreaker } from '../shared/breaker-admission.js';
 import { addWsSubscription } from '../shared/ws-subscriptions.js';
 import { MULTI_WORKER_RUNTIME, UNSEQUENCED_DELIVERY, carriedSeq, receivedOptions, relayedLocally, relayedBatchLocally, relayEntry } from '../shared/sequence-authority.js';
+import { defineOptions, option } from '../shared/options.js';
 
 // The degraded / recovered frames report this worker's own breaker, so they go
 // to this worker's subscribers only, and they make no monotonic promise.
@@ -86,6 +87,23 @@ const ACTIVATE_RETRY_MAX_MS = 30000;
  *   delivered.
  */
 
+const validateOptions = defineOptions({
+	factory: 'createPubSubBus',
+	label: 'pubsub bus',
+	types: 'PubSubBusOptions in redis/pubsub.d.ts'
+}, {
+	// Compared with the string channel ioredis delivers.
+	channel: option.string,
+	systemChannel: option.known,
+	onDegraded: option.known,
+	onRecovered: option.known,
+	degradationPolicy: option.known,
+	maxEnvelopeBytes: option.known,
+	allowSystemTopics: option.boolean,
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 /**
  * Create a Redis-backed pub/sub bus.
  *
@@ -111,6 +129,7 @@ const ACTIVATE_RETRY_MAX_MS = 30000;
  * ```
  */
 export function createPubSubBus(client, options = {}) {
+	validateOptions(options);
 	const channel = options.channel || 'uws:pubsub';
 	const instanceId = randomBytes(8).toString('hex');
 

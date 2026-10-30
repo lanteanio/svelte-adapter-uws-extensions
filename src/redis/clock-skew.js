@@ -33,6 +33,7 @@ import { registerClusterHealth } from '../shared/cluster-dashboard.js';
 import { wallEpoch, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+import { defineOptions, option, timerCeiling } from '../shared/options.js';
 
 const DEFAULT_INTERVAL_MS = 30_000;
 const DEFAULT_SAMPLES = 5;
@@ -99,6 +100,26 @@ function median(values) {
 	return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
 }
 
+const validateOptions = defineOptions({
+	factory: 'createClockSkewSampler',
+	label: 'clock-skew',
+	types: 'ClockSkewSamplerOptions in redis/clock-skew.d.ts'
+}, {
+	intervalMs: timerCeiling(),
+	samples: option.known,
+	warnMs: option.known,
+	tripMs: option.known,
+	immediate: option.boolean,
+	onSkew: option.known,
+	onWarn: option.known,
+	onTrip: option.known,
+	onError: option.known,
+	fence: option.known,
+	onFence: option.known,
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 /**
  * Create a clock-skew sampler. Starts sampling immediately; call `stop()` on
  * shutdown.
@@ -124,6 +145,7 @@ function median(values) {
  * ```
  */
 export function createClockSkewSampler(client, options = {}) {
+	validateOptions(options);
 	if (!client || !client.redis) {
 		throw new Error('clock-skew: client (from createRedisClient) is required');
 	}

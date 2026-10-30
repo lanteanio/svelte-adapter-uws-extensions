@@ -105,6 +105,7 @@ import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { openSubscriber, SUBSCRIBER_RESTORED } from '../shared/redis-subscriber.js';
 import { isCluster } from '../shared/cluster.js';
 import { operationError } from '../shared/errors.js';
+import { allOf, defineOptions, option, timerCeiling } from '../shared/options.js';
 
 /** Relay message kinds (the `k` field on every envelope). */
 const KIND_UPDATE = 'u';
@@ -190,6 +191,18 @@ function positive(v, fallback) {
  *   comment for when such a document is persisted).
  */
 
+const validateOptions = defineOptions({
+	factory: 'createCrdtCluster',
+	label: 'crdt cluster',
+	types: 'CrdtClusterOptions in redis/crdt.d.ts'
+}, {
+	// A Redis PX lease, and a third of it paces the sync-window timers.
+	persistLeaseMs: allOf(option.positiveInteger, timerCeiling({ scale: 1 / 3 })),
+	maxEnvelopeBytes: option.known,
+	breaker: option.collaborator,
+	onError: option.function
+});
+
 /**
  * Create the cluster coordinator. Attach it to the platform the same way the
  * other Redis plugins are wired (`platform.crdt = createCrdtCluster(client)`)
@@ -201,6 +214,7 @@ function positive(v, fallback) {
  * @param {CrdtClusterOptions} [options]
  */
 export function createCrdtCluster(client, options = {}) {
+	validateOptions(options);
 	const redis = client.redis;
 	const channel = client.key('crdt:events');
 	const instanceId = randomBytes(8).toString('hex');

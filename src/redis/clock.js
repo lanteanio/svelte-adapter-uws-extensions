@@ -49,6 +49,7 @@
 import { wallEpoch, setIntervalTimer, clearIntervalTimer } from '../shared/runtime.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
+import { defineOptions, option, timerCeiling } from '../shared/options.js';
 
 const DEFAULT_INTERVAL_MS = 30_000;
 const DEFAULT_SAMPLES = 5;
@@ -129,6 +130,31 @@ function monotoneClamp() {
  * @property {() => Promise<void>} stop - Stop the interval and await any in-flight round. Idempotent.
  */
 
+const validateOptions = defineOptions({
+	factory: 'createClusterClock',
+	label: 'cluster clock',
+	types: 'ClusterClockOptions in redis/clock.d.ts'
+}, {
+	intervalMs: timerCeiling(),
+	samples: option.known,
+	warnMs: option.known,
+	tripMs: option.known,
+	driftThresholdMs: option.known,
+	immediate: option.boolean,
+	ntp: option.known,
+	leader: option.known,
+	leaderKey: option.known,
+	legacyLeaderKeyFallback: option.known,
+	leaderTtlMs: option.known,
+	onSample: option.known,
+	onWarn: option.known,
+	onTrip: option.known,
+	onDrift: option.known,
+	onError: option.known,
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 /**
  * Create a cluster clock. Starts sampling immediately (the startup drift
  * check); call `stop()` on shutdown.
@@ -150,6 +176,7 @@ function monotoneClamp() {
  * ```
  */
 export function createClusterClock(client, options = {}) {
+	validateOptions(options);
 	if (!client || !client.redis) {
 		throw new Error('cluster clock: client (from createRedisClient) is required');
 	}

@@ -42,6 +42,7 @@ import {
 	LEASE_RENEW_SCRIPT as HEARTBEAT_SCRIPT,
 	LEASE_RELEASE_SCRIPT as RELEASE_SCRIPT
 } from '../shared/lease-scripts.js';
+import { defineOptions, option, timerCeiling, wholeExpiry } from '../shared/options.js';
 
 /**
  * @typedef {Object} DistributedLockOptions
@@ -80,6 +81,26 @@ export class LockLostError extends Error {
 	}
 }
 
+const leaseHeartbeatCeiling = timerCeiling({ scale: 1 / 3 });
+
+const validateOptions = defineOptions({
+	factory: 'createDistributedLock',
+	label: 'lock',
+	types: 'DistributedLockOptions in redis/lock.d.ts'
+}, {
+	keyPrefix: option.known,
+	// Sent to Redis as PX / PEXPIRE.
+	defaultTtlMs: wholeExpiry(),
+	// The retry sleep is this plus up to 25% jitter.
+	retryDelayMs: timerCeiling({ scale: 1.25 }),
+	maxWaitMs: option.known,
+	heartbeatMs: timerCeiling(),
+	fence: option.known,
+	mapKey: option.known,
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 /**
  * Create a cluster-wide distributed lock factory.
  *
@@ -102,6 +123,7 @@ export class LockLostError extends Error {
  * ```
  */
 export function createDistributedLock(client, options = {}) {
+	validateOptions(options);
 	if (!client || !client.redis) {
 		throw new Error('lock: client (from createRedisClient) is required');
 	}
@@ -122,6 +144,8 @@ export function createDistributedLock(client, options = {}) {
 	if (!Number.isFinite(heartbeatMs) || heartbeatMs < 1) {
 		throw new Error('lock: heartbeatMs must be a positive number (ms)');
 	}
+	// Without an explicit heartbeatMs, a third of the lease paces the heartbeat timer.
+	if (options.heartbeatMs == null) leaseHeartbeatCeiling('lock: defaultTtlMs', defaultTtlMs);
 	if (options.mapKey !== undefined && typeof options.mapKey !== 'function') {
 		throw new Error('lock: mapKey must be a function');
 	}

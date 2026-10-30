@@ -135,6 +135,15 @@ export interface RedisPresenceOptions {
 		holdMaxMs?: number;
 		onChange?: (active: boolean, info: { held: number; total: number }) => void;
 	};
+	/**
+	 * Binary wire transport for presence frames, as in the adapter's presence
+	 * plugin: a client that advertised `presence.protocol:1` receives compact
+	 * `0x03` frames and every other client the identical JSON frames. Set
+	 * `false` to force JSON for every client.
+	 *
+	 * @default true
+	 */
+	binary?: boolean;
 	/** Prometheus metrics registry. */
 	metrics?: MetricsRegistry;
 	/** Circuit breaker instance. */

@@ -36,6 +36,7 @@ import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure, firstReportInProcess } from '../shared/diagnostic.js';
 import { createInputDropReporter } from '../shared/input-drops.js';
 import { UNSEQUENCED_PUBLISH } from '../shared/sequence-authority.js';
+import { defineOptions, option } from '../shared/options.js';
 export { ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError };
 export { migrateReplayToStream } from './replay-migrate.js';
 
@@ -121,6 +122,25 @@ end
 return seq
 `;
 
+const validateOptions = defineOptions({
+	factory: 'createReplay',
+	label: 'redis replay',
+	types: 'RedisReplayOptions in redis/replay.d.ts'
+}, {
+	storage: option.known,
+	size: option.known,
+	ttl: option.known,
+	durability: option.known,
+	minReplicas: option.known,
+	replicationTimeoutMs: option.known,
+	idempotencyTtl: option.known,
+	localFanoutOnStorageFailure: option.known,
+	maxDataBytes: option.known,
+	forgetUserId: option.known,
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 /**
  * Create a Redis-backed replay buffer.
  *
@@ -129,6 +149,7 @@ return seq
  * @returns {RedisReplayBuffer}
  */
 export function createReplay(client, options = {}) {
+	validateOptions(options);
 	if (options.storage !== undefined && options.storage !== 'sortedset' && options.storage !== 'stream') {
 		throw new Error(`redis replay: storage must be 'sortedset' or 'stream', got ${options.storage}`);
 	}

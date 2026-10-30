@@ -66,6 +66,7 @@ import { createRoster } from './cursor/roster.js';
 import { createInputDropReporter } from '../shared/input-drops.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { createScheduler } from './cursor/scheduler.js';
+import { defineOptions, option, timerCeiling, wholeExpiry } from '../shared/options.js';
 
 export { WsClosedError, SubscribeDeniedError };
 
@@ -149,6 +150,32 @@ const JSON_OPTIONS = Object.freeze({ relay: false, compress: false, seq: false }
  * @property {() => { flushes: number, driftMeanMs: number, driftMaxMs: number, dirtyTopicsCurrent: number, activeTopicsTotal: number, jitterDropped: number, viewportsReported: number, perSubscriberFlushes: number, bpSkips: number, culledEntriesDropped: number }} stats - Scheduler health snapshot
  */
 
+const validateOptions = defineOptions({
+	factory: 'createCursor',
+	label: 'redis cursor',
+	types: 'RedisCursorOptions in redis/cursor.d.ts'
+}, {
+	maxDataBytes: option.known,
+	maxTopicLength: option.known,
+	throttle: timerCeiling(),
+	topicThrottle: timerCeiling(),
+	// The roster confirmation timer waits twice this.
+	snapshotIntervalMs: timerCeiling({ scale: 2 }),
+	select: option.known,
+	// Sent to Redis EXPIRE in seconds, and paces the cleanup and prune timers
+	// in milliseconds.
+	ttl: wholeExpiry({ unit: 'seconds', also: timerCeiling({ scale: 1000, unit: 'seconds' }) }),
+	position: option.known,
+	minMove: option.known,
+	viewport: option.known,
+	backpressure: option.known,
+	maxEnvelopeBytes: option.known,
+	binary: option.boolean,
+	dictionary: option.boolean,
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 /**
  * Create a Redis-backed cursor tracker.
  *
@@ -157,6 +184,7 @@ const JSON_OPTIONS = Object.freeze({ relay: false, compress: false, seq: false }
  * @returns {RedisCursorTracker}
  */
 export function createCursor(client, options = {}) {
+	validateOptions(options);
 	const {
 		maxDataBytes,
 		maxTopicLength,

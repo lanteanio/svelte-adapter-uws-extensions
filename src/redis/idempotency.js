@@ -37,6 +37,7 @@ import { withBreaker } from '../shared/breaker.js';
 import { randomUuid } from '../shared/runtime.js';
 import { MAX_IDEMPOTENCY_KEY_LENGTH } from '../shared/caps.js';
 import { IdempotencyResultTooLargeError, IdempotencyLeaseLostError } from '../shared/errors.js';
+import { defineOptions, option } from '../shared/options.js';
 
 export { IdempotencyResultTooLargeError, IdempotencyLeaseLostError };
 
@@ -77,6 +78,19 @@ const PENDING_PREFIX = '__idem_pending__';
  * @property {() => Promise<void>} clear
  */
 
+const validateOptions = defineOptions({
+	factory: 'createIdempotencyStore',
+	label: 'redis idempotency',
+	types: 'RedisIdempotencyOptions in redis/idempotency.d.ts'
+}, {
+	keyPrefix: option.known,
+	ttl: option.known,
+	acquireTtl: option.known,
+	maxResultBytes: option.known,
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 /**
  * Create a Redis-backed idempotency store.
  *
@@ -85,6 +99,7 @@ const PENDING_PREFIX = '__idem_pending__';
  * @returns {RedisIdempotencyStore}
  */
 export function createIdempotencyStore(client, options = {}) {
+	validateOptions(options);
 	if (options.ttl !== undefined) {
 		if (typeof options.ttl !== 'number' || options.ttl < 1 || !Number.isInteger(options.ttl)) {
 			throw new Error(`redis idempotency: ttl must be a positive integer, got ${options.ttl}`);

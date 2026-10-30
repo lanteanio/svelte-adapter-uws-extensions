@@ -34,6 +34,7 @@ import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure, firstReportInProcess } from '../shared/diagnostic.js';
 import { createInputDropReporter } from '../shared/input-drops.js';
 import { UNSEQUENCED_PUBLISH } from '../shared/sequence-authority.js';
+import { defineOptions, option } from '../shared/options.js';
 
 /**
  * Lua script for atomic idempotent publish.
@@ -201,6 +202,27 @@ function seqFromId(id) {
 	return dash === -1 ? parseInt(id, 10) : parseInt(id.slice(0, dash), 10);
 }
 
+const validateOptions = defineOptions({
+	// Reached through createReplay({ storage: 'stream' }); the shared name
+	// lets one unknown-key set warn once across both entry points.
+	factory: 'createReplay',
+	label: 'redis stream replay',
+	types: 'RedisReplayOptions in redis/replay.d.ts'
+}, {
+	storage: option.known,
+	size: option.known,
+	ttl: option.known,
+	durability: option.known,
+	minReplicas: option.known,
+	replicationTimeoutMs: option.known,
+	idempotencyTtl: option.known,
+	localFanoutOnStorageFailure: option.known,
+	maxDataBytes: option.known,
+	forgetUserId: option.known,
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 /**
  * Create a Streams-backed Redis replay buffer.
  *
@@ -209,6 +231,7 @@ function seqFromId(id) {
  * @returns {import('./replay.js').RedisReplayBuffer}
  */
 export function createStreamReplay(client, options = {}) {
+	validateOptions(options);
 	const { maxSize, ttl, replicated, minReplicas, replicationTimeoutMs, maxDataBytes, localFanoutOnStorageFailure } =
 		parseReplayOptions('redis stream replay', options);
 

@@ -22,6 +22,7 @@
 import { parseRedisVersion } from '../shared/redis-version.js';
 import { withBreaker } from '../shared/breaker.js';
 import { isCluster } from '../shared/cluster.js';
+import { defineOptions, option } from '../shared/options.js';
 
 const SHEBANG_RE = /^#!lua\s+name=(\S+)/;
 
@@ -48,6 +49,15 @@ function functionTargets(client) {
  * @property {() => Promise<void>} delete - Drop the library via FUNCTION DELETE.
  */
 
+const validateOptions = defineOptions({
+	factory: 'createFunctionLibrary',
+	label: 'redis functions',
+	types: 'FunctionLibraryOptions in redis/functions.d.ts'
+}, {
+	breaker: option.collaborator,
+	metrics: option.collaborator
+});
+
 /**
  * Create a function-library handle.
  *
@@ -68,6 +78,7 @@ function functionTargets(client) {
  * ```
  */
 export function createFunctionLibrary(client, code, options = {}) {
+	validateOptions(options);
 	if (typeof code !== 'string' || code.length === 0) {
 		throw new Error('redis functions: code must be a non-empty string');
 	}
