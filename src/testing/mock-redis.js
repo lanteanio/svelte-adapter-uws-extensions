@@ -2244,7 +2244,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				try { rec = JSON.parse(json); } catch { return ''; }
 				return (rec && typeof rec === 'object' ? topicTenantScope(rec.topic) : null) ?? '';
 			};
-			if (!add) return argv.reduce((removed, id) => removed + drop(id), 0);
+			if (!add) return argv.slice(1).reduce((removed, id) => removed + drop(id), 0);
 			if ((hashes.get(tenantKey)?.size ?? 0) !== members(orderKey).length || members(rankKey).length !== members(sizeKey).length) {
 				for (const key of [tenantOrderKey, sizeKey, rankKey]) sortedSets.delete(key);
 				const live = new Set(members(orderKey));

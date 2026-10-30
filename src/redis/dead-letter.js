@@ -42,7 +42,7 @@
  * Retention clocks off the SERVER (`TIME`), never the caller-supplied
  * `failedAt`: a skewed or hostile producer stamp can then neither mass-evict
  * healthy records nor pin its own forever. With `ttlMs` set, each add also
- * re-arms a PEXPIRE on all three keys as a quiet-queue backstop, so an idle
+ * re-arms a PEXPIRE on every key as a quiet-queue backstop, so an idle
  * DLQ self-cleans within `ttlMs` instead of retaining payloads indefinitely.
  *
  * Reads apply the same server-clock cutoff, so with `ttlMs` set an expired
@@ -166,7 +166,6 @@ rerank(ARGV[3], function()
 end)
 local ttl = tonumber(ARGV[5])
 if ttl > 0 then
-	for i = 1, 7 do redis.call('PEXPIRE', KEYS[i], ttl) end
 	for _, expired in ipairs(redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', ARGV[6])) do drop(expired) end
 end
 local max = tonumber(ARGV[4])
@@ -186,14 +185,21 @@ while redis.call('ZCARD', KEYS[3]) > max do
 	local rank = rank_of(scope)
 	if rank then redis.call('ZADD', KEYS[7], 0, rank) end
 end
+-- Last, because a drop can empty a key and recreate it without a TTL.
+if ttl > 0 then
+	for i = 1, 7 do redis.call('PEXPIRE', KEYS[i], ttl) end
+end
 return { id, evicted }
 `;
 
-// ARGV: record ids. Returns how many existed.
+// ARGV: ttlMs, then record ids. Returns how many existed. A drop can empty
+// the rank key and recreate it, so it gets the add's TTL backstop again.
 const DROP_SCRIPT = `-- DLQ_DROP
 ${PRELUDE}
 local removed = 0
-for i = 1, #ARGV do removed = removed + drop(ARGV[i]) end
+for i = 2, #ARGV do removed = removed + drop(ARGV[i]) end
+local ttl = tonumber(ARGV[1])
+if ttl > 0 and redis.call('PTTL', KEYS[7]) == -1 then redis.call('PEXPIRE', KEYS[7], ttl) end
 return removed
 `;
 
@@ -318,7 +324,7 @@ export function createDeadLetter(client, options = {}) {
 
 	/** Remove records from every structure in one script; resolves how many existed. */
 	function drop(ids) {
-		return withBreaker(b, () => evalCached(redis, DROP_SCRIPT, keys.length, ...keys, ...ids));
+		return withBreaker(b, () => evalCached(redis, DROP_SCRIPT, keys.length, ...keys, ttlMs, ...ids));
 	}
 
 	return {
@@ -523,7 +529,7 @@ export function createDeadLetter(client, options = {}) {
 					if (uid === userId) ids.push(id);
 				}
 				if (ids.length === 0) return 0;
-				await evalCached(redis, DROP_SCRIPT, keys.length, ...keys, ...ids);
+				await evalCached(redis, DROP_SCRIPT, keys.length, ...keys, ttlMs, ...ids);
 				return ids.length;
 			});
 		},

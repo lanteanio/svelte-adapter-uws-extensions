@@ -85,22 +85,24 @@ describe('redis dead-letter (integration)', () => {
 	});
 
 	it('arms a PEXPIRE backstop so an idle queue self-cleans within ttlMs', async () => {
-		const dlq = createDeadLetter(client, { ttlMs: 600 });
-		await dlq.add(rec({ failedAt: await redisNowMs(client) }));
+		const dlq = createDeadLetter(client, { ttlMs: 600, max: 2 });
+		const keys = ['recs', 'order', 'seq', 'tenant', 'tenant-order', 'tenant-size', 'tenant-rank'].map((k) => client.key(`dlq:${k}:{dlq}`));
+		const now = await redisNowMs(client);
+		// With one tenant, an eviction and a remove each empty the rank key and
+		// create it again; it keeps a backstop too.
+		for (let n = 0; n < 2; n++) await dlq.add(rec({ topic: '@t/t0/orders', failedAt: now }));
+		const removable = await dlq.add(rec({ topic: '@t/t0/orders', failedAt: now }));
+		expect(await dlq.remove(removable)).toBe(true);
 
-		for (const k of ['dlq:recs:{dlq}', 'dlq:order:{dlq}', 'dlq:seq:{dlq}']) {
-			const pttl = await client.redis.pttl(client.key(k));
-			expect(pttl).toBeGreaterThan(0);
-			expect(pttl).toBeLessThanOrEqual(600);
+		for (const key of keys) {
+			const pttl = await client.redis.pttl(key);
+			expect(pttl, key).toBeGreaterThan(0);
+			expect(pttl, key).toBeLessThanOrEqual(600);
 		}
 
 		// No further writes: the keys must expire on their own (server clock).
 		await waitRedisMs(client, 800);
-		expect(await client.redis.exists(
-			client.key('dlq:recs:{dlq}'),
-			client.key('dlq:order:{dlq}'),
-			client.key('dlq:seq:{dlq}')
-		)).toBe(0);
+		expect(await client.redis.exists(...keys)).toBe(0);
 		expect(await dlq.count()).toBe(0);
 	});
 
