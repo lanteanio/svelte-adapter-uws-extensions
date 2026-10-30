@@ -112,10 +112,15 @@ export interface DistributedSessionOptions<T = unknown> {
 	 * or malformed extractor (a missing `tenantId`, an invalid tenant, an empty
 	 * `userId`) rejects `set` and `create` with
 	 * `code: 'ERASURE_INDEX_INCOMPLETE'` (the close-time persist skips its
-	 * write), and nothing is written. `touch` never calls the extractor.
+	 * write), and nothing is written.
 	 *
-	 * Records written before the option was enabled stay readable but are not
-	 * extended, so they expire within `ttlMs`.
+	 * A record written before the option was enabled is adopted where a
+	 * legacy store would slide it (`touch`, and a `get` or lifecycle load with
+	 * `refreshOnGet`): its identity is extracted, indexed, and the record is
+	 * rewritten in the qualified layout with a fresh TTL. One whose identity
+	 * cannot be extracted stays readable but is not extended, and `touch`
+	 * resolves `false` for it. The time the keyspace first saw qualified mode
+	 * is kept at `sess:identity:v1:since`.
 	 */
 	forgetIdentity?: (data: T) => ForgetIdentity | null | undefined;
 
@@ -199,10 +204,12 @@ export interface DistributedSession<T = unknown> {
 	 * With `forgetIdentity` (needed instead of `forgetUserId`), the purge
 	 * reads only the index of exactly `(tenantId, userId)`, `null` being only
 	 * the untenanted scope, and deletes only records stored with that
-	 * identity. An invalid `tenantId` throws. While the `forgetUserId` index of
-	 * the same raw user id still lists a record written before qualified mode,
-	 * which names no tenant, it rejects with `code: 'ERASURE_INCOMPLETE'`,
-	 * `legacyResidue: true` and the `removed` count, and leaves that record.
+	 * identity. An invalid `tenantId` throws. Records written before
+	 * qualified mode name no tenant and have no qualified index entry, so
+	 * while one may still exist it rejects with `code: 'ERASURE_INCOMPLETE'`,
+	 * `legacyResidue: true` and the `removed` count: for `ttlMs` after the
+	 * keyspace first saw qualified mode, and while the `forgetUserId` index of
+	 * the same raw user id still lists one.
 	 * Every rejection carries `removed`, the sessions this call revoked.
 	 */
 	purgeUser(tenantId: string | null, userId: string): Promise<number>;

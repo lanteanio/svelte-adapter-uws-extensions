@@ -494,6 +494,13 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 					|| hashes.has(key) || streams.has(key);
 				return exists ? 1 : 0;
 			},
+			// Remaining TTL of a string key in ms: -2 when absent, -1 without one.
+			async pttl(key) {
+				pruneExpiredString(key);
+				if (!store.has(key)) return -2;
+				const expireAt = stringExpiry.get(key);
+				return expireAt === undefined ? -1 : Math.max(0, expireAt - serverNowMs());
+			},
 			async pexpire(key) {
 				const exists = store.has(key) || sortedSets.has(key)
 					|| hashes.has(key) || streams.has(key);
@@ -1171,6 +1178,13 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				// DEL iff the stored value matches). Their DEL would otherwise look
 				// like the fence-release script; the markers keep them distinct and
 				// are matched first.
+				if (script.includes('SESSION_ADOPT_RECORD')) {
+					const [key, expected, next, ttlMs] = args;
+					pruneExpiredString(key);
+					if (store.get(key) !== expected) return 0;
+					await r.set(key, next, 'PX', ttlMs);
+					return 1;
+				}
 				if (script.includes('IDEM_ABORT') || script.includes('SESSION_ERASE_RECORD')) {
 					return evalIdempotencyAbort(args);
 				}

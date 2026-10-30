@@ -67,12 +67,24 @@ function incompleteIndex(cause) {
 	return error;
 }
 
+// Replace a legacy-layout record with its qualified form, extending its TTL,
+// only while it still holds the exact bytes read.
+const ADOPT_RECORD = `
+-- SESSION_ADOPT_RECORD
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  redis.call('SET', KEYS[1], ARGV[2], 'PX', ARGV[3])
+  return 1
+end
+return 0
+`;
+
 // Qualified mode keeps an erasure counter in each identity's index hash. The
 // field name begins with the reserved token prefix, so no token collides with
 // it. purgeUser increments it before reading the index; a write that started
 // before that increment sees the change after storing its record and deletes
 // the record again. The counter lives long enough for any write in flight.
 const ERASURE_FIELD = 'identity:erasure';
+const SINCE_KEY = 'identity:v1:since';
 const ERASURE_FENCE_MS = INDEX_GRACE_MS;
 
 // Qualified mode wraps the record the legacy layout would store with the
@@ -456,12 +468,62 @@ export function createDistributedSession(client, options = {}) {
 		throw incompleteIndex(cause);
 	}
 
+	// The time this store's keyspace first saw qualified mode, recorded once
+	// under the reserved `identity:` prefix and kept. A session written in the
+	// legacy layout before then can exist, unindexed, until its TTL runs out,
+	// so a purge reports such residue for `ttlMs` after this time. Memoized
+	// per store; a failed read is retried on the next call.
+	let sinceRead = null;
+	function qualifiedSince() {
+		if (sinceRead) return sinceRead;
+		sinceRead = (async () => {
+			const sinceKey = client.key(keyPrefix + SINCE_KEY);
+			try {
+				await redis.set(sinceKey, String(wallEpoch()), 'NX');
+				const value = Number(await redis.get(sinceKey));
+				breaker?.success();
+				// An unreadable marker counts as just set: the window opens now.
+				return Number.isFinite(value) ? value : wallEpoch();
+			} catch (err) {
+				breaker?.failure(err);
+				throw err;
+			}
+		})();
+		sinceRead.catch(() => { sinceRead = null; });
+		return sinceRead;
+	}
+
+	// Adopt a record in the legacy layout where a legacy store would slide it:
+	// extract its identity, index it, and replace the record with the
+	// qualified layout and a fresh TTL while it still holds `raw`. Resolves
+	// whether it was adopted. A record whose identity cannot be extracted is
+	// left as it is and not extended.
+	async function adoptLegacy(key, token, raw, value) {
+		let identity;
+		try { identity = readIdentity(forgetIdentity(unwrapData(value)), 'session: forgetIdentity'); } catch { return false; }
+		await qualifiedSince();
+		const epoch = identity !== null ? await indexOwner(identity, token) : null;
+		const wrapped = wrapQualified(identity, raw);
+		let swapped;
+		try {
+			swapped = Number(await evalCached(redis, ADOPT_RECORD, 1, key, raw, wrapped, ttlMs)) === 1;
+			breaker?.success();
+		} catch (err) {
+			breaker?.failure(err);
+			throw err;
+		}
+		if (!swapped) return false;
+		if (identity !== null) await confirmIndexed(key, token, identity, wrapped, epoch);
+		return true;
+	}
+
 	// Write a qualified record: index the new identity, then replace the record
 	// and read the one it replaced in one transaction, so the previous
 	// identity's index field can be dropped. `record` is what the legacy layout
 	// stores ('' for no data). Resolves whether the record was written.
 	async function writeQualified(key, token, record, onlyExisting) {
 		const identity = record === '' ? null : extractIdentity(unwrapData(JSON.parse(record)));
+		try { await qualifiedSince(); } catch (err) { throw incompleteIndex(err); }
 		const epoch = identity !== null ? await indexOwner(identity, token) : null;
 		const raw = record === '' ? '' : wrapQualified(identity, record);
 		let result;
@@ -561,14 +623,15 @@ export function createDistributedSession(client, options = {}) {
 			return null;
 		}
 		if (qualified) {
-			// A record in the legacy layout stays readable but is never
-			// extended, so it expires within one TTL of its last legacy write.
+			// A record in the legacy layout is adopted into the qualified one
+			// where a legacy store would have slid it.
 			const stored = unwrapQualified(data);
-			if (stored !== null) {
-				data = stored.record;
-				if (refreshOnGet) {
-					try { await slideQualified(key, token, stored.identity); } catch { /* not slid */ }
-				}
+			if (stored !== null) data = stored.record;
+			if (refreshOnGet) {
+				try {
+					if (stored !== null) await slideQualified(key, token, stored.identity);
+					else await adoptLegacy(key, token, raw, data);
+				} catch { /* not slid */ }
 			}
 			mGet?.inc({ result: 'hit' });
 			return data;
@@ -638,9 +701,10 @@ export function createDistributedSession(client, options = {}) {
 				try { value = JSON.parse(raw); } catch { readable = false; }
 			}
 			if (readable && qualified) {
-				// The legacy layout is not extended, as in get().
 				const stored = unwrapQualified(value);
-				if (stored !== null) refreshed = await slideQualified(key, token, stored.identity);
+				refreshed = stored !== null
+					? await slideQualified(key, token, stored.identity)
+					: await adoptLegacy(key, token, raw, value);
 			} else if (readable) refreshed = await slide(key, token, value);
 		}
 		mTouch?.inc({ result: refreshed ? 'present' : 'absent' });
@@ -706,8 +770,9 @@ export function createDistributedSession(client, options = {}) {
 		let rec;
 		try { rec = JSON.parse(raw); } catch { return null; }
 		// Qualified mode reads the record inside its identity wrapper; one in
-		// the legacy layout loads but is not extended.
+		// the legacy layout is adopted when the load slides it.
 		const stored = qualified ? unwrapQualified(rec) : null;
+		const legacyLayout = qualified && stored === null ? rec : undefined;
 		if (stored !== null) rec = stored.record;
 		if (!rec || typeof rec !== 'object' || !('d' in rec)) return null;
 		const createdAt = Number(rec.c) || 0;
@@ -719,10 +784,11 @@ export function createDistributedSession(client, options = {}) {
 			try { await redis.unlink(key); breaker?.success(); } catch (err) { breaker?.failure(err); }
 			return null;
 		}
-		if (refreshOnGet && (!qualified || stored !== null)) {
+		if (refreshOnGet) {
 			// Best-effort, as in get(): a load never fails because of it.
 			try {
 				if (stored !== null) await slideQualified(key, token, stored.identity);
+				else if (qualified) await adoptLegacy(key, token, raw, legacyLayout);
 				else await slide(key, token, rec);
 			} catch { /* not slid */ }
 		}
@@ -1090,7 +1156,13 @@ export function createDistributedSession(client, options = {}) {
 			residue ||= outcome.residue;
 		}
 		if (qualified && !failure && !residue) {
-			try { residue = await legacyResidue(userId); } catch (err) { failure = err; }
+			try {
+				// Sessions written in the legacy layout before qualified mode
+				// carry no index this purge could read until their TTL has run
+				// out since the switch; those still listed by a forgetUserId
+				// index are checked one by one.
+				residue = wallEpoch() < (await qualifiedSince()) + ttlMs || await legacyResidue(userId);
+			} catch (err) { failure = err; }
 		}
 		if (failure) {
 			const error = failure.erasureIndexIncomplete ? failure : incompleteIndex(failure);

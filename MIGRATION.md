@@ -661,6 +661,27 @@ without an erasure extractor; that namespace holds the tenant-qualified erasure
 index. Server-minted tokens are unaffected. Stop issuing such tokens before
 upgrading.
 
+### Redis sessions switching to `forgetIdentity`
+
+**Symptom.** Session `purgeUser` rejects with `code: 'ERASURE_INCOMPLETE'` and
+`legacyResidue: true` for `ttlMs` after the first instance runs the store with
+`forgetIdentity`.
+
+**Why.** Sessions written before the switch carry no tenant and, without
+`forgetUserId`, no index, so the purge cannot show that none of them belongs to
+the user until every one of them has either been adopted or expired. The store
+records the switch time at `sess:identity:v1:since`; keep that key with the
+sessions (`clear()` removes it, which opens the window again).
+
+**Action.** Stop instances of the earlier release first, and keep `ttlMs` at
+least as long as before the switch. Active sessions are adopted on their next
+`touch`, refreshing `get` or lifecycle load: the extractor reads their data,
+they are indexed and rewritten in the qualified layout with a fresh TTL, and
+their users stay signed in. With `refreshOnGet: false` and no `touch` calls a
+legacy session is not adopted and expires within its TTL. A legacy session
+whose data the extractor rejects is never extended. Retry erasures that report
+`legacyResidue` after the window.
+
 ### `createForgetStore` requires an explicit tenant
 
 **Symptom.** `forget-store: tenant id is required - pass null for the

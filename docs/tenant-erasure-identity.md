@@ -63,8 +63,11 @@ unknown:
 
 - Postgres tasks: any row with no identity stamp whose `user_id` is this user id
   or is null.
-- Redis sessions: a session in the legacy layout still listed in the
-  `forgetUserId` index of this user id.
+- Redis sessions: any session in the legacy layout during the first `ttlMs`
+  after the store's keyspace first ran in qualified mode (recorded at
+  `sess:identity:v1:since`), because such sessions carry no index the purge
+  could read; afterwards, a legacy session still listed in the `forgetUserId`
+  index of this user id.
 - Redis registry: a `conns:<userId>` row written by `identify`.
 
 Every other failure rejects with `removed` as well, and `createForgetStore`
@@ -102,8 +105,13 @@ read only keys whose segment decodes to a valid identity.
 
 Session tokens beginning with `identity:` are reserved in both modes, as
 `byuser:` is. A replacement that stores a session for another identity removes
-the token from the previous identity's index. A qualified store reads a session
-written in the legacy layout but never extends it, so it expires within `ttlMs`.
+the token from the previous identity's index. A qualified store adopts a session
+written in the legacy layout where a legacy store would extend it (`touch`, and
+a `get` or lifecycle load with `refreshOnGet`): it extracts the identity,
+indexes it, and rewrites the record in the qualified layout with a fresh TTL,
+so active users stay signed in. A legacy session whose identity cannot be
+extracted stays readable, is not extended, and expires within its TTL; `touch`
+resolves `false` for it.
 
 Task rows written without `forgetIdentity` keep `identity_version` null; a
 stamped row with a `null` tenant is the untenanted scope. A check constraint
@@ -126,8 +134,10 @@ migration ledger.
    (`identity_version = 1` with the owning `tenant_id` and `user_id`), or let
    them finish and expire. Rows of unknown ownership stay unstamped and keep
    qualified erasures incomplete; do not relabel them as the `null` tenant.
-   Legacy sessions expire within `ttlMs` and legacy registry rows within the
-   registry `ttl`.
+   Legacy sessions are adopted on their next refresh or expire within `ttlMs`
+   (keep `ttlMs` at least as long as before the switch); session purges report
+   `legacyResidue` until that window has passed. Legacy registry rows expire
+   within the registry `ttl`.
 
 Deployments that keep the legacy options keep their behaviour: a bare user id is
 global within the configured prefix or table, and `tenantId` does not scope the
