@@ -42,7 +42,7 @@ Branch on an error's `code` when deciding how to handle a recoverable failure. M
 | `ERASURE_INCOMPLETE` | Composed forget store | One or more stores failed. Inspect failures and partialCounts, repair the cause and retry. |
 | `REDIS_CONNECTION_CLOSED` | Managed Redis subscribers | The owned connection ended and cannot complete the queued operation. Native driver errors retain their own codes. |
 | `REDIS_CLUSTER_PUBLISHER_UNAVAILABLE` | Redis pub/sub relay | No ready master can publish this relay batch. |
-| `BUS_DEACTIVATED` | Redis pub/sub and sharded bus lifecycle | Deactivation interrupted activation or a pending shard follow. |
+| `BUS_DEACTIVATED` | Redis pub/sub, sharded bus and publish-rate aggregator lifecycle | Deactivation interrupted activation or a pending shard follow. |
 | `BUS_NOT_ACTIVE` | Sharded bus follows | Activate the bus before following topics. |
 | `SHARDED_OWNER_UNAVAILABLE` | Sharded bus topology | The slot owner is not available in the current topology. |
 | `SHARDED_OWNER_CLOSED` | Sharded bus subscription | The owning connection ended while subscribing. |

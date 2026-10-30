@@ -368,10 +368,48 @@ describe('redis publish-rate aggregator', () => {
 				const activating = agg.activate(platform);
 				await agg.deactivate();
 				release();
-				await activating;
+				await expect(activating).rejects.toMatchObject({ code: 'BUS_DEACTIVATED' });
 				expect(vi.getTimerCount()).toBe(0);
 			} finally {
 				vi.useRealTimers();
+			}
+		});
+
+		// 'pending' when `promise` has not settled within `ms`.
+		const within = (promise, ms = 200) => Promise.race([
+			promise.then(() => 'resolved', (err) => err),
+			new Promise((r) => setTimeout(() => r('pending'), ms))
+		]);
+
+		it('rejects an activation that deactivate() overtakes, even when SUBSCRIBE is never answered', async () => {
+			gatedClient(() => new Promise(() => {}));
+			const agg = createPublishRateAggregator(client);
+			const activating = agg.activate(platform);
+			await agg.deactivate();
+			const outcome = await within(activating);
+			expect(outcome).toBeInstanceOf(Error);
+			expect(outcome.code).toBe('BUS_DEACTIVATED');
+		});
+
+		it('deactivates without waiting for Redis to answer QUIT', async () => {
+			const { subscribers } = gatedClient((go) => go());
+			const agg = createPublishRateAggregator(client);
+			await agg.activate(platform);
+			subscribers[0].quit = () => new Promise(() => {});
+			expect(await within(agg.deactivate())).toBe('resolved');
+		});
+
+		it('keeps the platform of an activate() that follows deactivate() at once', async () => {
+			const agg = createPublishRateAggregator(client);
+			await agg.activate(mockPlatform());
+			const deactivating = agg.deactivate();
+			const activating = agg.activate(platform);
+			await deactivating;
+			await activating;
+			try {
+				expect(agg.topPublishers.map((t) => t.topic)).toContain('chat:room1');
+			} finally {
+				await agg.deactivate();
 			}
 		});
 	});

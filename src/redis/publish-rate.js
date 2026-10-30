@@ -33,6 +33,7 @@ import { createBusValidator } from '../shared/bus-validate.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { openSubscriber, closeConnection } from '../shared/redis-subscriber.js';
+import { operationError } from '../shared/errors.js';
 import { registerAdmissionRate } from '../shared/_publish-rate-admission.js';
 
 /**
@@ -132,8 +133,10 @@ export function createPublishRateAggregator(client, options = {}) {
 	const busValidator = createBusValidator({});
 	let publishTimer = null;
 	let activated = false;
-	// The activation in flight, shared by overlapping activate() calls.
+	// The activation in flight, shared by overlapping activate() calls, and
+	// the signal deactivate() cancels it with.
 	let activation = null;
+	let cancelAttempt = null;
 	let remoteInstancesWarnFired = false;
 
 	// Merged-view memo. computeMerged runs on EVERY rateOf/topPublishers read
@@ -332,10 +335,16 @@ export function createPublishRateAggregator(client, options = {}) {
 				remoteSubs.set(env.instanceId, { ts, subs: subsMap });
 			}
 		});
-		// A deactivate() meanwhile replaced or dropped `subscriber` and closed
-		// this one, so the attempt then ends without starting the timer.
-		const current = sub.subscribe(channel).then(() => {
-			if (subscriber !== sub) return;
+		// A deactivate() meanwhile closes this connection and cancels the
+		// attempt, which then rejects at once, even when the SUBSCRIBE is never
+		// answered, and starts no timer.
+		let cancel;
+		const cancelled = new Promise((resolve) => { cancel = resolve; });
+		cancelAttempt = cancel;
+		const subscribed = sub.subscribe(channel).then(() => true);
+		const current = Promise.race([subscribed, cancelled]).then((ok) => {
+			if (ok !== true || subscriber !== sub) throw deactivatedError();
+			cancelAttempt = null;
 			activation = null;
 			activated = true;
 			// First broadcast on the next tick (so subscribers in this same
@@ -344,8 +353,9 @@ export function createPublishRateAggregator(client, options = {}) {
 			publishTimer = setIntervalTimer(tick, publishInterval);
 			if (publishTimer.unref) publishTimer.unref();
 		}, (err) => {
-			if (subscriber !== sub) return;
+			if (subscriber !== sub) throw deactivatedError();
 			// Left inactive, so the next activate() tries again.
+			cancelAttempt = null;
 			activation = null;
 			subscriber = null;
 			activePlatform = null;
@@ -356,18 +366,23 @@ export function createPublishRateAggregator(client, options = {}) {
 		return current;
 	}
 
+	function deactivatedError() {
+		return operationError('BUS_DEACTIVATED', 'publish-rate: deactivated during activation');
+	}
+
+	// Everything is reset before anything could be awaited, so an activate()
+	// right after starts from a clean slate.
 	async function deactivate() {
 		activated = false;
 		activation = null;
+		const cancel = cancelAttempt;
+		cancelAttempt = null;
 		if (publishTimer) {
 			clearIntervalTimer(publishTimer);
 			publishTimer = null;
 		}
-		if (subscriber) {
-			const sub = subscriber;
-			subscriber = null;
-			try { await sub.quit(); } catch { try { sub.disconnect(); } catch { /* ignore */ } }
-		}
+		const sub = subscriber;
+		subscriber = null;
 		remoteSlices.clear();
 		remoteSubs.clear();
 		mergedRev++;
@@ -375,8 +390,12 @@ export function createPublishRateAggregator(client, options = {}) {
 		// Reset each subscriber's over-set: after the merged view is torn down,
 		// a re-activate should treat a still-hot topic as a fresh crossing
 		// rather than suppress it against a stale pre-deactivate over-set.
-		for (const sub of rateSubscribers) sub.over = new Set();
+		for (const rs of rateSubscribers) rs.over = new Set();
 		activePlatform = null;
+		if (cancel) cancel(false);
+		// Closed at once: a QUIT waits in the offline queue while Redis is
+		// unreachable, and closing the connection ends its subscription anyway.
+		if (sub) closeConnection(sub);
 	}
 
 	/**

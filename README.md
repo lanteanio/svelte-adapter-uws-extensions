@@ -3889,8 +3889,8 @@ export async function init({ platform }) {
 | `rateOf(topic)` | Sampled messagesPerSec for a topic in the merged top-N, or 0 outside that display. A zero does not establish that the topic is idle. |
 | `subscribersOf(topic)` | Cluster-wide subscriber count for a topic, summed across this instance's live local count (from the optional `subjects` callback) and cached non-stale remote contributions. Returns 0 when no `subjects` is wired and no remote instance has reported the topic. The sharded bus's `bus.subscribers(topic)` delegates here when an aggregator is wired. |
 | `onPublishRate(cb)` | Register a callback that fires when topics cross the configured cluster-wide `topicPublishRatePerSec` threshold (the cluster mirror of the adapter's per-instance `platform.onPublishRate(cb)`). Evaluated once per broadcast tick over the merged view, **edge-triggered**: a topic fires the tick it rises to or above the threshold and re-arms only after it drops below and rises again, so a persistently-hot topic fires once rather than every tick. `cb` receives the array of crossing `{topic, messagesPerSec, bytesPerSec, contributingInstances}` entries; a throwing callback is contained (logged, never breaks the timer or sibling subscribers). Returns an unsubscribe function. No-op when `topicPublishRatePerSec` is `false`. The admission rule sheds continuously; this is the event-push hook for acting on a crossing (alert, scale, targeted backpressure). |
-| `activate(platform)` | Open the subscriber and start the broadcast timer. Idempotent. |
-| `deactivate()` | Stop the timer, drop the subscriber, clear cached slices. |
+| `activate(platform)` | Open the subscriber and start the broadcast timer. Idempotent; overlapping calls share one activation. Rejects when the SUBSCRIBE fails, and the next call tries again; rejects with `BUS_DEACTIVATED` when `deactivate()` runs first. |
+| `deactivate()` | Stop the timer, close the subscriber at once without waiting for Redis, clear cached slices. |
 
 #### Wire envelope (internal)
 

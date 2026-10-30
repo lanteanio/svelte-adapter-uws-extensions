@@ -77,10 +77,15 @@ export interface PublishRateAggregator {
 	/** Stable id for this instance. */
 	readonly instanceId: string;
 
-	/** Open the subscriber and start the broadcast timer. Idempotent. */
+	/**
+	 * Open the subscriber and start the broadcast timer. Idempotent; overlapping
+	 * calls share one activation. Rejects when the SUBSCRIBE fails, and the next
+	 * call tries again; rejects with code `BUS_DEACTIVATED` when `deactivate()`
+	 * runs first.
+	 */
 	activate(platform: Platform): Promise<void>;
 
-	/** Stop the timer, drop the subscriber, and clear cached slices. */
+	/** Stop the timer, close the subscriber without waiting for Redis, and clear cached slices. */
 	deactivate(): Promise<void>;
 
 	/**
