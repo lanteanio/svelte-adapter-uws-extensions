@@ -35,7 +35,7 @@ import { guardBreaker } from '../shared/breaker-admission.js';
 import { addWsSubscription } from '../shared/ws-subscriptions.js';
 import { MULTI_WORKER_RUNTIME, UNSEQUENCED_DELIVERY, carriedSeq, receivedOptions, relayedLocally, relayedBatchLocally, relayEntry } from '../shared/sequence-authority.js';
 import { defineOptions, option } from '../shared/options.js';
-import { SYSTEM_FRAME, createDeliveryHints, isRefetchRequest } from '../shared/delivery-hints.js';
+import { attachHealth, isRefetchRequest } from '../shared/delivery-hints.js';
 
 // How an activation's SUBSCRIBE race ended.
 const SUBSCRIBED = Symbol('subscribed');
@@ -217,17 +217,26 @@ export function createPubSubBus(client, options = {}) {
 	/** @type {(() => void) | null} */
 	let unsubscribeBreaker = null;
 
-	// Refetch hints after lost delivery (see shared/delivery-hints.js), on a
-	// bus that publishes health frames. The peer request is a plain
-	// `recovered` envelope on systemChannel.
-	const hints = b && typeof b.subscribe === 'function' && systemChannel ? createDeliveryHints({
+	// degraded / recovered and refetch hints go through the announcer this
+	// bus shares with every other bus on its platform and systemChannel (see
+	// shared/delivery-hints.js), from activate() until deactivate(). The peer
+	// request is a plain `recovered` envelope on systemChannel.
+	const healthSource = b && typeof b.subscribe === 'function' && systemChannel ? {
 		breaker: b,
-		channel: systemChannel,
 		policy: degradationPolicy,
-		platform: () => activePlatform,
 		relay: (data) => scheduleRelay(JSON.stringify({ instanceId, topic: systemChannel, event: 'recovered', data, s: false }), 1),
-		emitted: () => mRecovered?.inc()
-	}) : null;
+		counted: (event) => (event === 'degraded' ? mDegraded : mRecovered)?.inc()
+	} : null;
+	/** @type {ReturnType<typeof attachHealth> | null} */
+	let hints = null;
+	/** @type {any} */
+	let healthPlatform = null;
+	function attachTo(platform) {
+		if (healthSource === null || healthPlatform === platform) return;
+		hints?.detach();
+		healthPlatform = platform;
+		hints = attachHealth(platform, /** @type {string} */ (systemChannel), healthSource);
+	}
 
 	// From activate() until deactivate(): a failed activation is retried, on a
 	// timer that backs off, and at once when the breaker lets a probe through or
@@ -316,7 +325,7 @@ export function createPubSubBus(client, options = {}) {
 	// does a refused systemChannel subscription lose health events.
 	const announcesHealth = !!(b && typeof b.subscribe === 'function');
 	// The topic of a peer's refetch request this bus answers itself, if any.
-	const hintChannel = hints ? systemChannel : null;
+	const hintChannel = healthSource ? systemChannel : null;
 	let systemChannelRefusalReported = false;
 	function reportSystemChannelFailure() {
 		if (!announcesHealth || systemChannelRefusalReported) return;
@@ -582,29 +591,18 @@ export function createPubSubBus(client, options = {}) {
 		} catch (err) { failed(err); }
 	}
 
-	// Emits degraded / recovered from activate() until deactivate(), and lets a
-	// failed activation try again once the breaker admits a probe.
+	// Runs the server-side callbacks from activate() until deactivate(), and
+	// lets a failed activation try again once the breaker admits a probe.
 	function breakerChanged(from, to) {
 		if (!active && to !== 'broken') scheduleRetry(0);
 		if (from === 'healthy' && to !== 'healthy') {
 			if (onDegraded) {
 				try { onDegraded(); } catch { /* don't propagate user errors */ }
 			}
-			if (systemChannel && activePlatform) {
-				// A degradation policy ships the precomputed client mitigation
-				// alongside the event + de-herds the push (jitterMs), so the
-				// resulting client retries/fallbacks spread across the cooldown.
-				let out = null;
-				if (degradationPolicy) { try { out = degradationPolicy.onDegraded({ from, to }); } catch { /* a policy must never break the emit */ } }
-				const data = out && out.mitigation ? { at: now(), mitigation: out.mitigation } : { at: now() };
-				activePlatform.publish(systemChannel, 'degraded', data, out && out.jitterMs ? { ...SYSTEM_FRAME, jitterMs: out.jitterMs } : SYSTEM_FRAME);
-				mDegraded?.inc();
-			}
 		} else if (from !== 'healthy' && to === 'healthy') {
 			if (onRecovered) {
 				try { onRecovered(); } catch { /* don't propagate user errors */ }
 			}
-			hints?.recovered(from, to);
 		}
 	}
 
@@ -642,7 +640,7 @@ export function createPubSubBus(client, options = {}) {
 			// they must not read a peer's recovery as this instance's, and
 			// requests from several peers merge into one frame.
 			if (hintChannel !== null && parsed.topic === hintChannel && isRefetchRequest(parsed)) {
-				hints.peerLost();
+				hints?.peerLost();
 				return;
 			}
 			// Local delivery runs no application code, so a carried trace
@@ -704,9 +702,9 @@ export function createPubSubBus(client, options = {}) {
 		sub.on('message', (ch, message) => receive(sub, ch, message));
 		// A reconnect drops the subscription without an 'end': whatever peers
 		// published until the channel is restored never arrives.
-		if (hints) {
-			sub.on(SUBSCRIBER_RESTORING, () => { if (subscriber === sub) hints.restoreStarted(); });
-			sub.on(SUBSCRIBER_RESTORED, () => { if (subscriber === sub) hints.restoreEnded(); });
+		if (healthSource) {
+			sub.on(SUBSCRIBER_RESTORING, () => { if (subscriber === sub) hints?.restoreStarted(); });
+			sub.on(SUBSCRIBER_RESTORED, () => { if (subscriber === sub) hints?.restoreEnded(); });
 		}
 
 		let outcome;
@@ -1119,6 +1117,7 @@ export function createPubSubBus(client, options = {}) {
 			// are forwarded through the latest platform, even if a
 			// previous activate() already started the subscriber.
 			activePlatform = platform;
+			attachTo(platform);
 			activeTracing = traceEnabled(platform);
 			clearIncomingContext = activeTracing ? bindTraceContext(platform, null) : null;
 			wanted = true;
@@ -1136,7 +1135,9 @@ export function createPubSubBus(client, options = {}) {
 			stopRetry();
 			retryMs = 0;
 			activateFailing = false;
-			hints?.reset();
+			hints?.detach();
+			hints = null;
+			healthPlatform = null;
 			if (unsubscribeBreaker) {
 				unsubscribeBreaker();
 				unsubscribeBreaker = null;

@@ -46,7 +46,7 @@ import {
 	traceEnabled
 } from '../shared/trace-context.js';
 import { openSubscriber, watchLiveness, closeConnection, isReplyError, SUBSCRIBER_RESTORING, SUBSCRIBER_RESTORED } from '../shared/redis-subscriber.js';
-import { SYSTEM_FRAME, createDeliveryHints, isRefetchRequest } from '../shared/delivery-hints.js';
+import { attachHealth, isRefetchRequest } from '../shared/delivery-hints.js';
 import { MULTI_WORKER_RUNTIME, UNSEQUENCED_DELIVERY, carriedSeq, receivedOptions, relayedLocally, relayedBatchLocally, relayEntry } from '../shared/sequence-authority.js';
 import { defineOptions, option } from '../shared/options.js';
 
@@ -150,19 +150,27 @@ export function createShardedBus(client, options = {}) {
 		return channelPrefix + shardKey(topic);
 	}
 
-	// Refetch hints after lost delivery (see shared/delivery-hints.js), on a
-	// bus with a breaker. The bus follows the health topic's shard channel
-	// from activation on, where peers send their requests.
+	// degraded / recovered and refetch hints, on a bus with a breaker, go
+	// through the announcer it shares with every other bus on its platform and
+	// HEALTH_TOPIC (see shared/delivery-hints.js), from a successful activation
+	// until deactivate(). The bus follows the health topic's shard channel,
+	// where peers send their requests.
 	const announcesHealth = !!(b && typeof b.subscribe === 'function');
 	const hintShard = announcesHealth ? channelFor(HEALTH_TOPIC) : null;
-	const hints = announcesHealth ? createDeliveryHints({
+	const healthSource = announcesHealth ? {
 		breaker: b,
-		channel: HEALTH_TOPIC,
-		platform: () => activePlatform,
 		relay: (data) => scheduleRelay(/** @type {string} */ (hintShard), JSON.stringify({ instanceId, topic: HEALTH_TOPIC, event: 'recovered', data, s: false }), [HEALTH_TOPIC])
-	}) : null;
-	/** @type {(() => void) | null} */
-	let unsubscribeBreaker = null;
+	} : null;
+	/** @type {ReturnType<typeof attachHealth> | null} */
+	let hints = null;
+	/** @type {any} */
+	let healthPlatform = null;
+	function attachTo(platform) {
+		if (healthSource === null || healthPlatform === platform) return;
+		hints?.detach();
+		healthPlatform = platform;
+		hints = attachHealth(platform, HEALTH_TOPIC, healthSource);
+	}
 	// An activation failed since the last one that succeeded: the connections
 	// served meanwhile missed what peers published.
 	let activationFailed = false;
@@ -635,7 +643,7 @@ export function createShardedBus(client, options = {}) {
 				// A peer's refetch request: requests from several peers merge into
 				// one frame, published once this instance's breaker is healthy.
 				if (ch === hintShard && parsed.topic === HEALTH_TOPIC && isRefetchRequest(parsed)) {
-					/** @type {any} */ (hints).peerLost();
+					hints?.peerLost();
 					return;
 				}
 				// Local delivery runs no application code, so a carried trace
@@ -1008,9 +1016,9 @@ export function createShardedBus(client, options = {}) {
 			sub.on('smessage', (ch, message) => {
 				if (subStandalone === sub) handleSMessage(ch, message);
 			});
-			if (hints) {
-				sub.on(SUBSCRIBER_RESTORING, () => { if (subStandalone === sub) hints.restoreStarted(); });
-				sub.on(SUBSCRIBER_RESTORED, () => { if (subStandalone === sub) hints.restoreEnded(); });
+			if (healthSource) {
+				sub.on(SUBSCRIBER_RESTORING, () => { if (subStandalone === sub) hints?.restoreStarted(); });
+				sub.on(SUBSCRIBER_RESTORED, () => { if (subStandalone === sub) hints?.restoreEnded(); });
 			}
 		}
 		subReady = true;
@@ -1079,7 +1087,10 @@ export function createShardedBus(client, options = {}) {
 		activePlatform = platform;
 		activeTracing = traceEnabled(platform);
 		clearIncomingContext = activeTracing ? bindTraceContext(platform, null) : null;
-		if (active) return;
+		if (active) {
+			attachTo(platform);
+			return;
+		}
 		// Overlapping calls share one activation, so only one subscriber set is
 		// opened.
 		if (activation) return activation;
@@ -1169,8 +1180,8 @@ export function createShardedBus(client, options = {}) {
 		attempt = null;
 		active = true;
 		activation = null;
-		if (hintShard !== null) {
-			if (!unsubscribeBreaker) unsubscribeBreaker = b.subscribe(breakerChanged);
+		if (healthSource !== null && hintShard !== null) {
+			attachTo(activePlatform);
 			// Held while active, so an unfollow of a topic on the same shard
 			// channel keeps it.
 			channelRefcounts.set(hintShard, (channelRefcounts.get(hintShard) || 0) + 1);
@@ -1214,16 +1225,6 @@ export function createShardedBus(client, options = {}) {
 		});
 	}
 
-	// degraded / recovered for this worker's breaker, from activation until
-	// deactivate().
-	function breakerChanged(from, to) {
-		if (from === 'healthy' && to !== 'healthy') {
-			activePlatform?.publish(HEALTH_TOPIC, 'degraded', { at: now() }, SYSTEM_FRAME);
-		} else if (from !== 'healthy' && to === 'healthy') {
-			hints?.recovered(from, to);
-		}
-	}
-
 	function deactivatedError() {
 		return operationError('BUS_DEACTIVATED', 'sharded bus: deactivated during activation');
 	}
@@ -1236,11 +1237,9 @@ export function createShardedBus(client, options = {}) {
 		attempt = null;
 		activation = null;
 		if (pending) pending.cancel();
-		if (unsubscribeBreaker) {
-			unsubscribeBreaker();
-			unsubscribeBreaker = null;
-		}
-		hints?.reset();
+		hints?.detach();
+		hints = null;
+		healthPlatform = null;
 		activationFailed = false;
 		if (healthRetry !== null) {
 			clearTimer(healthRetry);

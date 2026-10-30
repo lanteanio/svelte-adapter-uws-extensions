@@ -10,7 +10,8 @@ import { registeredRecord } from '../helpers/diagnostic-line.js';
 import { EXTENSIONS_ERROR_IDS } from '../../src/error-registry.js';
 import { createDegradationPolicy } from '../../src/shared/degradation.js';
 import { SUBSCRIBER_RESTORING, SUBSCRIBER_RESTORED } from '../../src/shared/redis-subscriber.js';
-import { HINT_HOLD_MS } from '../../src/shared/delivery-hints.js';
+import { HINT_HOLD_MS, HINT_MAX_HOLD_MS } from '../../src/shared/delivery-hints.js';
+import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
 
 const TRACE_A = '00-0123456789abcdef0123456789abcdef-0123456789abcdef-01';
 const TRACE_B = '00-fedcba9876543210fedcba9876543210-fedcba9876543210-00';
@@ -1237,9 +1238,14 @@ describe('redis pubsub bus', () => {
 
 	describe('refetch hint after lost delivery', () => {
 		const cleanups = [];
-		beforeEach(() => { vi.useFakeTimers(); });
+		beforeEach(() => {
+			vi.useFakeTimers();
+			// The waits are measured on the monotonic clock; run it on the fake one.
+			setRuntimeEnv({ clock: { monotonic: () => Date.now() } });
+		});
 		afterEach(async () => {
 			while (cleanups.length) await cleanups.pop()();
+			resetRuntimeEnv();
 			vi.useRealTimers();
 		});
 		const tick = () => vi.advanceTimersByTimeAsync(5);
@@ -1505,13 +1511,15 @@ describe('redis pubsub bus', () => {
 			expect(frames(b.platform)[0].data.recovery).toEqual(expected);
 			expect(frames(b.platform)[0].options).toEqual({ relay: false, seq: false, jitterMs: 2000 });
 
-			// A peer request.
+			// A peer request, at least HINT_MAX_HOLD_MS after the first.
 			a.breaker.failure();
 			a.wrapped.publish('chat', 'msg', { n: 1 });
 			await tick();
 			a.breaker.reset();
 			await tick();
 			await hold();
+			expect(frames(b.platform)).toHaveLength(1);
+			await vi.advanceTimersByTimeAsync(HINT_MAX_HOLD_MS);
 			expect(frames(b.platform)).toHaveLength(2);
 			expect(frames(b.platform)[1].data.recovery).toEqual(expected);
 			expect(frames(b.platform)[1].options).toEqual({ relay: false, seq: false, jitterMs: 2000 });

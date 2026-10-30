@@ -6,6 +6,7 @@ import { createShardedBus } from '../../src/redis/sharded-pubsub.js';
 import { createCircuitBreaker } from '../../src/shared/breaker.js';
 import { SUBSCRIBER_RESTORING, SUBSCRIBER_RESTORED } from '../../src/shared/redis-subscriber.js';
 import { HINT_HOLD_MS } from '../../src/shared/delivery-hints.js';
+import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
 import { EXTENSIONS_ERROR_IDS } from '../../src/error-registry.js';
 
 const HEALTH_CHANNEL = 'uws:sharded:__realtime';
@@ -15,10 +16,13 @@ describe('sharded bus health events and refetch hints', () => {
 	const cleanups = [];
 	beforeEach(() => {
 		vi.useFakeTimers();
+		// The waits are measured on the monotonic clock; run it on the fake one.
+		setRuntimeEnv({ clock: { monotonic: () => Date.now() } });
 		client = mockRedisClient();
 	});
 	afterEach(async () => {
 		while (cleanups.length) await cleanups.pop()();
+		resetRuntimeEnv();
 		vi.useRealTimers();
 	});
 	const tick = () => vi.advanceTimersByTimeAsync(5);
@@ -155,6 +159,79 @@ describe('sharded bus health events and refetch hints', () => {
 		expect(a.subscriber()._shardedChannels.has(HEALTH_CHANNEL)).toBe(true);
 		expect(sink.ids().filter((id) => id === EXTENSIONS_ERROR_IDS.SHARDED_HEALTH_CHANNEL)).toHaveLength(1);
 		expect(a.breaker.state).toBe('healthy');
+	});
+
+	it('stops retrying a refused health channel on deactivate', async () => {
+		const source = mockRedisClient();
+		const duplicate = source.duplicate.bind(source);
+		source.duplicate = (o) => {
+			const dup = duplicate(o);
+			const ssubscribe = dup.ssubscribe.bind(dup);
+			dup.ssubscribe = async (...channels) => {
+				if (channels.includes(HEALTH_CHANNEL)) throw new Error('NOPERM');
+				return ssubscribe(...channels);
+			};
+			return dup;
+		};
+		const breaker = createCircuitBreaker({ failureThreshold: 1 });
+		const bus = createShardedBus(source, { breaker });
+		await bus.activate(mockPlatform());
+		await tick();
+		await bus.deactivate();
+		breaker.destroy();
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it('asks its own clients to refetch after activation failed and then succeeded', async () => {
+		const source = mockRedisClient();
+		const info = source.redis.info.bind(source.redis);
+		let refusals = 1;
+		source.redis.info = async (...args) => {
+			if (refusals > 0) { refusals--; throw new Error('connection lost'); }
+			return info(...args);
+		};
+		const p = mockPlatform();
+		const breaker = createCircuitBreaker({ failureThreshold: 5 });
+		const bus = createShardedBus(source, { breaker });
+		cleanups.push(async () => { await bus.deactivate(); breaker.destroy(); });
+		await expect(bus.activate(p)).rejects.toThrow('connection lost');
+		await bus.activate(p);
+		await hold();
+		expect(refetches(p)).toHaveLength(1);
+	});
+
+	it('asks its own clients to refetch after a cluster master connection ended and its channels moved', async () => {
+		const source = mockRedisClient();
+		const node = source.redis.duplicate();
+		const slots = [[0, 16383, ['127.0.0.1', 6379, 'master']]];
+		node.cluster = async (cmd) => (cmd === 'MYID' ? 'master' : slots);
+		source.redis.nodes = () => [node];
+		source.redis.cluster = node.cluster;
+		source.redis.refreshSlotsCache = (cb) => cb?.();
+		const subscribers = [];
+		const duplicate = node.duplicate.bind(node);
+		node.duplicate = (...args) => {
+			const sub = duplicate(...args);
+			sub.status = 'ready';
+			sub.condition = { subscriber: { channels: () => [...sub._shardedChannels] } };
+			subscribers.push(sub);
+			return sub;
+		};
+		const p = mockPlatform();
+		const breaker = createCircuitBreaker({ failureThreshold: 5 });
+		const bus = createShardedBus(source, { breaker });
+		cleanups.push(async () => { await bus.deactivate(); breaker.destroy(); });
+		await bus.activate(p);
+		await tick();
+		await bus.follow('room');
+		expect(subscribers).toHaveLength(1);
+		subscribers[0].status = 'end';
+		subscribers[0]._shardedChannels.clear();
+		subscribers[0]._listeners.get('end')();
+		for (let i = 0; i < 10; i++) await tick();
+		expect(subscribers.at(-1)._shardedChannels.has('uws:sharded:room')).toBe(true);
+		await hold();
+		expect(refetches(p)).toHaveLength(1);
 	});
 
 	it('keeps the health channel when a topic on the same shard channel is unfollowed', async () => {
