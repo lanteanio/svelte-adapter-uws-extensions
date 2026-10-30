@@ -5,6 +5,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPgClient } from '../helpers/mock-pg.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
+import { mockWs } from '../helpers/mock-ws.js';
 import { MAX_TIMER_INTERVAL_MS } from '../../src/shared/options.js';
 import { createRedisClient } from '../../src/redis/index.js';
 import { createPubSubBus } from '../../src/redis/pubsub.js';
@@ -383,9 +384,18 @@ describe('null takes the default, observed', () => {
 	});
 
 	it('a null pub/sub systemChannel still turns the health events off', async () => {
+		// open() subscribes the connection to the system channel; the default
+		// channel shows the comparison is live.
+		const breaker = createCircuitBreaker();
 		const platform = mockPlatform();
-		const bus = keep(createPubSubBus(redis, { systemChannel: null }));
-		await bus.hooks.open({ id: 'w1' }, { platform });
+		const announcing = keep(createPubSubBus(redis, { breaker }));
+		const heard = mockWs();
+		await announcing.hooks.open(heard, { platform });
+		expect(heard.isSubscribed('__realtime')).toBe(true);
+		const silent = keep(createPubSubBus(redis, { breaker, systemChannel: null }));
+		const quiet = mockWs();
+		await silent.hooks.open(quiet, { platform });
+		expect(quiet.isSubscribed('__realtime')).toBe(false);
 		expect(platform.subscribed).toEqual([]);
 	});
 });

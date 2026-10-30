@@ -10,7 +10,8 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { createBackendClient, resetBackendKeys, isClusterBackend } from '../helpers/backend.js';
 import { waitRedisMs } from '../helpers/backend-clock.js';
-import { createRateLimit } from '../../../src/redis/ratelimit.js';
+import { createRateLimit, createCompositeRateLimit } from '../../../src/redis/ratelimit.js';
+import { createUpgradeBucket } from '../../../src/redis/upgrade-bucket.js';
 
 function fakeWs(userData = {}) {
 	return { getUserData: () => userData };
@@ -183,6 +184,35 @@ describe('redis ratelimit (integration)', () => {
 				expect((await limiter.consume(fakeWs({ ip: '10.0.0.' + refill.length }))).allowed).toBe(false);
 			});
 		}
+
+		it('composite consumes, bans and bans explicitly with fractional values', async () => {
+			const limiter = createCompositeRateLimit(client, {
+				dimensions: {
+					ip: { points: 1, interval: 1000.5, blockDuration: 2500.25, keyBy: 'ip' },
+					route: { points: 5, interval: 999.75, keyBy: () => 'route' }
+				}
+			});
+			const ws = fakeWs({ ip: '11.0.0.1' });
+			expect((await limiter.consume(ws)).allowed).toBe(true);
+			const denied = await limiter.consume(ws);
+			expect(denied.allowed).toBe(false);
+			expect(denied.tripped).toBe('ip');
+			expect(denied.resetMs).toBeGreaterThan(1000);
+			await limiter.ban('ip', '11.0.0.2', 1500.5);
+			expect((await limiter.consume(fakeWs({ ip: '11.0.0.2' }))).allowed).toBe(false);
+		});
+
+		it('upgrade bucket blocks with a fractional blockDuration instead of failing open', async () => {
+			// The bucket admits when its script fails, so only a real deny shows
+			// the expiry was accepted.
+			const bucket = createUpgradeBucket(client, {
+				perMinute: 1, blockDuration: 1500.5, siege: { perMinute: 1, blockDuration: 2500.25 }
+			});
+			expect(await bucket.admit('12.0.0.1')).toBe(true);
+			expect(await bucket.admit('12.0.0.1')).toBe(false);
+			expect(await bucket.admit('12.0.0.2', 'siege')).toBe(true);
+			expect(await bucket.admit('12.0.0.2', 'siege')).toBe(false);
+		});
 	});
 
 	describe('keyBy modes', () => {
