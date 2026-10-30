@@ -41,7 +41,7 @@ describe('PostgreSQL schema contracts', () => {
 			await postgresReadiness(runtime, [component]);
 			expect(component.status()).toEqual({ state: 'ready', error: null });
 		} finally { await runtime.end(); }
-		expect((await client.query('SELECT version FROM svti_schema_migrations WHERE table_name = $1 ORDER BY version', [table])).rows).toEqual((store === 'alarm-store' || store === 'dead-letter' ? [1, 2, 3, 4] : store === 'tasks' ? [1, 2, 3] : [1, 2]).map(version => ({ version })));
+		expect((await client.query('SELECT version FROM svti_schema_migrations WHERE table_name = $1 ORDER BY version', [table])).rows).toEqual((store === 'alarm-store' || store === 'dead-letter' || store === 'tasks' ? [1, 2, 3, 4] : [1, 2]).map(version => ({ version })));
 	});
 
 	it('serializes independent cold starts without duplicate ledger entries', async () => {

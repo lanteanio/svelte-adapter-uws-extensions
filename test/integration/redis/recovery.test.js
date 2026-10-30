@@ -134,13 +134,17 @@ it('verifies session records and registry routing with their default prefixes', 
 		await registry.hooks.open(mockWs({ userId: 'user', appSession: 'byuser:routing-token', [WS_SESSION_ID]: 'connection-token' }), { platform: mockPlatform() });
 		expect(await source.redis.type(source.key('sess:' + token))).toBe('string');
 		expect(await source.redis.type(source.key('regsess:byuser:routing-token'))).toBe('hash');
+		// A store without forgetIdentity keeps the legacy coverage key beside
+		// the record and its erasure index.
+		expect(await source.redis.type(source.key('sess:identity:v1:legacy-active'))).toBe('string');
+		const expected = { sessions: 3, registry: 2 };
 		for (const families of [['sessions'], ['registry'], ['sessions', 'registry']]) {
 			const report = await runVerification({ schemaVersion: 1, redis: {
 				keyPrefix: source.key(''), families,
-				minimumKeys: Object.fromEntries(families.map(id => [id, 2]))
+				minimumKeys: Object.fromEntries(families.map(id => [id, expected[id]]))
 			} }, { redis: source.redis });
 			expect(report.ok, JSON.stringify(report)).toBe(true);
-			for (const id of families) expect(report.redis.observations[id].keys).toBe(2);
+			for (const id of families) expect(report.redis.observations[id].keys).toBe(expected[id]);
 		}
 	} finally { await registry.destroy(); }
 });
