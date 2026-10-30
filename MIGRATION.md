@@ -670,13 +670,22 @@ keyspace still held sessions written before the switch.
 **Why.** Sessions written before the switch carry no tenant and, without
 `forgetUserId`, no index, so the purge cannot show that none of them belongs to
 the user until every one of them has either been adopted or expired. The first
-qualified purge scans the session keyspace once (a SCAN of the store's prefix
-and one GET per session) and records the result at
+qualified purge scans the session keyspace once and records the result at
 `sess:identity:v1:legacy`; a keyspace with no legacy session opens no window.
-A store without `forgetIdentity` deletes that record before its first write,
-and `clear()` deletes it with the sessions, so the next qualified purge scans
-again. Keep the store's prefix for sessions only: a JSON value of another kind
-under it counts as a legacy session.
+The scan reads one SCAN page of 100 keys at a time and, per page, one
+pipelined 15-byte `GETRANGE` per key, which identifies a qualified session;
+only other values are read in full. A legacy session is recognised by its
+value: JSON that is neither a qualified session nor another store's marker, so
+a store on a nested prefix (`sess:admin:`) is not mistaken for one, though its
+own legacy sessions count. The scan stops at the first legacy session, runs
+for at most 5 seconds, and settles `residue` when it runs out of time or, on a
+Redis Cluster, when slot ownership changed or a slot was migrating while it
+ran. While it runs the record says `scanning` under a 15-second lease, and a
+scan that fails gives it back, so the next purge scans again. Every write and
+every TTL slide of a store without `forgetIdentity` (`set`, `create`, the
+close-time persist, `touch`, a refreshing `get` or load) deletes the record in
+the same pipelined round trip, one extra `DEL` per call, and `clear()` deletes
+it with the sessions, so the next qualified purge scans again.
 
 **Action.** Stop instances of the earlier release first, and keep `ttlMs` at
 least as long as before the switch. Active sessions are adopted on their next

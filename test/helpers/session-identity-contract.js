@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { createDistributedSession } from '../../src/redis/session.js';
 import { createForgetStore } from '../../src/shared/forget-store.js';
 import { scanKeys } from '../../src/shared/redis-scan.js';
+import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
 
 const owner = (tenantId, userId) => ({ owner: { tenantId, userId } });
 const options = { forgetIdentity: (data) => data?.owner, refreshOnGet: false, ttlMs: 30_000 };
@@ -50,6 +51,21 @@ function beforeFirstHdel(redis, action) {
 		return original.apply(this, args);
 	};
 	return () => { redis.hdel = original; };
+}
+
+// Route every node's SCAN through `handler(scan, args, first)`, where `scan`
+// is that node's own SCAN and `first` marks the first call. Covers each
+// master of a Cluster.
+function patchScan(redis, handler) {
+	const nodes = typeof redis.nodes === 'function' ? redis.nodes('master') : [redis];
+	const originals = nodes.map((node) => node.scan);
+	let calls = 0;
+	nodes.forEach((node, i) => {
+		node.scan = function (...args) {
+			return handler((...a) => originals[i].apply(node, a), args, ++calls === 1);
+		};
+	});
+	return () => nodes.forEach((node, i) => { node.scan = originals[i]; });
 }
 
 // Every PEXPIRE key, the command that slides a session record.
@@ -369,6 +385,110 @@ export function sessionIdentityContract(getClient) {
 				restore();
 			}
 			expect(await record('tok')).toBeNull();
+		});
+
+		it('scans again when a store without forgetIdentity that already wrote writes again', async () => {
+			const legacy = createDistributedSession(getClient(), {});
+			await legacy.set('warm', owner('tb', '1'));
+			await legacy.delete('warm');
+			const s = sessions();
+			expect(await s.purgeUser('ta', 'x')).toBe(0);
+			expect(JSON.parse(await getClient().redis.get(markerKey()))).toMatchObject({ state: 'clean' });
+			await legacy.set('old', owner('ta', '42'));
+			await expect(s.purgeUser('ta', '42')).rejects.toMatchObject({ code: 'ERASURE_INCOMPLETE', legacyResidue: true });
+			expect(await record('old')).not.toBeNull();
+		});
+
+		it('scans again when a store without forgetIdentity writes after the window', async () => {
+			const legacy = createDistributedSession(getClient(), { ttlMs: 60 });
+			await legacy.set('a', owner('tb', '1'));
+			const s = sessions({ ttlMs: 60 });
+			await expect(s.purgeUser('ta', 'x')).rejects.toMatchObject({ legacyResidue: true });
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			await legacy.set('old', owner('ta', '42'));
+			await expect(s.purgeUser('ta', '42')).rejects.toMatchObject({ legacyResidue: true });
+		});
+
+		it('drops the marker when a store without forgetIdentity slides a session', async () => {
+			const legacy = createDistributedSession(getClient(), { refreshOnGet: true });
+			await legacy.set('old', owner('ta', '42'));
+			for (const slideIt of [() => legacy.touch('old'), () => legacy.get('old')]) {
+				await getClient().redis.set(markerKey(), JSON.stringify({ since: 0, state: 'clean' }));
+				await slideIt();
+				expect(await getClient().redis.get(markerKey())).toBeNull();
+			}
+		});
+
+		it('gives the marker back when the scan fails, and leases it while it runs', async () => {
+			const s = sessions();
+			await s.set('a', owner('ta', '42'));
+			let lease;
+			const restore = patchScan(getClient().redis, async (scan, args, first) => {
+				if (first) {
+					lease = await getClient().redis.pttl(markerKey());
+					throw new Error('scan timed out');
+				}
+				return scan(...args);
+			});
+			try {
+				await expect(s.purgeUser('ta', '42')).rejects.toMatchObject({ code: 'ERASURE_INDEX_INCOMPLETE', removed: 1 });
+			} finally {
+				restore();
+			}
+			expect(lease).toBeGreaterThan(0);
+			expect(lease).toBeLessThanOrEqual(15_000);
+			expect(await getClient().redis.get(markerKey())).toBeNull();
+			await s.set('b', owner('ta', '43'));
+			expect(await s.purgeUser('ta', '43')).toBe(1);
+			expect(JSON.parse(await getClient().redis.get(markerKey()))).toMatchObject({ state: 'clean' });
+		});
+
+		it('reports residue when the scan runs past its time budget', async () => {
+			const s = sessions();
+			await s.set('a', owner('ta', '42'));
+			let offset = 0;
+			const base = performance.now();
+			setRuntimeEnv({ clock: { monotonic: () => base + offset } });
+			const restore = patchScan(getClient().redis, async (scan, args) => {
+				offset += 6_000;
+				return scan(...args);
+			});
+			try {
+				await expect(s.purgeUser('ta', '42')).rejects.toMatchObject({ legacyResidue: true, removed: 1 });
+			} finally {
+				restore();
+				resetRuntimeEnv();
+			}
+			expect(JSON.parse(await getClient().redis.get(markerKey()))).toMatchObject({ state: 'residue' });
+		});
+
+		it('reports residue when the Cluster topology changes during the scan', async () => {
+			const redis = getClient().redis;
+			if (typeof redis.nodes !== 'function') return;
+			const s = sessions();
+			await s.set('a', owner('ta', '42'));
+			const cluster = redis.cluster;
+			let calls = 0;
+			redis.cluster = async function (...args) {
+				const reply = await cluster.apply(this, args);
+				return ++calls === 1 ? reply : String(reply) + '\ndeadbeef 127.0.0.1:1@2 master - 0 0 99 connected 0-1\n';
+			};
+			try {
+				await expect(s.purgeUser('ta', '42')).rejects.toMatchObject({ legacyResidue: true });
+			} finally {
+				redis.cluster = cluster;
+			}
+		});
+
+		it('does not read a nested store\'s marker, index or sessions as legacy sessions', async () => {
+			const nested = sessions({ keyPrefix: 'sess:admin:' });
+			await nested.set('t', owner('ta', '7'));
+			expect(await nested.purgeUser('ta', 'x')).toBe(0);
+			const s = sessions();
+			await s.set('t', owner('ta', '42'));
+			expect(await s.purgeUser('ta', '42')).toBe(1);
+			expect(JSON.parse(await getClient().redis.get(markerKey()))).toMatchObject({ state: 'clean' });
+			expect(await nested.purgeUser('ta', '7')).toBe(1);
 		});
 
 		it('reserves the identity: token prefix with and without an extractor', async () => {

@@ -420,6 +420,15 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 		const r = {
 			// String ops
 			async get(key) { pruneExpiredString(key); return store.has(key) ? store.get(key) : null; },
+			// Inclusive byte range of a string value; '' for a missing key, as Redis.
+			async getrange(key, start, end) {
+				pruneExpiredString(key);
+				if (hashes.has(key)) throw new Error('WRONGTYPE Operation against a key holding the wrong kind of value');
+				if (!store.has(key)) return '';
+				const bytes = Buffer.from(String(store.get(key)), 'utf8');
+				const from = Number(start), to = Number(end);
+				return bytes.subarray(from, to < 0 ? bytes.length + to + 1 : to + 1).toString('utf8');
+			},
 			async set(key, val, ...flags) {
 				// Real Redis SET accepts NX / XX / EX / PX / EXAT / PXAT / KEEPTTL
 				// flags. The mock honors the conditional gates (NX / XX) and now

@@ -207,11 +207,12 @@ export interface DistributedSession<T = unknown> {
 	 * qualified mode name no tenant and have no qualified index entry, so
 	 * while one may still exist it rejects with `code: 'ERASURE_INCOMPLETE'`,
 	 * `legacyResidue: true` and the `removed` count. The first qualified purge
-	 * scans the keyspace once for such records and keeps the answer at
-	 * `sess:identity:v1:legacy`: none found opens no window, some found opens
-	 * one for `ttlMs`. A store without `forgetIdentity` deletes that answer
-	 * before its first write. Records still listed by the `forgetUserId` index
-	 * of the same raw user id are residue as well.
+	 * scans the keyspace once, for at most 5 seconds, and keeps the answer at
+	 * `sess:identity:v1:legacy`: none found opens no window; some found, a
+	 * scan out of time, or Cluster slots moving during it opens one for
+	 * `ttlMs`. Every write and TTL slide of a store without `forgetIdentity`
+	 * deletes that answer in the same round trip. Records still listed by the
+	 * `forgetUserId` index of the same raw user id are residue as well.
 	 * Every rejection carries `removed`, the sessions this call revoked.
 	 */
 	purgeUser(tenantId: string | null, userId: string): Promise<number>;
