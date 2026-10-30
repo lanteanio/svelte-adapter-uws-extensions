@@ -403,6 +403,70 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 	}
 
 	/*
+	 * Durable enqueue receipts. One statement either inserts the receipt for
+	 * a free (or expired) scope together with its pending task row, or
+	 * changes nothing: the task insert reads its id from the receipt CTE's
+	 * RETURNING, so a conflict that keeps a live receipt inserts no task, and
+	 * a failure of either insert rolls back both. Concurrent producers of one
+	 * scope serialize on the receipts primary key. An expired receipt is
+	 * replaced in place by the ON CONFLICT update under the same row lock.
+	 * Times are database epoch milliseconds from the statement's now().
+	 */
+	const receipts = table + '_receipts';
+	const NOW_MS = 'floor(extract(epoch FROM now()) * 1000)::bigint';
+
+	async function insertReceiptTask(scope, taskId, name, encodedInput, idempotencyKey, requestId, stamp, traceContext, ttlMs) {
+		const fenced = stamp.version === 1 && stamp.userId !== null;
+		const values = [scope, taskId, encodedInput, stamp.version, stamp.tenantId, stamp.userId, ttlMs, name, idempotencyKey, requestId ?? null,
+			traceContext?.traceparent ?? null, traceContext?.tracestate ?? null];
+		if (fenced) values.push(table, JSON.stringify([stamp.tenantId, stamp.userId]));
+		const res = await client.query({
+			name: (fenced ? 'tasks_receipt_fenced_' : 'tasks_receipt_') + table,
+			text: `WITH receipt AS (
+			         INSERT INTO ${receipts} AS r (scope, svti_tasks_id, input, identity_version, tenant_id, user_id, created_at, dedup_expires_at)
+			         SELECT $1::text, $2::uuid, $3::text, $4::integer, $5::text, $6::text, c.now_ms, c.now_ms + $7::bigint
+			           FROM (SELECT ${NOW_MS} AS now_ms${fenced ? `, pg_advisory_xact_lock_shared(${FENCE_KEY(13)}) AS fence` : ''}) AS c
+			         ON CONFLICT (scope) DO UPDATE
+			            SET svti_tasks_id = EXCLUDED.svti_tasks_id, input = EXCLUDED.input,
+			                identity_version = EXCLUDED.identity_version, tenant_id = EXCLUDED.tenant_id, user_id = EXCLUDED.user_id,
+			                created_at = EXCLUDED.created_at, dedup_expires_at = EXCLUDED.dedup_expires_at
+			          WHERE r.dedup_expires_at <= EXCLUDED.created_at
+			      RETURNING r.svti_tasks_id, r.dedup_expires_at
+			       ), task AS (
+			         INSERT INTO ${table} (svti_tasks_id, name, input, svti_idempotency_key, request_id, user_id, traceparent, tracestate,
+			                               status, fence, fence_expires_at, attempts, identity_version, tenant_id)
+			         SELECT receipt.svti_tasks_id, $8::text, $3::text::jsonb, $9::text, $10::text, $6::text, $11::text, $12::text,
+			                'pending', gen_random_uuid(), now(), 0, $4::integer, $5::text
+			           FROM receipt
+			       )
+			       SELECT svti_tasks_id AS id, dedup_expires_at::text AS expires FROM receipt`,
+			values
+		});
+		const row = res.rows[0];
+		return row ? { taskId: row.id, dedupExpiresAt: Number(row.expires) } : null;
+	}
+
+	// The scope's mapping as the primary sees it now, live or not.
+	async function readReceipt(scope) {
+		const res = await client.query({
+			name: 'tasks_receipt_read_' + table,
+			text: `SELECT svti_tasks_id AS id, input, identity_version, tenant_id, user_id, dedup_expires_at::text AS expires,
+			              dedup_expires_at > ${NOW_MS} AS live
+			         FROM ${receipts} WHERE scope = $1`,
+			values: [scope]
+		});
+		return res.rows[0] ?? null;
+	}
+
+	async function deleteExpiredReceipts(budget, limit) {
+		return budget.remove(`WITH expired AS (
+			SELECT scope FROM ${receipts}
+			WHERE dedup_expires_at <= ${NOW_MS}
+			ORDER BY dedup_expires_at LIMIT $1 FOR UPDATE SKIP LOCKED
+		) DELETE FROM ${receipts} r USING expired WHERE r.scope = expired.scope AND r.dedup_expires_at <= ${NOW_MS}`, [limit]);
+	}
+
+	/*
 	 * Pending dispatch is fair across tenant scopes. A scope is one tenant of
 	 * qualified rows, the untenanted qualified scope, or the rows written
 	 * without forgetIdentity. Each handler name keeps its own rotation over
@@ -614,20 +678,27 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 		) DELETE FROM ${table} r USING expired WHERE r.svti_tasks_id = expired.svti_tasks_id`, [rowTtl, limit]);
 	}
 
-	// Right-to-erasure: delete every unqualified task row stamped with this
-	// user's id. Rows a forgetIdentity runner stamped belong to one tenant's
-	// user and are erased only through their exact identity.
+	// Right-to-erasure: delete every unqualified task row and enqueue receipt
+	// stamped with this user's id, in one statement. Rows a forgetIdentity
+	// runner stamped belong to one tenant's user and are erased only through
+	// their exact identity.
 	async function deleteByUser(userId) {
 		const res = await client.query({
 			name: 'tasks_delete_user_' + table,
-			text: `DELETE FROM ${table} WHERE user_id = $1 AND identity_version IS NULL`,
+			text: `WITH receipts AS (
+			         DELETE FROM ${receipts} WHERE user_id = $1 AND identity_version IS NULL RETURNING 1
+			       ), tasks AS (
+			         DELETE FROM ${table} WHERE user_id = $1 AND identity_version IS NULL RETURNING 1
+			       )
+			       SELECT ((SELECT count(*) FROM receipts) + (SELECT count(*) FROM tasks))::int AS removed`,
 			values: [userId]
 		});
-		return res.rowCount || 0;
+		return Number(res.rows[0]?.removed) || 0;
 	}
 
-	// Qualified erasure: delete the rows stamped with exactly (tenantId,
-	// userId), and in the same statement report whether unqualified rows remain
+	// Qualified erasure: delete the task rows and enqueue receipts stamped with
+	// exactly (tenantId, userId), and in the same statement report whether
+	// unqualified task rows or receipts remain
 	// that could still be this user's: rows with the same raw user id, or with
 	// none. Their tenant is unknown, so they are neither deleted nor ruled out.
 	// The exclusive identity lock first waits out inserts of this identity
@@ -651,10 +722,16 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 			         DELETE FROM ${table}
 			          WHERE identity_version = 1 AND ${untenanted ? 'tenant_id IS NULL' : 'tenant_id = $2'} AND user_id = $1
 			      RETURNING 1
+			       ), erased_receipts AS (
+			         DELETE FROM ${receipts}
+			          WHERE identity_version = 1 AND ${untenanted ? 'tenant_id IS NULL' : 'tenant_id = $2'} AND user_id = $1
+			      RETURNING 1
 			       )
-			       SELECT (SELECT count(*) FROM removed)::int AS removed,
+			       SELECT ((SELECT count(*) FROM removed) + (SELECT count(*) FROM erased_receipts))::int AS removed,
 			              (EXISTS (SELECT 1 FROM ${table} WHERE identity_version IS NULL AND tenant_id IS NULL AND user_id = $1)
-			               OR EXISTS (SELECT 1 FROM ${table} WHERE identity_version IS NULL AND tenant_id IS NULL AND user_id IS NULL)) AS residue`,
+			               OR EXISTS (SELECT 1 FROM ${table} WHERE identity_version IS NULL AND tenant_id IS NULL AND user_id IS NULL)
+			               OR EXISTS (SELECT 1 FROM ${receipts} WHERE identity_version IS NULL AND tenant_id IS NULL AND user_id = $1)
+			               OR EXISTS (SELECT 1 FROM ${receipts} WHERE identity_version IS NULL AND tenant_id IS NULL AND user_id IS NULL)) AS residue`,
 			values: untenanted ? [identity.userId] : [identity.userId, identity.tenantId]
 		});
 		const row = res.rows[0] ?? {};
@@ -678,6 +755,9 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 		reclaimStuck,
 		deleteOldTerminal,
 		deleteByUser,
-		deleteByIdentity
+		deleteByIdentity,
+		insertReceiptTask,
+		readReceipt,
+		deleteExpiredReceipts
 	};
 }

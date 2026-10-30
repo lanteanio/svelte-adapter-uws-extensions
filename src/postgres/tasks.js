@@ -8,6 +8,8 @@
  *      idempotency store ensures retries from the original caller return
  *      the cached result rather than re-executing. enqueue() always inserts a
  *      new row; its key is persisted and forwarded to the handler only.
+ *      enqueueOnce() inserts at most one row per tenant, name and key while
+ *      its receipt (the companion `<table>_receipts` row) is live.
  *   2. Worker-crash recovery: every attempt holds a fence (UUID + expiry).
  *      The conditional commit `UPDATE ... WHERE fence = $current` is
  *      atomic, so a stuck attempt that comes back from the dead cannot
@@ -53,6 +55,8 @@ import {
 	TaskInFlightError,
 	UnknownTaskError,
 	TaskFenceLostError,
+	TaskEnqueueConflictError,
+	TaskEnqueueOutcomeUnknownError,
 	deserialiseError,
 	serialiseErrorSafe
 } from './_tasks-errors.js';
@@ -64,7 +68,7 @@ import { withBreaker, pgFailure } from './_breaker.js';
 import { assertSafeTableName } from '../shared/pg-migrate.js';
 import { MAX_TASK_HANDLERS, MAX_STORE_PAYLOAD_BYTES } from '../shared/caps.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
-import { readIdentity, purgeIdentity, legacyResidueError } from '../shared/forget-identity.js';
+import { readIdentity, purgeIdentity, legacyResidueError, isTenantId } from '../shared/forget-identity.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import {
 	POSTGRES_TRACE_ATTRIBUTES,
@@ -75,7 +79,7 @@ import {
 } from '../shared/trace-context.js';
 import { defineOptions, option, timerCeiling } from '../shared/options.js';
 
-export { TaskInFlightError, UnknownTaskError, TaskFenceLostError };
+export { TaskInFlightError, UnknownTaskError, TaskFenceLostError, TaskEnqueueConflictError, TaskEnqueueOutcomeUnknownError };
 
 // Private control flow: a lost lease is not a terminal handler outcome.
 class AbandonedTaskAttempt {
@@ -157,6 +161,53 @@ class AbandonedTaskAttempt {
  */
 
 const NAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9_-]*$/;
+const DEFAULT_DEDUP_TTL_MS = 24 * 3600 * 1000;
+const MAX_DEDUP_TTL_MS = 30 * 24 * 3600 * 1000;
+// Rounds of insert-or-read before enqueueOnce gives up. A round repeats only
+// when the live receipt that blocked the insert expired or was erased before
+// it could be read, so a second round normally settles it.
+const RECEIPT_ROUNDS = 3;
+
+// The receipt scope of one tenant, task name and idempotency key. The JSON
+// array keeps null distinct from every string and has no delimiter to forge.
+function receiptScope(name, query, label) {
+	if (typeof name !== 'string' || !NAME_PATTERN.test(name)) {
+		throw new Error(`postgres tasks: invalid task name "${name}"`);
+	}
+	if (!query || typeof query !== 'object') {
+		throw new TypeError(`postgres tasks: ${label} requires an options object with tenantId and idempotencyKey`);
+	}
+	if (!Object.hasOwn(query, 'tenantId') || !isTenantId(query.tenantId)) {
+		throw new TypeError(`postgres tasks: ${label} tenantId must be null (the untenanted scope) or 1-64 characters of [a-zA-Z0-9_-]`);
+	}
+	const key = query.idempotencyKey;
+	if (typeof key !== 'string' || key.length === 0) {
+		throw new Error(`postgres tasks: ${label} idempotencyKey must be a non-empty string`);
+	}
+	if (key.length > 256) {
+		throw new Error(`postgres tasks: ${label} idempotencyKey must be at most 256 characters`);
+	}
+	return { tenantId: query.tenantId, key, scope: JSON.stringify([query.tenantId, name, key]) };
+}
+
+// True when a failed receipt statement certainly changed nothing: PostgreSQL
+// reported an ordinary statement error (which rolls the statement back), or
+// the call was refused locally before reaching the server. A lost reply,
+// timeout or broken connection leaves the commit undecided.
+function definiteFailure(error) {
+	const code = error?.code;
+	if (code === 'PG_CAPACITY_EXCEEDED' || code === 'CIRCUIT_BROKEN') return true;
+	return error?.severity === 'ERROR' && typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) && !code.startsWith('08');
+}
+
+function sameSubmission(row, encodedInput, stamp) {
+	return row.input === encodedInput
+		&& (row.identity_version ?? null) === stamp.version
+		&& (row.tenant_id ?? null) === stamp.tenantId
+		&& (row.user_id ?? null) === stamp.userId;
+}
+
+const receiptOf = (row) => ({ taskId: row.id, dedupExpiresAt: Number(row.expires) });
 
 function defaultBackoff(attempt) {
 	return Math.min(1000 * 2 ** (attempt - 1), 60000);
@@ -816,6 +867,12 @@ export function createTaskRunner(client, options = {}) {
 				const count = await sql.deleteOldTerminal(budget, limit);
 				if (count < limit) break;
 			}
+			// Expired enqueue receipts only; a live receipt outlives its task row.
+			while (budget.available) {
+				const limit = budget.limit;
+				const count = await sql.deleteExpiredReceipts(budget, limit);
+				if (count < limit) break;
+			}
 		}
 	});
 
@@ -1005,6 +1062,70 @@ export function createTaskRunner(client, options = {}) {
 			return taskId;
 		},
 
+		async enqueueOnce(name, onceOptions) {
+			const { tenantId, key, scope } = receiptScope(name, onceOptions, 'enqueueOnce');
+			const ttlMs = onceOptions.dedupTtlMs ?? DEFAULT_DEDUP_TTL_MS;
+			if (!Number.isInteger(ttlMs) || ttlMs < 1 || ttlMs > MAX_DEDUP_TTL_MS) {
+				throw new Error(`postgres tasks: enqueueOnce dedupTtlMs must be a positive integer of at most ${MAX_DEDUP_TTL_MS} (30 days), got ${ttlMs}`);
+			}
+			// Encoded once: these exact bytes are both the task input and the
+			// receipt's identity, so a stateful toJSON cannot make them differ.
+			const input = onceOptions.input ?? null;
+			const encodedInput = encodeTaskPayload(input, 'input', maxPayloadBytes);
+			const stamp = _taskStamp(input, name);
+			if (stamp.version === 1 && stamp.userId !== null && stamp.tenantId !== tenantId) {
+				throw new TypeError('postgres tasks: enqueueOnce forgetIdentity returned an owner in another tenant than tenantId');
+			}
+			const producer = producerTrace(onceOptions);
+			const tracePlatform = producer.tracePlatform;
+			let traceContext = producer.traceContext;
+			const requestId = resolveRequestId(onceOptions, onceOptions.platform ?? defaultTracePlatform);
+
+			await sql.ensureTable();
+
+			const inserted = (receipt) => {
+				fireStateChange({ taskId: receipt.taskId, name, oldStatus: null, newStatus: 'pending', attempt: 0, requestId: requestId ?? null, traceContext });
+				mEnqueued?.inc({ name });
+				return receipt;
+			};
+			for (let round = 0; round < RECEIPT_ROUNDS; round++) {
+				const taskId = randomUuid();
+				let receipt;
+				try {
+					receipt = await runTraceOperation(tracePlatform, 'postgres.tasks.enqueue', 'producer', traceContext, POSTGRES_TRACE_ATTRIBUTES, (currentTraceContext) => {
+						traceContext = currentTraceContext;
+						return withBreaker(b, () => sql.insertReceiptTask(scope, taskId, name, encodedInput, key, requestId, stamp, traceContext, ttlMs));
+					});
+				} catch (error) {
+					if (definiteFailure(error)) throw error;
+					// The reply was lost: only the primary's mapping can say what
+					// happened. Our own task id there proves the commit; an equal
+					// submission's receipt is equally valid; anything else, or no
+					// answer, leaves the outcome open.
+					let row = null;
+					try { row = await sql.readReceipt(scope); } catch { /* unanswered: unknown */ }
+					if (row && row.id === taskId) return inserted(receiptOf(row));
+					if (row?.live && sameSubmission(row, encodedInput, stamp)) return receiptOf(row);
+					throw new TaskEnqueueOutcomeUnknownError(tenantId, name, key, error);
+				}
+				if (receipt) return inserted(receipt);
+				// A live receipt holds the scope. This statement inserted nothing.
+				const row = await withBreaker(b, () => sql.readReceipt(scope));
+				if (row?.live) {
+					if (sameSubmission(row, encodedInput, stamp)) return receiptOf(row);
+					throw new TaskEnqueueConflictError(tenantId, name, key);
+				}
+			}
+			throw new Error('postgres tasks: enqueueOnce found the receipt for this key replaced or expiring on every attempt and inserted nothing; retry the same submission');
+		},
+
+		async lookupEnqueueReceipt(name, query) {
+			const { scope } = receiptScope(name, query, 'lookupEnqueueReceipt');
+			await sql.ensureTable();
+			const row = await withBreaker(b, () => sql.readReceipt(scope));
+			return row?.live ? receiptOf(row) : null;
+		},
+
 		async await(taskId, awaitOptions = {}) {
 			if (typeof taskId !== 'string' || taskId.length === 0) {
 				throw new Error('postgres tasks: taskId must be a non-empty string');
@@ -1082,9 +1203,9 @@ export function createTaskRunner(client, options = {}) {
 		},
 
 		/**
-		 * Right-to-erasure (`live.forget`): delete every task row stamped with this
-		 * user's id (requires a `forgetUserId` or `forgetIdentity` extractor; a
-		 * no-op otherwise).
+		 * Right-to-erasure (`live.forget`): delete every task row and enqueue
+		 * receipt stamped with this user's id (requires a `forgetUserId` or
+		 * `forgetIdentity` extractor; a no-op otherwise).
 		 *
 		 * With `forgetIdentity` the purge deletes exactly the rows stamped with
 		 * `(tenantId, userId)`, null being only the untenanted scope, and rejects
@@ -1104,7 +1225,7 @@ export function createTaskRunner(client, options = {}) {
 		 *
 		 * @param {string | null} tenantId - The exact scope with forgetIdentity; ignored with forgetUserId.
 		 * @param {string} userId
-		 * @returns {Promise<number>} task rows removed
+		 * @returns {Promise<number>} task rows and enqueue receipts removed
 		 */
 		async purgeUser(tenantId, userId) {
 			if ((!forgetUserId && !qualified) || typeof userId !== 'string' || userId.length === 0) return 0;

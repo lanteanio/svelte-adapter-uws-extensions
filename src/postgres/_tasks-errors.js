@@ -56,6 +56,43 @@ export class TaskFenceLostError extends Error {
 }
 
 /**
+ * Thrown by `enqueueOnce()` when a live receipt for the same tenant, task
+ * name and idempotency key maps different input bytes or a different erasure
+ * owner. Nothing was inserted and no handler runs for this call.
+ *
+ * Stable contract: `err.code === 'TASK_ENQUEUE_CONFLICT'`.
+ */
+export class TaskEnqueueConflictError extends Error {
+	constructor(tenantId, taskName, idempotencyKey) {
+		super(`a live enqueue receipt for task "${taskName}" and this idempotency key holds different input or a different owner`);
+		this.name = 'TaskEnqueueConflictError';
+		this.code = 'TASK_ENQUEUE_CONFLICT';
+		this.tenantId = tenantId;
+		this.taskName = taskName;
+		this.idempotencyKey = idempotencyKey;
+	}
+}
+
+/**
+ * Thrown by `enqueueOnce()` when the reply to its insert was lost and the
+ * authoritative read could not establish whether it committed. The task may
+ * exist. Recover with `lookupEnqueueReceipt()` or retry the same submission
+ * with the same key; never substitute a new key.
+ *
+ * Stable contract: `err.code === 'TASK_ENQUEUE_OUTCOME_UNKNOWN'`.
+ */
+export class TaskEnqueueOutcomeUnknownError extends Error {
+	constructor(tenantId, taskName, idempotencyKey, cause) {
+		super(`the outcome of enqueueOnce for task "${taskName}" is unknown; retry the same submission or look up its receipt`, { cause });
+		this.name = 'TaskEnqueueOutcomeUnknownError';
+		this.code = 'TASK_ENQUEUE_OUTCOME_UNKNOWN';
+		this.tenantId = tenantId;
+		this.taskName = taskName;
+		this.idempotencyKey = idempotencyKey;
+	}
+}
+
+/**
  * Convert an Error (or anything else) into a JSON-safe shape for storage
  * in the tasks table or transport across a worker-thread boundary.
  *

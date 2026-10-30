@@ -2,7 +2,7 @@ import { CircuitBrokenError } from '../../src/shared/breaker.js';
 import { ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError } from '../../src/redis/replay.js';
 import { ReplayStorageError as PgStorageError, ReplaySerializationError as PgSerializationError } from '../../src/postgres/replay.js';
 import { LockAcquireTimeoutError, LockLostError } from '../../src/redis/lock.js';
-import { TaskInFlightError, UnknownTaskError } from '../../src/postgres/tasks.js';
+import { TaskInFlightError, UnknownTaskError, TaskEnqueueConflictError, TaskEnqueueOutcomeUnknownError } from '../../src/postgres/tasks.js';
 
 const circuit: 'CIRCUIT_BROKEN' = new CircuitBrokenError().code;
 const replication: 'REPLICATION_TIMEOUT' = new ReplicationTimeoutError(0, 1, 20).code;
@@ -14,4 +14,6 @@ const acquire: 'LOCK_ACQUIRE_TIMEOUT' = new LockAcquireTimeoutError('resource', 
 const lost: 'LOCK_LOST' = new LockLostError('resource').code;
 const inFlight: 'TASK_IN_FLIGHT' = new TaskInFlightError('key').code;
 const unknown: 'UNKNOWN_TASK' = new UnknownTaskError('operation').code;
-void [circuit, replication, storage, serialization, pgStorage, pgSerialization, acquire, lost, inFlight, unknown];
+const enqueueConflict: 'TASK_ENQUEUE_CONFLICT' = new TaskEnqueueConflictError().code;
+const enqueueUnknown: 'TASK_ENQUEUE_OUTCOME_UNKNOWN' = new TaskEnqueueOutcomeUnknownError().code;
+void [circuit, replication, storage, serialization, pgStorage, pgSerialization, acquire, lost, inFlight, unknown, enqueueConflict, enqueueUnknown];

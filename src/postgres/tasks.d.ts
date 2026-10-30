@@ -262,6 +262,27 @@ export interface TaskRegistrationOptions {
 	worker?: URL | string | TaskWorkerOption;
 }
 
+/** A durable enqueue receipt. */
+export interface TaskEnqueueReceipt {
+	taskId: string;
+	/** Database epoch milliseconds after which the receipt no longer deduplicates. */
+	dedupExpiresAt: number;
+}
+
+export interface TaskEnqueueOnceOptions<TInput = unknown> extends TaskRunOptions<TInput> {
+	/** Trusted server-side tenant; null is the untenanted scope, distinct from every string. */
+	tenantId: string | null;
+	/** Non-empty, at most 256 characters. */
+	idempotencyKey: string;
+	/** Receipt lifetime from its first insertion, a positive integer of at most 30 days. @default 86400000 */
+	dedupTtlMs?: number;
+}
+
+export interface TaskEnqueueReceiptQuery {
+	tenantId: string | null;
+	idempotencyKey: string;
+}
+
 export interface TaskRunOptions<TInput = unknown> {
 	/** JSON-serialisable input. Defaults to null. */
 	input?: TInput;
@@ -333,6 +354,26 @@ export interface TaskRunner extends PostgresStoreReadiness {
 	enqueue(name: string, options: TaskRunOptions): Promise<string>;
 
 	/**
+	 * Enqueue at most one task per tenant, task name and idempotency key while
+	 * its receipt is live. One statement inserts the pending task row and its
+	 * receipt, or neither. A retry with the same input bytes and erasure owner
+	 * returns the original receipt, whose expiry it never extends; different
+	 * input or owner rejects with `TaskEnqueueConflictError`. An expired
+	 * receipt is replaced by a new task. A lost reply that the primary cannot
+	 * settle rejects with `TaskEnqueueOutcomeUnknownError`: retry the same
+	 * submission or look up its receipt. The handler still receives the key
+	 * and may run more than once; this deduplicates submissions, not effects.
+	 */
+	enqueueOnce(name: string, options: TaskEnqueueOnceOptions): Promise<TaskEnqueueReceipt>;
+
+	/**
+	 * Read the live receipt for a tenant, task name and idempotency key from
+	 * the primary. Resolves null when none is visible, including after expiry
+	 * or erasure; null does not rule out a submission still in flight.
+	 */
+	lookupEnqueueReceipt(name: string, query: TaskEnqueueReceiptQuery): Promise<TaskEnqueueReceipt | null>;
+
+	/**
 	 * Block until the given task reaches a terminal status. Returns the
 	 * committed result, throws the stored error, or rejects with a
 	 * timeout error if the task is still pending/running past the
@@ -369,12 +410,13 @@ export interface TaskRunner extends PostgresStoreReadiness {
 	counts(options?: { name?: string }): Promise<TaskCounts>;
 
 	/**
-	 * Right-to-erasure: delete every task row stamped with a user's id (needs
-	 * `forgetUserId` or `forgetIdentity`; resolves 0 without either).
+	 * Right-to-erasure: delete every task row and enqueue receipt stamped with
+	 * a user's id (needs `forgetUserId` or `forgetIdentity`; resolves 0 without
+	 * either), resolving how many of both it removed.
 	 *
 	 * With `forgetIdentity`, deletes exactly the rows stamped
 	 * `(tenantId, userId)`, `null` being only the untenanted scope; an invalid
-	 * `tenantId` throws. While rows written without an identity stamp remain
+	 * `tenantId` throws. While rows or receipts written without an identity stamp remain
 	 * that carry this raw user id or no user id, it rejects with
 	 * `code: 'ERASURE_INCOMPLETE'`, `legacyResidue: true` and the committed
 	 * `removed` count: their tenant is unknown, so they are kept.
@@ -440,6 +482,32 @@ export class TaskFenceLostError extends Error {
 	code: 'TASK_FENCE_LOST';
 	taskId: string;
 	taskName: string;
+}
+
+/**
+ * Thrown by `enqueueOnce()` when a live receipt for the same tenant, task
+ * name and key holds different input bytes or a different erasure owner.
+ * Nothing was inserted.
+ */
+export class TaskEnqueueConflictError extends Error {
+	name: 'TaskEnqueueConflictError';
+	code: 'TASK_ENQUEUE_CONFLICT';
+	tenantId: string | null;
+	taskName: string;
+	idempotencyKey: string;
+}
+
+/**
+ * Thrown by `enqueueOnce()` when its reply was lost and the primary could not
+ * establish whether it committed. Carries no task id. Retry the same
+ * submission with the same key, or call `lookupEnqueueReceipt()`.
+ */
+export class TaskEnqueueOutcomeUnknownError extends Error {
+	name: 'TaskEnqueueOutcomeUnknownError';
+	code: 'TASK_ENQUEUE_OUTCOME_UNKNOWN';
+	tenantId: string | null;
+	taskName: string;
+	idempotencyKey: string;
 }
 
 /**

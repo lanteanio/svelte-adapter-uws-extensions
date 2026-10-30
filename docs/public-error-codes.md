@@ -19,6 +19,8 @@ Branch on an error's `code` when deciding how to handle a recoverable failure. M
 | `TASK_NOT_FOUND` | PostgreSQL task `await()` | No row exists for the requested task ID. |
 | `TASK_AWAIT_TIMEOUT` | PostgreSQL task `await()` | The row exists but did not become terminal within the wait deadline. |
 | `TASK_FENCE_LOST` | PostgreSQL task execution | Another worker owns the task and its canonical outcome was not available before the deadline. |
+| `TASK_ENQUEUE_CONFLICT` | PostgreSQL task `enqueueOnce()` | A live receipt for this tenant, task name and key holds different input or a different owner; nothing was inserted. |
+| `TASK_ENQUEUE_OUTCOME_UNKNOWN` | PostgreSQL task `enqueueOnce()` | The reply was lost and the primary could not establish whether the task committed. Retry the same submission with the same key. |
 | `IDEMPOTENCY_RESULT_TOO_LARGE` | Redis and PostgreSQL idempotency | The encoded result exceeds the configured byte cap. |
 | `IDEMPOTENCY_LEASE_LOST` | Redis and PostgreSQL idempotency | The pending slot is no longer owned by this call. |
 | `ERASURE_INDEX_INCOMPLETE` | Redis sessions with `forgetUserId` or `forgetIdentity` | `set`, `create` or `touch` stored or extended nothing because `forgetUserId` threw or returned a non-string, `forgetIdentity` threw or returned a malformed identity, or the erasure index write failed; a qualified `set` or `create` also rejects, with its record deleted, when an erasure of its identity ran while it was writing; or `purgeUser` could not erase every indexed session. `err.cause` holds the underlying error; retry after repairing it. |

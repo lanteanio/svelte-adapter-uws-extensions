@@ -7,7 +7,7 @@ import { CircuitBrokenError } from '../../src/shared/breaker.js';
 import { ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError } from '../../src/redis/replay.js';
 import { ReplayStorageError as PgReplayStorageError, ReplaySerializationError as PgReplaySerializationError } from '../../src/postgres/replay.js';
 import { LockAcquireTimeoutError, LockLostError } from '../../src/redis/lock.js';
-import { TaskInFlightError, UnknownTaskError } from '../../src/postgres/tasks.js';
+import { TaskInFlightError, UnknownTaskError, TaskEnqueueConflictError, TaskEnqueueOutcomeUnknownError } from '../../src/postgres/tasks.js';
 import { serialiseErrorSafe, deserialiseError } from '../../src/postgres/_tasks-errors.js';
 
 describe('stable operational error codes', () => {
@@ -31,7 +31,9 @@ describe('stable operational error codes', () => {
 		[new LockAcquireTimeoutError('resource', 20), 'LOCK_ACQUIRE_TIMEOUT'],
 		[new LockLostError('resource'), 'LOCK_LOST'],
 		[new TaskInFlightError('key'), 'TASK_IN_FLIGHT'],
-		[new UnknownTaskError('operation'), 'UNKNOWN_TASK']
+		[new UnknownTaskError('operation'), 'UNKNOWN_TASK'],
+		[new TaskEnqueueConflictError(null, 'operation', 'key'), 'TASK_ENQUEUE_CONFLICT'],
+		[new TaskEnqueueOutcomeUnknownError('tenant', 'operation', 'key', new Error('lost')), 'TASK_ENQUEUE_OUTCOME_UNKNOWN']
 	])('preserves %s code %s through persisted error reconstruction', (error, code) => {
 		expect(error.code).toBe(code);
 		const restored = deserialiseError(JSON.parse(JSON.stringify(serialiseErrorSafe(error))));

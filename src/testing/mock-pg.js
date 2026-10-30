@@ -129,6 +129,11 @@ export function mockPgClient(options = {}) {
 	// breaks ties deterministically in insertion order (the durable analogue is
 	// the BIGSERIAL primary key Postgres assigns each INSERT).
 	let taskInsSeq = 1;
+	/**
+	 * Durable enqueue receipts by scope. Times are epoch milliseconds.
+	 * @type {Map<string, {id: string, input: string, identity_version: number|null, tenant_id: string|null, user_id: string|null, created_at: number, dedup_expires_at: number}>}
+	 */
+	const receiptRows = new Map();
 
 	/** @type {Map<number, {id: number, queue: string, payload: any, request_id: string|null, traceparent: string|null, tracestate: string|null, claimed_at: number|null, claimed_until: number|null, attempts: number, created_at: Date}>} */
 	const jobRows = new Map();
@@ -279,6 +284,48 @@ export function mockPgClient(options = {}) {
 			const acquired = owner === undefined || owner === connId;
 			if (acquired && txState?.inTx) transactionLocks.set(key, connId);
 			return { rows: [{ acquired }], rowCount: 1 };
+		}
+		// ----- Durable enqueue receipts (marker: `dedup_expires_at`). One
+		// statement inserts or replaces an expired receipt together with its
+		// pending task row, or changes nothing while a live receipt holds the
+		// scope.
+		if (sql.startsWith('WITH receipt AS (') && sql.includes('dedup_expires_at')) {
+			const ts = Math.floor(now());
+			const existing = receiptRows.get(values[0]);
+			if (existing && existing.dedup_expires_at > ts) return { rows: [], rowCount: 0 };
+			const receipt = {
+				id: values[1], input: values[2], identity_version: values[3] ?? null, tenant_id: values[4] ?? null,
+				user_id: values[5] ?? null, created_at: ts, dedup_expires_at: ts + Number(values[6])
+			};
+			receiptRows.set(values[0], receipt);
+			taskRows.set(values[1], {
+				id: values[1], name: values[7], input: JSON.parse(values[2]), idempotency_key: values[8],
+				request_id: values[9] ?? null, traceparent: values[10] ?? null, tracestate: values[11] ?? null,
+				user_id: values[5] ?? null, identity_version: values[3] ?? null, tenant_id: values[4] ?? null,
+				status: 'pending', result: null, error: null, fence: randomUuid(), fence_expires_at: ts, attempts: 0,
+				created_at: ts, updated_at: ts, _ins: taskInsSeq++
+			});
+			return { rows: [{ id: receipt.id, expires: String(receipt.dedup_expires_at) }], rowCount: 1 };
+		}
+		if (sql.startsWith('SELECT svti_tasks_id AS id, input,') && sql.includes('dedup_expires_at') && sql.includes('WHERE scope = $1')) {
+			const row = receiptRows.get(values[0]);
+			if (!row) return { rows: [], rowCount: 0 };
+			return {
+				rows: [{
+					id: row.id, input: row.input, identity_version: row.identity_version, tenant_id: row.tenant_id, user_id: row.user_id,
+					expires: String(row.dedup_expires_at), live: row.dedup_expires_at > Math.floor(now())
+				}],
+				rowCount: 1
+			};
+		}
+		if (sql.startsWith('WITH expired AS') && sql.includes('dedup_expires_at')) {
+			const ts = Math.floor(now()), limit = Number(values[0]);
+			let count = 0;
+			for (const [scope, row] of [...receiptRows].sort((a, b) => a[1].dedup_expires_at - b[1].dedup_expires_at)) {
+				if (count >= limit || row.dedup_expires_at > ts) break;
+				receiptRows.delete(scope); count++;
+			}
+			return { rows: [], rowCount: count };
 		}
 		if (sql.startsWith('WITH expired AS')) {
 			let count = 0;
@@ -787,12 +834,14 @@ export function mockPgClient(options = {}) {
 		// Task erasure. Unqualified: rows with this user id and no identity
 		// stamp. Qualified: rows stamped with exactly (tenant, user), plus
 		// whether unstamped rows that could be this user's remain.
-		if (sql.startsWith('DELETE FROM') && sql.includes('WHERE user_id = $1 AND identity_version IS NULL')) {
+		if (sql.startsWith('WITH receipts AS (') && sql.includes('WHERE user_id = $1 AND identity_version IS NULL')) {
 			let removed = 0;
-			for (const [id, row] of taskRows) {
-				if (row.user_id === values[0] && row.identity_version == null) { taskRows.delete(id); removed++; }
+			for (const rowsByKey of [receiptRows, taskRows]) {
+				for (const [key, row] of rowsByKey) {
+					if (row.user_id === values[0] && row.identity_version == null) { rowsByKey.delete(key); removed++; }
+				}
 			}
-			return { rows: [], rowCount: removed };
+			return { rows: [{ removed }], rowCount: 1 };
 		}
 		if (sql.includes('WITH removed AS (') && sql.includes('identity_version = 1')) {
 			const userId = values[0];
@@ -800,11 +849,13 @@ export function mockPgClient(options = {}) {
 			const tenant = untenanted ? null : values[1];
 			let removed = 0;
 			let residue = false;
-			for (const [id, row] of taskRows) {
-				if (row.identity_version == null && row.tenant_id == null && (row.user_id === userId || row.user_id == null)) residue = true;
-				if (row.identity_version === 1 && (row.tenant_id ?? null) === tenant && row.user_id === userId) {
-					taskRows.delete(id);
-					removed++;
+			for (const rowsByKey of [taskRows, receiptRows]) {
+				for (const [key, row] of rowsByKey) {
+					if (row.identity_version == null && row.tenant_id == null && (row.user_id === userId || row.user_id == null)) residue = true;
+					if (row.identity_version === 1 && (row.tenant_id ?? null) === tenant && row.user_id === userId) {
+						rowsByKey.delete(key);
+						removed++;
+					}
 				}
 			}
 			return { rows: [{ removed, residue }], rowCount: 1 };
@@ -938,6 +989,11 @@ export function mockPgClient(options = {}) {
 		}
 
 		// Task clear (default table name)
+		if (/^DELETE FROM \w+_receipts$/.test(sql)) {
+			const before = receiptRows.size;
+			receiptRows.clear();
+			return { rows: [], rowCount: before };
+		}
 		if (sql.startsWith('DELETE FROM svti_tasks') && !sql.includes('WHERE')) {
 			const before = taskRows.size;
 			taskRows.clear();
@@ -1640,6 +1696,7 @@ export function mockPgClient(options = {}) {
 		_getSeqCounters() { return seqCounters; },
 		_getIdemRows() { return idemRows; },
 		_getTaskRows() { return taskRows; },
+		_getReceiptRows() { return receiptRows; },
 		_getJobRows() { return jobRows; },
 		_getAdvisoryLocks() { return advisoryLocks; },
 		_getRowLocks() { return rowLocks; },
