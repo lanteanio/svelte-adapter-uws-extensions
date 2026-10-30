@@ -131,9 +131,11 @@ export function createPresenceState(client, options = {}) {
 			platform.send(ws, fullTopic, event, data, { compress: true });
 		}
 	}
-	if (typeof heartbeatInterval !== 'number' || !Number.isFinite(heartbeatInterval) || heartbeatInterval < 1) {
+	// Any finite delay above 0 is accepted, as the in-memory plugin accepts it
+	// (Node runs a sub-millisecond interval every millisecond).
+	if (typeof heartbeatInterval !== 'number' || !Number.isFinite(heartbeatInterval) || !(heartbeatInterval > 0)) {
 		throw new Error(
-			'redis presence: heartbeat must be a positive number (ms). Unlike the in-memory plugin, 0 cannot turn it ' +
+			'redis presence: heartbeat must be a number > 0 (ms). Unlike the in-memory plugin, 0 cannot turn it ' +
 			'off here: each heartbeat also renews the Redis TTL of every local entry, so without it every present ' +
 			'user would expire from the shared roster after `ttl` seconds.'
 		);

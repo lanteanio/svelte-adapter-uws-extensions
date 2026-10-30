@@ -4,43 +4,33 @@
 // that works on one throws when moved to the other. The one exception is
 // presence `heartbeat: 0`, which the in-memory plugin reads as "no heartbeat"
 // and the Redis presence cannot honor: its heartbeat also renews the Redis
-// TTL of every local entry.
+// TTL of every local entry. plugin-option-behaviour.test.js checks that the
+// accepted values also behave the same.
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createPresence as leadPresence } from 'svelte-adapter-uws/plugins/presence';
 import { createCursor as leadCursor } from 'svelte-adapter-uws/plugins/cursor';
 import { createGroup as leadGroup } from 'svelte-adapter-uws/plugins/groups';
 import { createRateLimit as leadRateLimit } from 'svelte-adapter-uws/plugins/ratelimit';
 import { mockRedisClient } from '../helpers/mock-redis.js';
+import { ODD_VALUES, describeValue } from '../helpers/plugin-option-values.js';
 import { createPresence } from '../../src/redis/presence.js';
 import { createCursor } from '../../src/redis/cursor.js';
 import { createGroup } from '../../src/redis/groups.js';
 import { createRateLimit } from '../../src/redis/ratelimit.js';
 
-const big = 3_000_000_000;
-const fn = () => ({});
-const odd = [null, undefined, false, true, 0, -1, 1.5, '', 'x', '16', 5, big, [], ['a', 5], {}, fn];
-
 const plugins = [
-	['presence', (o) => leadPresence(o), (redis, o) => createPresence(redis, o), {
-		key: odd, select: odd, heartbeat: odd, topicThrottle: odd, transient: odd, binary: odd,
-		clientUpdateFields: [null, undefined, [], ['a'], ['a', 5], 'a', {}],
-		maxFieldsBytes: odd, maxTotalFieldsBytes: odd, maxTopicsPerConnection: odd
-	}],
-	['cursor', (o) => leadCursor(o), (redis, o) => createCursor(redis, o), {
-		select: odd, throttle: odd, topicThrottle: odd, binary: odd, dictionary: odd,
-		maxDataBytes: odd, maxTopicLength: odd, minMove: odd, position: odd,
-		viewport: [...odd, { enabled: true, padding: 1 }], backpressure: [...odd, { enabled: true }]
-	}],
-	['groups', (o) => leadGroup('room', o), (redis, o) => createGroup(redis, 'room', o), {
-		meta: odd, maxMembers: [...odd, Infinity], onJoin: odd, onLeave: odd, onFull: odd, onClose: odd
-	}],
-	['ratelimit', (o) => leadRateLimit({ points: 2, interval: 1000, ...o }), (redis, o) => createRateLimit(redis, { points: 2, interval: 1000, ...o }), {
-		points: odd, interval: odd, blockDuration: odd, keyBy: [...odd, 'ip', 'connection'], tenant: odd, budget: [...odd, 'principal', 'tenant']
-	}]
+	['presence', (o) => leadPresence(o), (redis, o) => createPresence(redis, o),
+		['key', 'select', 'heartbeat', 'topicThrottle', 'transient', 'binary', 'clientUpdateFields', 'maxFieldsBytes', 'maxTotalFieldsBytes', 'maxTopicsPerConnection']],
+	['cursor', (o) => leadCursor(o), (redis, o) => createCursor(redis, o),
+		['select', 'throttle', 'topicThrottle', 'binary', 'dictionary', 'maxDataBytes', 'maxTopicLength', 'minMove', 'position', 'viewport', 'backpressure']],
+	['groups', (o) => leadGroup('room', o), (redis, o) => createGroup(redis, 'room', o),
+		['meta', 'maxMembers', 'onJoin', 'onLeave', 'onFull', 'onClose']],
+	['ratelimit', (o) => leadRateLimit({ points: 2, interval: 1000, ...o }), (redis, o) => createRateLimit(redis, { points: 2, interval: 1000, ...o }),
+		['points', 'interval', 'blockDuration', 'keyBy', 'tenant', 'budget']]
 ];
 
-/** The one shared value the Redis side refuses on purpose. */
-const exceptions = new Set(['presence.heartbeat=0']);
+/** The shared values the Redis side refuses on purpose. */
+const exceptions = new Set(['presence.heartbeat=0', 'presence.heartbeat=-0']);
 
 let warn;
 let created;
@@ -59,16 +49,17 @@ function outcome(build) {
 	try {
 		created.push(build());
 		return 'ok';
-	} catch (error) {
+	} catch {
 		return 'throws';
 	}
 }
 
-const label = (value) => typeof value === 'function' ? 'fn' : value === undefined ? 'undefined' : JSON.stringify(value);
 const rows = [];
+const keys = [];
 for (const [name, lead, ours, options] of plugins) {
-	for (const [key, values] of Object.entries(options)) {
-		for (const value of values) rows.push([`${name}.${key}=${label(value)}`, lead, ours, key, value]);
+	for (const key of options) {
+		keys.push([`${name}.${key}`, lead, key]);
+		for (const value of ODD_VALUES) rows.push([`${name}.${key}=${describeValue(value)}`, lead, ours, key, value]);
 	}
 }
 
@@ -81,6 +72,13 @@ describe('options shared with the in-memory plugins', () => {
 			return;
 		}
 		if (leadResult === 'ok') expect(ourResult).toBe('ok');
+	});
+
+	// The check above only asserts when the in-memory plugin accepts a value,
+	// so a plugin that started refusing everything would pass it silently.
+	it.each(keys)('%s: the in-memory plugin accepts some of the values tried', (_id, lead, key) => {
+		const accepted = ODD_VALUES.filter((value) => outcome(() => lead({ [key]: value })) === 'ok');
+		expect(accepted.length).toBeGreaterThanOrEqual(3);
 	});
 
 	it('presence heartbeat: 0 names why the Redis presence refuses it', () => {
