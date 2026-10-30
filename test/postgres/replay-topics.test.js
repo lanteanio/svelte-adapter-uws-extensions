@@ -4,6 +4,11 @@ import { mockPlatform } from '../helpers/mock-platform.js';
 import { mockWs } from '../helpers/mock-ws.js';
 import { createReplay } from '../../src/postgres/replay.js';
 import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
+import { setOperationalEventSink } from '../../src/shared/diagnostic.js';
+import { EXTENSIONS_ERROR_IDS, extensionsErrorDefinition } from '../../src/error-registry.js';
+import { createMetrics } from '../../src/prometheus/index.js';
+
+const FIRST_REPORTS = Symbol.for('svelte-adapter-uws-extensions.first-reports.v1');
 
 let clock;
 let ticks;
@@ -116,28 +121,75 @@ describe('postgres replay maxTopics and generations', () => {
 			log.seen.length = 0;
 			await publishAt(replay, 3000, 'fresh');
 			expect(log.seen).toHaveLength(2);
-			expect(log.seen[1]).toMatch(/^WITH victims AS/);
+			expect(log.seen[1]).toMatch(/^WITH cutoff AS/);
 		} finally {
 			log.restore();
 		}
 	});
 
-	it('reads issue no writes', async () => {
-		const replay = create({ maxTopics: 5 });
-		await publishAt(replay, 1000, 'room', 3);
-		const log = recordStatements();
+	for (const kind of ['seq', 'since', 'gap', 'replay']) {
+		it(`${kind}() counts as use at most once a minute per topic, in its own statement`, async () => {
+			const replay = create({ maxTopics: 5 });
+			const read = {
+				seq: () => replay.seq('room'),
+				since: () => replay.since('room', 0),
+				gap: () => replay.gap('room', 1),
+				replay: () => replay.replay(mockWs({}), 'room', 1, platform)
+			}[kind];
+			await publishAt(replay, 1000, 'room', 3);
+			const log = recordStatements();
+			try {
+				clock = 2000;
+				await read();
+				const statements = log.seen.length;
+				expect(log.seen[0]).toMatch(/^WITH stamp AS/);
+				log.seen.length = 0;
+				clock = 30_000;
+				await read();
+				expect(log.seen).toHaveLength(statements);
+				expect(log.seen[0]).toMatch(/^SELECT/);
+				log.seen.length = 0;
+				clock = 70_000;
+				await read();
+				expect(log.seen).toHaveLength(statements);
+				expect(log.seen[0]).toMatch(/^WITH stamp AS/);
+			} finally {
+				log.restore();
+			}
+		});
+	}
+
+	it('keeps a topic that is only read over one published earlier', async () => {
+		const replay = create({ maxTopics: 2 });
+		await publishAt(replay, 1000, 'readonly');
+		await publishAt(replay, 2000, 'written');
+		clock = 70_000;
+		await replay.since('readonly', 0);
+		await publishAt(replay, 71_000, 'third');
+		expect(await replay.seq('readonly')).toBe(1);
+		expect(await replay.seq('written')).toBe(0);
+	});
+
+	it('warns once and counts evictions when the table holds more topics than the cap', async () => {
+		delete globalThis[FIRST_REPORTS];
+		const records = [];
+		const dispose = setOperationalEventSink((record) => { records.push(record); });
 		try {
-			await replay.seq('room');
-			await replay.since('room', 0);
-			await replay.gap('room', 1);
-			await replay.currentEpoch('room');
-			await replay.replay(mockWs({}), 'room', 1, platform);
-			await replay.resumeHook()(mockWs({}), { lastSeenSeqs: { room: 1 }, lastSeenEpochs: { room: await replay.currentEpoch('room') }, platform });
+			const writer = create({ maxTopics: 100 });
+			for (let i = 1; i <= 4; i++) await publishAt(writer, i * 1000, 'room-' + i);
+			const metrics = createMetrics();
+			const replay = create({ maxTopics: 2, metrics });
+			await publishAt(replay, 9000, 'fresh');
+			await new Promise((resolve) => setImmediate(resolve));
+			const { event } = extensionsErrorDefinition(EXTENSIONS_ERROR_IDS.POSTGRES_REPLAY_TOPICS_OVER_CAP);
+			const warnings = records.filter((r) => r.event === event);
+			expect(warnings).toHaveLength(1);
+			expect(warnings[0].attributes).toEqual({ topics: 4, maxTopics: 2 });
+			expect(await metrics.serialize()).toMatch(/replay_topic_evictions_total 3/);
 		} finally {
-			log.restore();
+			dispose();
+			delete globalThis[FIRST_REPORTS];
 		}
-		expect(log.seen.length).toBeGreaterThan(0);
-		for (const text of log.seen) expect(text).toMatch(/^SELECT/);
 	});
 
 	it('still stores and broadcasts when eviction fails', async () => {
@@ -145,7 +197,7 @@ describe('postgres replay maxTopics and generations', () => {
 		await publishAt(replay, 1000, 'old');
 		const original = client.query;
 		client.query = async (q, values) => {
-			if (String(q?.text ?? q).includes('WITH victims AS')) throw new Error('evict down');
+			if (String(q?.text ?? q).includes('WITH cutoff AS')) throw new Error('evict down');
 			return original.call(client, q, values);
 		};
 		try {

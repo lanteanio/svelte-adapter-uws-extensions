@@ -38,7 +38,8 @@
 
 import { assertSafeTableName } from '../shared/pg-migrate.js';
 import { createStoreSchema } from './migrations.js';
-import { MAX_REPLAY_EPOCH_CACHE_TOPICS, MAX_STORE_PAYLOAD_BYTES } from '../shared/caps.js';
+import { MAX_REPLAY_EPOCH_CACHE_TOPICS, MAX_STORE_PAYLOAD_BYTES, REPLAY_READ_USE_INTERVAL_MS } from '../shared/caps.js';
+import { now } from '../shared/runtime.js';
 import { createLruMap } from '../shared/lru-map.js';
 import { withBreaker, pgFailure, guardBreaker } from './_breaker.js';
 import { scheduleCleanup } from './_cleanup.js';
@@ -94,6 +95,9 @@ const CREATE_EVICTION_TOPICS = 4;
 
 /** Topics one cleanup statement removes. */
 const TOPIC_RETENTION_BATCH = 8;
+
+/** Topic-removing statements one cleanup pass issues at most. */
+const TOPIC_RETENTION_STATEMENTS = 32;
 
 /**
  * @typedef {Object} PgReplayOptions
@@ -201,6 +205,7 @@ export function createReplay(client, options = {}) {
 	const m = options.metrics;
 	const mt = m?.mapTopic || (() => 'all');
 	const mPublishes = m?.counter('replay_publishes_total', 'Messages published to replay buffer', ['topic']);
+	const mEvictions = m?.counter('replay_topic_evictions_total', 'Topics evicted past maxTopics with their replay history');
 	const mReplayed = m?.counter('replay_messages_replayed_total', 'Messages replayed to clients', ['topic']);
 	const mTruncations = m?.counter('replay_truncations_total', 'Truncation events detected', ['topic']);
 	const mResumeTopicOverflows = m?.counter(
@@ -212,7 +217,43 @@ export function createReplay(client, options = {}) {
 		: null;
 
 	const schema = createStoreSchema(client, 'replay', table, autoMigrate);
-	const ensureTable = schema.ensure;
+	// The first operation after the schema is ready also counts the topic rows
+	// once, without waiting for the count, to report a store already over the
+	// cap (topics kept from before maxTopics existed) once per process.
+	async function ensureTable() {
+		await schema.ensure();
+		reportTopicCount();
+	}
+
+	let topicCountReported = false;
+	function reportTopicCount() {
+		if (topicCountReported) return;
+		topicCountReported = true;
+		client.query({ text: `SELECT count(*)::bigint AS n FROM ${seqTable}` }).then((res) => {
+			const topics = Number(res.rows[0]?.n);
+			if (topics > maxTopics && firstReportInProcess(EXTENSIONS_ERROR_IDS.POSTGRES_REPLAY_TOPICS_OVER_CAP)) {
+				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.POSTGRES_REPLAY_TOPICS_OVER_CAP, { attributes: { topics, maxTopics } });
+			}
+		}, () => { topicCountReported = false; });
+	}
+
+	// Reads count as use, as in the core plugin: seq, since, gap and replay
+	// stamp the topic's last_used_at in the statement they already send, at
+	// most once per REPLAY_READ_USE_INTERVAL_MS per topic in this process, and
+	// only when the row has not been used within that interval anyway.
+	const readStamps = createLruMap(MAX_REPLAY_EPOCH_CACHE_TOPICS);
+	const stampPrefix = `WITH stamp AS (
+			UPDATE ${seqTable} SET last_used_at = now()
+			 WHERE topic = $1 AND last_used_at < now() - interval '1 millisecond' * ${REPLAY_READ_USE_INTERVAL_MS}
+			RETURNING 1
+		) `;
+	function readStatement(topic, name, text) {
+		const at = now();
+		const last = readStamps.get(topic);
+		if (last !== undefined && at - last < REPLAY_READ_USE_INTERVAL_MS) return { name, text };
+		readStamps.set(topic, at);
+		return { name: name + '_used', text: stampPrefix + text };
+	}
 
 	let cleanupTopic = '';
 	async function trimExpired(budget) {
@@ -257,38 +298,77 @@ export function createReplay(client, options = {}) {
 			if (!complete) break;
 		}
 	}
-	// Topic rows past maxTopics, least recently published first. A topic and
-	// its events go in one statement; rows a publish holds locked are skipped,
-	// so a topic being written is never the one removed. The sequence row is
-	// deleted with the events: its epoch is never handed out again, so the
-	// topic's next publish starts a seq space no client can mistake for this one.
-	const evictSql = `WITH victims AS (
-			SELECT topic FROM ${seqTable}
+	// Topic rows past maxTopics, least recently used first. The cutoff - the
+	// newest row past the cap - is found without locks; then only rows at or
+	// below it are locked, SKIP LOCKED, and the lock re-checks the condition,
+	// so a topic published since the cutoff was read (its last_used_at moved
+	// past it) or being published right now is never touched. A topic and its
+	// events go in one statement. The sequence row is deleted with the events:
+	// its epoch is never handed out again, so the topic's next publish starts a
+	// seq space no client can mistake for this one.
+	const evictSql = `WITH cutoff AS (
+			SELECT last_used_at, topic FROM ${seqTable}
 			 ORDER BY last_used_at DESC, topic DESC
-			OFFSET $1 LIMIT $2
+			OFFSET $1 LIMIT 1
+		), victims AS (
+			SELECT s.topic FROM ${seqTable} s, cutoff c
+			 WHERE (s.last_used_at, s.topic) <= (c.last_used_at, c.topic)
+			 LIMIT $2
+			   FOR UPDATE OF s SKIP LOCKED
+		), purged AS (
+			DELETE FROM ${table} r USING victims v WHERE r.topic = v.topic
+		)
+		DELETE FROM ${seqTable} s USING victims v WHERE s.topic = v.topic
+		RETURNING s.topic`;
+	// Cleanup reads the cutoff once per pass and then removes the rows at or
+	// below it in batches. Each batch is a plain scan that stops at its LIMIT,
+	// so draining a large surplus does not sort the table once per batch.
+	const cutoffSql = `SELECT last_used_at::text AS at, topic FROM ${seqTable}
+		 ORDER BY last_used_at DESC, topic DESC
+		OFFSET $1 LIMIT 1`;
+	const evictBelowSql = `WITH victims AS (
+			SELECT topic FROM ${seqTable}
+			 WHERE (last_used_at, topic) <= ($1::timestamptz, $2::text)
+			 LIMIT $3
 			   FOR UPDATE SKIP LOCKED
 		), purged AS (
 			DELETE FROM ${table} r USING victims v WHERE r.topic = v.topic
 		)
 		DELETE FROM ${seqTable} s USING victims v WHERE s.topic = v.topic
 		RETURNING s.topic`;
-	// With a ttl, a topic not published for longer than it has no events left
-	// to resume from, so its row goes too.
+	// With a ttl, a topic not used for longer than it has no events left to
+	// resume from, so its row goes too.
 	const idleSql = `WITH idle AS (
 			SELECT topic FROM ${seqTable}
 			 WHERE last_used_at < now() - interval '1 second' * $1
-			 ORDER BY last_used_at LIMIT $2
+			 LIMIT $2
 			   FOR UPDATE SKIP LOCKED
 		), purged AS (
 			DELETE FROM ${table} r USING idle i WHERE r.topic = i.topic
 		)
-		DELETE FROM ${seqTable} s USING idle i WHERE s.topic = i.topic`;
+		DELETE FROM ${seqTable} s USING idle i WHERE s.topic = i.topic
+		RETURNING s.topic`;
+	// Topic retention runs as short autocommit statements beside the pass, not
+	// inside its transaction: a removed topic's row lock is released when its
+	// statement ends instead of being held until the pass commits.
 	async function trimTopics(budget) {
-		while (ttl > 0 && budget.available) {
-			if (await budget.remove(idleSql, [ttl, TOPIC_RETENTION_BATCH]) < TOPIC_RETENTION_BATCH) break;
+		let statements = 0;
+		const removeTopics = async (text, values) => {
+			statements++;
+			const res = await client.query({ text, values });
+			for (const row of res.rows) epochCache.delete(row.topic);
+			if (res.rows.length > 0) mEvictions?.inc(res.rows.length);
+			return res.rows.length;
+		};
+		while (ttl > 0 && budget.available && statements < TOPIC_RETENTION_STATEMENTS) {
+			if (await removeTopics(idleSql, [ttl, TOPIC_RETENTION_BATCH]) < TOPIC_RETENTION_BATCH) break;
 		}
-		while (budget.available) {
-			if (await budget.remove(evictSql, [maxTopics, TOPIC_RETENTION_BATCH]) < TOPIC_RETENTION_BATCH) break;
+		if (!budget.available || statements >= TOPIC_RETENTION_STATEMENTS) return;
+		statements++;
+		const cutoff = (await client.query({ text: cutoffSql, values: [maxTopics] })).rows[0];
+		if (!cutoff) return;
+		while (budget.available && statements < TOPIC_RETENTION_STATEMENTS) {
+			if (await removeTopics(evictBelowSql, [cutoff.at, cutoff.topic, TOPIC_RETENTION_BATCH]) < TOPIC_RETENTION_BATCH) break;
 		}
 	}
 	const policies = [trimExpired, trimSizes, trimTopics];
@@ -419,6 +499,7 @@ export function createReplay(client, options = {}) {
 				values: [maxTopics, CREATE_EVICTION_TOPICS]
 			});
 			for (const row of res.rows) epochCache.delete(row.topic);
+			if (res.rows.length > 0) mEvictions?.inc(res.rows.length);
 		} catch {
 			// Non-fatal; see above.
 		}
@@ -654,10 +735,9 @@ export function createReplay(client, options = {}) {
 			const res = await withBreaker(b, async () => {
 				await ensureTable();
 				return client.query({
-					name: 'replay_seq_' + table,
-					text: `SELECT COALESCE(seq, 0)::bigint AS current_seq
+					...readStatement(topic, 'replay_seq_' + table, `SELECT COALESCE(seq, 0)::bigint AS current_seq
 					         FROM ${seqTable}
-					        WHERE topic = $1`,
+					        WHERE topic = $1`),
 					values: [topic]
 				});
 			});
@@ -676,10 +756,9 @@ export function createReplay(client, options = {}) {
 			try {
 				await ensureTable();
 				const nextRes = await client.query({
-					name: 'replay_gap_' + table,
-					text: `SELECT seq FROM ${table}
+					...readStatement(topic, 'replay_gap_' + table, `SELECT seq FROM ${table}
 					        WHERE topic = $1 AND seq >= $2
-					        ORDER BY seq ASC LIMIT 1`,
+					        ORDER BY seq ASC LIMIT 1`),
 					values: [topic, target]
 				});
 				if (nextRes.rows.length > 0) {
@@ -722,12 +801,11 @@ export function createReplay(client, options = {}) {
 			const res = await withBreaker(b, async () => {
 				await ensureTable();
 				return client.query({
-					name: 'replay_since_' + table,
-					text: `SELECT seq, topic, event, data
+					...readStatement(topic, 'replay_since_' + table, `SELECT seq, topic, event, data
 					   FROM ${table}
 					  WHERE topic = $1
 					    AND seq > $2
-					  ORDER BY seq ASC`,
+					  ORDER BY seq ASC`),
 					values: [topic, since]
 				});
 			});
@@ -776,8 +854,7 @@ export function createReplay(client, options = {}) {
 			let fillRes;
 			try {
 				fillRes = await client.query({
-					name: 'replay_fill_' + table,
-					text: `SELECT c.current_seq, r.seq, r.topic, r.event, r.data
+					...readStatement(topic, 'replay_fill_' + table, `SELECT c.current_seq, r.seq, r.topic, r.event, r.data
 					   FROM (SELECT COALESCE((SELECT seq FROM ${seqTable} WHERE topic = $1), 0)::bigint AS current_seq) c
 					   LEFT JOIN LATERAL (
 					         SELECT seq, topic, event, data
@@ -785,7 +862,7 @@ export function createReplay(client, options = {}) {
 					          WHERE topic = $1
 					            AND seq > $2
 					          ORDER BY seq ASC
-					   ) r ON true`,
+					   ) r ON true`),
 					values: [topic, sinceSeq]
 				});
 			} catch (err) {

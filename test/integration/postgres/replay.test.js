@@ -640,15 +640,85 @@ describe('postgres replay (integration)', () => {
 			}
 		});
 
-		it('reads leave last_used_at alone', async () => {
+		it('a read stamps last_used_at in its own statement once the interval has passed', async () => {
 			await replay.publish(platform, 'chat', 'msg', { id: 1 });
-			const before = (await client.query(`SELECT last_used_at FROM ${TABLE}_seq WHERE topic = 'chat'`)).rows[0].last_used_at;
-			await replay.seq('chat');
-			await replay.since('chat', 0);
-			await replay.gap('chat', 1);
-			await replay.replay({}, 'chat', 0, platform);
-			const after = (await client.query(`SELECT last_used_at FROM ${TABLE}_seq WHERE topic = 'chat'`)).rows[0].last_used_at;
-			expect(after.getTime()).toBe(before.getTime());
+			await client.query(`UPDATE ${TABLE}_seq SET last_used_at = now() - interval '2 minutes' WHERE topic = 'chat'`);
+			const old = (await client.query(`SELECT last_used_at FROM ${TABLE}_seq WHERE topic = 'chat'`)).rows[0].last_used_at;
+			expect(await replay.seq('chat')).toBe(1);
+			const stamped = (await client.query(`SELECT last_used_at FROM ${TABLE}_seq WHERE topic = 'chat'`)).rows[0].last_used_at;
+			expect(stamped.getTime()).toBeGreaterThan(old.getTime());
+			// The other reads return their results through the stamping statement.
+			const r = createReplay(client, { table: TABLE, size: 5, cleanupInterval: 0 });
+			try {
+				await client.query(`UPDATE ${TABLE}_seq SET last_used_at = now() - interval '2 minutes' WHERE topic = 'chat'`);
+				expect((await r.since('chat', 0)).map((m) => m.seq)).toEqual([1]);
+				expect(await r.gap('chat', 0)).toEqual({ truncated: false, missingFrom: null });
+				platform.reset();
+				expect(await r.replay({}, 'chat', 0, platform)).toBe(1);
+			} finally {
+				r.destroy();
+			}
+		});
+
+		it('a publish to a hot topic is not blocked by an eviction in flight', async () => {
+			const r = createReplay(client, { table: TABLE, size: 5, cleanupInterval: 0, maxTopics: 2 });
+			const texts = [];
+			const query = client.query;
+			client.query = (q, values) => { texts.push(typeof q === 'object' ? q.text : q); return query.call(client, q, values); };
+			let evictText;
+			try {
+				await r.publish(platform, 'cold', 'msg', { id: 1 });
+				await r.publish(platform, 'hot', 'msg', { id: 1 });
+				await r.publish(platform, 'warm', 'msg', { id: 1 });
+				evictText = texts.find((text) => text.startsWith('WITH cutoff AS'));
+			} finally {
+				client.query = query;
+				r.destroy();
+			}
+			expect(evictText).toBeDefined();
+			await client.query(`INSERT INTO ${TABLE}_seq (topic, seq, last_used_at) VALUES ('stale', 1, now() - interval '1 hour')`);
+			const holder = await client.connect();
+			const impatient = createPgClient({ connectionString: process.env.INTEGRATION_POSTGRES_URL, autoShutdown: false, options: { options: '-c lock_timeout=500' } });
+			const fast = createReplay(impatient, { table: TABLE, size: 5, cleanupInterval: 0, maxTopics: 100 });
+			try {
+				await holder.query('BEGIN');
+				// The eviction locks only its victim and holds that lock.
+				const evicted = await holder.query(evictText, [2, 4]);
+				expect(evicted.rows.map((row) => row.topic)).toEqual(['stale']);
+				await fast.publish(platform, 'hot', 'msg', { id: 2 });
+				await fast.publish(platform, 'warm', 'msg', { id: 2 });
+				expect(await fast.seq('hot')).toBe(2);
+			} finally {
+				await holder.query('ROLLBACK').catch(() => {});
+				holder.release();
+				fast.destroy();
+				await impatient.end();
+			}
+		});
+
+		it('version 3 starts each existing topic at its newest event', async () => {
+			await replay.ready();
+			await client.query(`ALTER TABLE ${TABLE}_seq ALTER COLUMN epoch SET DEFAULT 0`);
+			await client.query(`DROP SEQUENCE ${TABLE}_seq_epoch_seq`);
+			await client.query(`ALTER TABLE ${TABLE}_seq DROP COLUMN last_used_at`);
+			await client.query('DELETE FROM svti_schema_migrations WHERE table_name = $1 AND version = 3', [TABLE]);
+			for (const [topic, age] of [['alpha', '3 hours'], ['beta', '1 hour'], ['gamma', '2 hours']]) {
+				await client.query(`INSERT INTO ${TABLE}_seq (topic, seq, epoch) VALUES ($1, 1, 1)`, [topic]);
+				await client.query(`INSERT INTO ${TABLE} (topic, seq, event, created_at) VALUES ($1, 1, 'e', now() - $2::interval)`, [topic, age]);
+			}
+			await client.query(`INSERT INTO ${TABLE}_seq (topic, seq, epoch) VALUES ('empty', 9, 1)`);
+			const r = createReplay(client, { table: TABLE, size: 5, cleanupInterval: 0, maxTopics: 2 });
+			try {
+				await r.ready();
+				const order = (await client.query(`SELECT topic FROM ${TABLE}_seq ORDER BY last_used_at DESC`)).rows.map((row) => row.topic);
+				expect(order).toEqual(['beta', 'gamma', 'alpha', 'empty']);
+				// A new topic keeps the two most recently published existing ones.
+				await r.publish(platform, 'fresh', 'msg', { id: 1 });
+				const left = (await client.query(`SELECT topic FROM ${TABLE}_seq ORDER BY topic`)).rows.map((row) => row.topic);
+				expect(left).toEqual(['beta', 'fresh']);
+			} finally {
+				r.destroy();
+			}
 		});
 
 		it('clear deletes both tables and a republished topic takes a new epoch', async () => {

@@ -84,6 +84,7 @@ export async function migrate(client, options) {
 		await query(`CREATE TABLE IF NOT EXISTS ${LEDGER} (table_name TEXT NOT NULL, store TEXT NOT NULL, version INTEGER NOT NULL, checksum TEXT NOT NULL, applied_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (table_name, version))`);
 		const { rows } = await query(`SELECT store, version, checksum FROM ${LEDGER} WHERE table_name = $1 ORDER BY version`, [schema.table]);
 		validateLedger(rows, schema);
+		if (schema.versions.some(version => !rows.some(row => row.version === version.version))) await precheckColumns({ query }, schema);
 		for (const version of schema.versions) {
 			if (rows.some(row => row.version === version.version)) continue;
 			const checkpoint = { tables: schema.checkpoints[version.version] };
@@ -127,11 +128,47 @@ export async function migrate(client, options) {
 	}
 }
 
+function readColumns(client, name) {
+	return client.query(`SELECT a.attname AS column_name, format_type(a.atttypid, a.atttypmod) AS data_type, a.attnotnull AS not_null, a.attgenerated AS generated, a.attidentity AS identity, pg_get_expr(d.adbin, d.adrelid) AS column_default
+			FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+			WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped`, [name]);
+}
+
+/**
+ * Before any DDL runs: every column an existing relation already has must
+ * match the definition some version gives it. A schema provisioned by hand
+ * that matches none is refused untouched, instead of being altered first and
+ * rejected afterwards. Missing relations and columns are left for the DDL.
+ */
+async function precheckColumns(client, schema) {
+	const known = new Map();
+	for (const tables of [...Object.values(schema.checkpoints), schema.tables]) for (const relation of tables) {
+		if (!known.has(relation.name)) known.set(relation.name, new Map());
+		const columns = known.get(relation.name);
+		for (const column of relation.columns) {
+			if (!columns.has(column[0])) columns.set(column[0], []);
+			columns.get(column[0]).push(column);
+		}
+	}
+	for (const relation of schema.tables) {
+		const { rows } = await readColumns(client, relation.name);
+		for (const actual of rows) {
+			const definitions = known.get(relation.name)?.get(actual.column_name) ?? [];
+			if (definitions.length === 0) {
+				if (actual.not_null) throw new Error(`postgres schema: unexpected required column ${relation.name}.${actual.column_name}`);
+				if (actual.column_default != null || actual.generated || actual.identity) throw new Error(`postgres schema: unexpected computed column ${relation.name}.${actual.column_name}`);
+				continue;
+			}
+			if (actual.generated || actual.identity) throw new Error(`postgres schema: incompatible generated or identity column ${relation.name}.${actual.column_name}`);
+			const problems = definitions.map(definition => columnProblem(actual, definition));
+			if (!problems.includes(null)) throw new Error(`postgres schema: incompatible ${problems.at(-1)} for ${relation.name}.${actual.column_name}`);
+		}
+	}
+}
+
 async function validateColumns(client, schema, known = schema) {
 	for (const relation of schema.tables) {
-		const { rows } = await client.query(`SELECT a.attname AS column_name, format_type(a.atttypid, a.atttypmod) AS data_type, a.attnotnull AS not_null, a.attgenerated AS generated, a.attidentity AS identity, pg_get_expr(d.adbin, d.adrelid) AS column_default
-			FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
-			WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped`, [relation.name]);
+		const { rows } = await readColumns(client, relation.name);
 		const permitted = known.tables.find(entry => entry.name === relation.name) ?? relation;
 		const columns = [...relation.columns, ...permitted.columns.filter(column => !relation.columns.some(entry => entry[0] === column[0]) && rows.some(entry => entry.column_name === column[0]))];
 		for (const actual of rows) {

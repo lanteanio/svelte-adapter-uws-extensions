@@ -229,7 +229,17 @@ describe('PostgreSQL migration contracts', () => {
 		// Seeded from the highest stored epoch before any new topic can take one.
 		expect(seed.indexOf('MAX(epoch)')).toBeLessThan(seed.indexOf('SET DEFAULT nextval'));
 		expect(seed).toContain("ALTER TABLE svti_replay_seq ALTER COLUMN epoch SET DEFAULT nextval('svti_replay_seq_epoch_seq'::regclass)");
+		// Existing topics start from their newest event, not the migration time.
+		expect(seed).toContain('UPDATE svti_replay_seq s SET last_used_at = COALESCE((SELECT r.created_at FROM svti_replay r WHERE r.topic = s.topic ORDER BY r.seq DESC LIMIT 1), to_timestamp(0))');
 		const long = postgresMigrations({ store: 'replay', table: 'a'.repeat(42) })[2].statements.join(' ');
 		for (const [name] of long.matchAll(/\ba{42}_[a-z_]+/g)) expect(name.length, name).toBeLessThanOrEqual(63);
+	});
+
+	it('refuses a manually provisioned column no version defines before running any DDL', async () => {
+		const client = mockPgClient();
+		await client.query('CREATE TABLE IF NOT EXISTS svti_replay_seq (topic TEXT NOT NULL, seq BIGINT NOT NULL DEFAULT 0, epoch BIGINT NOT NULL DEFAULT 7, PRIMARY KEY (topic))');
+		await expect(migrate(client, { store: 'replay' })).rejects.toThrow('postgres schema: incompatible default for svti_replay_seq.epoch');
+		// Version 1 would have created the event table first.
+		expect((await client.query('SELECT to_regclass($1) IS NOT NULL AS present', ['svti_replay'])).rows).toEqual([{ present: false }]);
 	});
 });

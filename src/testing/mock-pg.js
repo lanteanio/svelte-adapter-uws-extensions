@@ -106,6 +106,11 @@ export function mockPgClient(options = {}) {
 	const lastUsedAt = new Map();
 	/** The `<table>_seq_epoch_seq` sequence: the last value handed out. */
 	let replayGeneration = 0;
+	/** Topic rows newest first by last use, ties by topic descending. */
+	function replayTopicsByUse() {
+		return [...seqCounters.keys()].sort((a, b) =>
+			(lastUsedAt.get(b) ?? 0) - (lastUsedAt.get(a) ?? 0) || (a < b ? 1 : a > b ? -1 : 0));
+	}
 	/** Drop topic rows and their events, as the eviction and idle statements do. */
 	function dropReplayTopics(topics) {
 		const gone = new Set(topics);
@@ -238,7 +243,15 @@ export function mockPgClient(options = {}) {
 			textOrObj = textOrObj.text;
 		}
 		if (!values) values = [];
-		const sql = textOrObj.trim().replace(/\s+/g, ' ');
+		let sql = textOrObj.trim().replace(/\s+/g, ' ');
+		// A replay read that also stamps its topic's last use: apply the stamp
+		// (only to a row not used within the interval) and dispatch the read.
+		const stamp = /^WITH stamp AS \( UPDATE \w+ SET last_used_at = now\(\) WHERE topic = \$1 AND last_used_at < now\(\) - interval '1 millisecond' \* (\d+) RETURNING 1 \) /.exec(sql);
+		if (stamp) {
+			const topic = values?.[0];
+			if (seqCounters.has(topic) && (lastUsedAt.get(topic) ?? 0) < now() - Number(stamp[1])) lastUsedAt.set(topic, now());
+			sql = sql.slice(stamp[0].length);
+		}
 		const schemaResult = schemaQuery(sql, values, connId);
 		if (schemaResult) return schemaResult;
 
@@ -1142,14 +1155,38 @@ export function mockPgClient(options = {}) {
 
 		// maxTopics eviction: topic rows past the newest $1 by last use, at
 		// most $2, deleted with their events. RETURNING the evicted topics.
-		if (sql.includes('WITH victims AS') && sql.includes('last_used_at DESC')) {
+		if (sql.startsWith('WITH cutoff AS') && sql.includes('last_used_at DESC')) {
 			const keep = parseInt(values[0], 10);
 			const limit = parseInt(values[1], 10);
-			const ordered = [...seqCounters.keys()].sort((a, b) =>
-				(lastUsedAt.get(b) ?? 0) - (lastUsedAt.get(a) ?? 0) || (a < b ? 1 : a > b ? -1 : 0));
-			const victims = ordered.slice(keep, keep + limit);
+			const victims = replayTopicsByUse().slice(keep, keep + limit);
 			dropReplayTopics(victims);
 			return { rows: victims.map((topic) => ({ topic })), rowCount: victims.length };
+		}
+
+		// The cleanup's eviction cutoff: the newest row past the cap.
+		if (sql.startsWith('SELECT last_used_at::text AS at, topic FROM') && sql.includes('OFFSET $1 LIMIT 1')) {
+			const topic = replayTopicsByUse()[parseInt(values[0], 10)];
+			return topic === undefined
+				? { rows: [], rowCount: 0 }
+				: { rows: [{ at: String(lastUsedAt.get(topic) ?? 0), topic }], rowCount: 1 };
+		}
+
+		// Cleanup eviction batch: rows at or below the cutoff, at most $3.
+		if (sql.startsWith('WITH victims AS') && sql.includes('::timestamptz')) {
+			const at = Number(values[0]);
+			const cut = String(values[1]);
+			const limit = parseInt(values[2], 10);
+			const victims = [...seqCounters.keys()].filter((topic) => {
+				const used = lastUsedAt.get(topic) ?? 0;
+				return used < at || (used === at && topic <= cut);
+			}).slice(0, limit);
+			dropReplayTopics(victims);
+			return { rows: victims.map((topic) => ({ topic })), rowCount: victims.length };
+		}
+
+		// Topic count for the over-cap report.
+		if (sql.startsWith('SELECT count(*)::bigint AS n FROM') && sql.includes('_seq')) {
+			return { rows: [{ n: String(seqCounters.size) }], rowCount: 1 };
 		}
 
 		// Idle topic expiry: rows not used for $1 seconds, oldest first, at
@@ -1162,7 +1199,7 @@ export function mockPgClient(options = {}) {
 				.sort((a, b) => (lastUsedAt.get(a) ?? 0) - (lastUsedAt.get(b) ?? 0))
 				.slice(0, limit);
 			dropReplayTopics(idle);
-			return { rows: [], rowCount: idle.length };
+			return { rows: idle.map((topic) => ({ topic })), rowCount: idle.length };
 		}
 
 		// Batch CTE publish: UNNEST arrays -> per-topic seq bump + multi-row

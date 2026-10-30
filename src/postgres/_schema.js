@@ -72,17 +72,20 @@ export function schemaFor({ store, table = defaults[store] } = {}) {
 	schema.checkpoints = { 1: schema.baseline, 2: schema.tables.map(relation => ({ ...relation, columns: [...relation.columns], indexes: [...relation.indexes], checks: [...relation.checks] })) };
 	const versions = [baseline, constraints];
 	if (store === 'replay') {
-		// Version 3: each topic's last publish, for maxTopics eviction and idle
+		// Version 3: each topic's last use, for maxTopics eviction and idle
 		// metadata expiry, and an epoch default drawn from one sequence so a
 		// deleted topic row can never hand its epoch out again. The sequence
-		// starts above every epoch already stored.
+		// starts above every epoch already stored, and an existing topic's last
+		// use starts at its newest event's created_at (the epoch of 1970 for a
+		// topic with no event left), so eviction ranks existing topics by when
+		// they were last published rather than all at the migration time.
 		const sequenceTable = schema.tables[1];
 		const lastUsed = timestamp('last_used_at', true, 'now()');
 		const sequence = `${sequenceTable.name}_epoch_seq`;
 		sequenceTable.columns = [...sequenceTable.columns.map(entry => entry[0] === 'epoch' ? ['epoch', 'bigint', true, 'serial'] : entry), lastUsed];
 		versions.push([
 			`ALTER TABLE ${sequenceTable.name} ADD COLUMN IF NOT EXISTS ${columnSql(lastUsed)}`,
-			`DO $migration$ DECLARE top BIGINT; BEGIN LOCK TABLE ${sequenceTable.name} IN SHARE ROW EXCLUSIVE MODE; CREATE SEQUENCE IF NOT EXISTS ${sequence} AS BIGINT OWNED BY ${sequenceTable.name}.epoch; SELECT COALESCE(MAX(epoch), 0) INTO top FROM ${sequenceTable.name}; IF top > 0 THEN PERFORM setval('${sequence}', GREATEST(top, (SELECT last_value FROM ${sequence}))); END IF; ALTER TABLE ${sequenceTable.name} ALTER COLUMN epoch SET DEFAULT nextval('${sequence}'::regclass); END $migration$`
+			`DO $migration$ DECLARE top BIGINT; BEGIN LOCK TABLE ${sequenceTable.name} IN SHARE ROW EXCLUSIVE MODE; CREATE SEQUENCE IF NOT EXISTS ${sequence} AS BIGINT OWNED BY ${sequenceTable.name}.epoch; SELECT COALESCE(MAX(epoch), 0) INTO top FROM ${sequenceTable.name}; IF top > 0 THEN PERFORM setval('${sequence}', GREATEST(top, (SELECT last_value FROM ${sequence}))); END IF; ALTER TABLE ${sequenceTable.name} ALTER COLUMN epoch SET DEFAULT nextval('${sequence}'::regclass); UPDATE ${sequenceTable.name} s SET last_used_at = COALESCE((SELECT r.created_at FROM ${table} r WHERE r.topic = s.topic ORDER BY r.seq DESC LIMIT 1), to_timestamp(0)); END $migration$`
 		]);
 		schema.checkpoints[3] = schema.tables;
 	}
