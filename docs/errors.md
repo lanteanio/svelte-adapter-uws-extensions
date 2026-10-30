@@ -8,7 +8,7 @@ whether anything recovers on its own, and what to do next:
 
 - 13 thrown errors. The Error message starts with the indexed prefix and ends with the
   stable ID tag and this document's route.
-- 79 diagnostic events. Each is one canonical line
+- 81 diagnostic events. Each is one canonical line
   `[lantean/diagnostic source=svelte-adapter-uws-extensions component=<component> event=<event> severity=<severity>] <message> {json}`,
   the same grammar the adapter prints, so `parseDiagnostic()` from `svelte-adapter-uws/observability`
   parses it and a sink installed through either package receives the record. The indexed prefix is
@@ -88,6 +88,8 @@ The adapter ships its own reference for its runtime at
 | [EXTENSIONS-ERR-REDIS-REPLAY-RETENTION-UNBOUNDED](#extensions-err-redis-replay-retention-unbounded) | `redis.replay.retention-unbounded` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.replay event=redis.replay.retention-unbounded severity=warn] A Redis replay buffer was created with no ttl and no forgetUserId, so its stored payloads never expire and live.forget cannot erase them.` |
 | [EXTENSIONS-ERR-REDIS-REPLAY-STREAM-RETENTION-UNBOUNDED](#extensions-err-redis-replay-stream-retention-unbounded) | `redis.replay-stream.retention-unbounded` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.replay-stream event=redis.replay-stream.retention-unbounded severity=warn] A Redis stream replay buffer was created with no ttl and no forgetUserId, so its stored payloads never expire and live.forget cannot erase them.` |
 | [EXTENSIONS-ERR-POSTGRES-REPLAY-RETENTION-UNBOUNDED](#extensions-err-postgres-replay-retention-unbounded) | `postgres.replay.retention-unbounded` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.postgres.replay event=postgres.replay.retention-unbounded severity=warn] A Postgres replay buffer was created with no ttl and no forgetUserId, so its stored payloads never expire and live.forget cannot erase them.` |
+| [EXTENSIONS-ERR-REDIS-REPLAY-TOPICS-OVER-CAP](#extensions-err-redis-replay-topics-over-cap) | `redis.replay.topics-over-cap` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.replay event=redis.replay.topics-over-cap severity=warn] The Redis replay store holds more topics than maxTopics, so the least recently used ones are being evicted with their history.` |
+| [EXTENSIONS-ERR-POSTGRES-REPLAY-TOPICS-OVER-CAP](#extensions-err-postgres-replay-topics-over-cap) | `postgres.replay.topics-over-cap` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.postgres.replay event=postgres.replay.topics-over-cap severity=warn] The Postgres replay table holds more topics than maxTopics, so the least recently used ones are being evicted with their history.` |
 | [EXTENSIONS-ERR-REDIS-DEAD-LETTER-RETENTION-UNBOUNDED](#extensions-err-redis-dead-letter-retention-unbounded) | `redis.dead-letter.retention-unbounded` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.dead-letter event=redis.dead-letter.retention-unbounded severity=warn] A Redis dead-letter store was created with no ttlMs and no forgetUserId, so its stored payloads never expire and live.forget cannot erase them.` |
 | [EXTENSIONS-ERR-POSTGRES-DEAD-LETTER-RETENTION-UNBOUNDED](#extensions-err-postgres-dead-letter-retention-unbounded) | `postgres.dead-letter.retention-unbounded` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.postgres.dead-letter event=postgres.dead-letter.retention-unbounded severity=warn] A Postgres dead-letter store was created with no ttlMs and no forgetUserId, so its stored payloads never expire and live.forget cannot erase them.` |
 | [EXTENSIONS-ERR-RATELIMIT-STORE-FLOOR](#extensions-err-ratelimit-store-floor) | `redis.ratelimit.store-unreachable` | `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.ratelimit event=redis.ratelimit.store-unreachable severity=warn] The rate-limit store is unreachable; verdicts are decided on the in-process floor.` |
@@ -127,7 +129,7 @@ The adapter ships its own reference for its runtime at
 
 ## Emitted diagnostic event coverage
 
-The runtime emits 79 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
+The runtime emits 81 distinct diagnostic events. Every one of them is indexed above with a stable ID and full operator guidance.
 The split is enforced by severity rather than by a list: an emitted event is exempt from the
 indexed reference only while every severity it is emitted at is informational, so promoting one
 to a warning or an error fails generation until it is indexed.
@@ -181,6 +183,8 @@ Indexed events:
 - `redis.replay.retention-unbounded` - [EXTENSIONS-ERR-REDIS-REPLAY-RETENTION-UNBOUNDED](#extensions-err-redis-replay-retention-unbounded)
 - `redis.replay-stream.retention-unbounded` - [EXTENSIONS-ERR-REDIS-REPLAY-STREAM-RETENTION-UNBOUNDED](#extensions-err-redis-replay-stream-retention-unbounded)
 - `postgres.replay.retention-unbounded` - [EXTENSIONS-ERR-POSTGRES-REPLAY-RETENTION-UNBOUNDED](#extensions-err-postgres-replay-retention-unbounded)
+- `redis.replay.topics-over-cap` - [EXTENSIONS-ERR-REDIS-REPLAY-TOPICS-OVER-CAP](#extensions-err-redis-replay-topics-over-cap)
+- `postgres.replay.topics-over-cap` - [EXTENSIONS-ERR-POSTGRES-REPLAY-TOPICS-OVER-CAP](#extensions-err-postgres-replay-topics-over-cap)
 - `redis.dead-letter.retention-unbounded` - [EXTENSIONS-ERR-REDIS-DEAD-LETTER-RETENTION-UNBOUNDED](#extensions-err-redis-dead-letter-retention-unbounded)
 - `postgres.dead-letter.retention-unbounded` - [EXTENSIONS-ERR-POSTGRES-DEAD-LETTER-RETENTION-UNBOUNDED](#extensions-err-postgres-dead-letter-retention-unbounded)
 - `redis.ratelimit.store-unreachable` - [EXTENSIONS-ERR-RATELIMIT-STORE-FLOOR](#extensions-err-ratelimit-store-floor)
@@ -943,6 +947,30 @@ the stable ID tag on the line):
 - **Automatic recovery:** None; this is configuration.
 - **Next action:** Set ttl to the longest time a record must be kept, set forgetUserId to map a record to the user it belongs to, or both.
 - **Runtime help:** `docs/errors.md#extensions-err-postgres-replay-retention-unbounded`
+- **Runtime sources:** [src/postgres/replay.js](../src/postgres/replay.js)
+
+<a id="extensions-err-redis-replay-topics-over-cap"></a>
+## `EXTENSIONS-ERR-REDIS-REPLAY-TOPICS-OVER-CAP`
+
+- **Code/event:** `redis.replay.topics-over-cap`
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.redis.replay event=redis.replay.topics-over-cap severity=warn] The Redis replay store holds more topics than maxTopics, so the least recently used ones are being evicted with their history.`
+- **Cause:** The one-time scan of the replay keys found more existing topics than the maxTopics option allows. The topics attribute is the number found and maxTopics the configured cap; the cap covers every instance sharing the key prefix.
+- **Consequence:** Each topic created from now on evicts the least recently used topic past the cap: its buffer, sequence counter and epoch are deleted, and a client resuming it rehydrates. Reported once per process.
+- **Automatic recovery:** None; this is configuration.
+- **Next action:** Set maxTopics to at least the number of topics the deployment keeps replay history for, on every instance. replay_topic_evictions_total shows the eviction rate.
+- **Runtime help:** `docs/errors.md#extensions-err-redis-replay-topics-over-cap`
+- **Runtime sources:** [src/redis/replay.js](../src/redis/replay.js), [src/redis/replay-stream.js](../src/redis/replay-stream.js)
+
+<a id="extensions-err-postgres-replay-topics-over-cap"></a>
+## `EXTENSIONS-ERR-POSTGRES-REPLAY-TOPICS-OVER-CAP`
+
+- **Code/event:** `postgres.replay.topics-over-cap`
+- **Message prefix:** `[lantean/diagnostic source=svelte-adapter-uws-extensions component=runtime.postgres.replay event=postgres.replay.topics-over-cap severity=warn] The Postgres replay table holds more topics than maxTopics, so the least recently used ones are being evicted with their history.`
+- **Cause:** The first topic count after the store became ready found more sequence rows than the maxTopics option allows. The topics attribute is the number found and maxTopics the configured cap; the cap covers every instance sharing the table.
+- **Consequence:** The bounded cleanup and each topic creation evict the least recently used topics past the cap: their events and sequence rows are deleted, and a client resuming one rehydrates. Reported once per process.
+- **Automatic recovery:** None; this is configuration.
+- **Next action:** Set maxTopics to at least the number of topics the deployment keeps replay history for, on every instance. replay_topic_evictions_total shows the eviction rate.
+- **Runtime help:** `docs/errors.md#extensions-err-postgres-replay-topics-over-cap`
 - **Runtime sources:** [src/postgres/replay.js](../src/postgres/replay.js)
 
 <a id="extensions-err-redis-dead-letter-retention-unbounded"></a>
