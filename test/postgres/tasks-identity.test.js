@@ -279,6 +279,16 @@ describe('postgres tasks per-tenant dispatch', () => {
 		expect(heavy).toEqual(['aaa', 'zzz']);
 	});
 
+	it.each([['email', 'report'], ['report', 'email']])('reaches a victim of one name when a tenant floods two names with one scope per claim (%s first)', async (...order) => {
+		const { enqueue, claim } = await setup();
+		await enqueue('aaa', 30, 'email');
+		await enqueue('aaa', 30, 'report');
+		const [victim] = await enqueue('zzz', 1, 'report');
+		const served = [];
+		for (let i = 0; i < 4; i++) served.push(...(await claim(1, order)).map((row) => row.id));
+		expect(served).toContain(victim);
+	});
+
 	it('claims only registered names', async () => {
 		const { enqueue, claim } = await setup();
 		await enqueue('ta', 2, 'other');
@@ -309,6 +319,19 @@ describe('postgres tasks per-tenant dispatch', () => {
 		await r.await(victim, { timeout: 20000, pollInterval: 5 });
 		const done = rowsOf(client).filter((row) => row.tenant_id === 'aaa' && row.status === 'committed').length;
 		expect(done).toBeLessThan(4);
+	}, 30000);
+
+	it('reaches a victim of one name when a tenant floods two names and each sweep claims one row', async () => {
+		const client = mockPgClient();
+		const r = runner(client, { dispatchInterval: 5, dispatchBatchSize: 1 });
+		r.register('email', async () => 'ok');
+		r.register('report', async () => 'ok');
+		for (let i = 0; i < 40; i++) await r.enqueue('email', { input: owner('aaa', 'u' + i) });
+		await r.enqueue('report', { input: owner('aaa', 'r') });
+		const victim = await r.enqueue('report', { input: owner('zzz', 'v') });
+		await r.await(victim, { timeout: 20000, pollInterval: 5 });
+		const done = rowsOf(client).filter((row) => row.tenant_id === 'aaa' && row.status === 'committed').length;
+		expect(done).toBeLessThan(5);
 	}, 30000);
 
 	it('runs a later tenant\'s task in the first dispatch sweep', async () => {

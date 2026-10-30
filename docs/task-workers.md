@@ -70,14 +70,15 @@ name after another with the name served longest ago first, up to its limit,
 and then moves each name past the scopes of its rotation that the claim chose,
 up to the first one it did not. A claim that chooses nothing, or only other
 names' scopes, leaves a name where it was, so neither a busy worker pool, an
-inline-only claim nor another name's work makes a name skip a scope. Every
-claim serves at least the name that has waited longest, so a name with pending
-work is served within `N` claims that cover it, where `N` is the number of
-names with pending work in those claims (every claim, when its limit is at
-least `N`), and each time its rotation moves forward by at least one scope. A
-tenant with pending rows of a name is therefore reached within `S * N` claims
-that cover the name, where `S` is the number of scopes with pending rows of
-that name, however large another tenant's backlog is. A sweep's first claim has limit
+inline-only claim nor another name's work makes a name skip a scope. A name
+counts as served only when its own position moves. Every claim moves the
+position of the name that has waited longest, by at least one scope, so a name
+with pending work moves within `N` claims that cover it, where `N` is the
+number of names with pending work in those claims (in every claim, when its
+limit is at least `N`). A tenant with pending rows of a name is therefore
+reached within `S * N` claims that cover the name, where `S` is the number of
+scopes with pending rows of that name, however large another tenant's backlog
+is, and however many names that tenant floods. A sweep's first claim has limit
 `dispatchBatchSize`, or the free threads of the scarcest worker pool when that
 is lower; its second claim covers the inline handlers. Rotation state is per
 runner. Only `forgetIdentity` gives a row a tenant: without it every row is in

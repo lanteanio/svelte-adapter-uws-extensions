@@ -409,7 +409,8 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 	 * the scopes with pending rows of that name, in the order LEGACY,
 	 * UNTENANTED, then tenant ids in index order. A claim takes the next
 	 * scopes of each of its names' rotations, interleaved name by name
-	 * (the name served longest ago first), up to `limit` scopes.
+	 * (the name whose position moved longest ago first), up to `limit`
+	 * scopes.
 	 * A name's position then moves past the leading scopes of its rotation
 	 * that the claim chose, and no further: a scope is never passed over
 	 * because a claim chose later scopes for other names, and a claim that
@@ -521,8 +522,11 @@ export function createTaskSql({ client, table, fenceTtl, rowTtl, autoMigrate, se
 				if (!picked.has(scope)) break;
 				last = scope;
 			}
-			if (last !== undefined) cursors.set(name, last);
-			if (rotations.get(name).some((scope) => picked.has(scope))) lastServed.set(name, claim);
+			// A name counts as served only when its own position moved.
+			if (last !== undefined) {
+				cursors.set(name, last);
+				lastServed.set(name, claim);
+			}
 		}
 		if (chosen.length === 0) return [];
 		const tenants = [], ords = [];

@@ -114,6 +114,37 @@ describe('postgres tasks tenant-qualified identity (integration)', () => {
 describe('postgres tasks per-tenant dispatch (integration)', () => {
 	const sql = () => createTaskSql({ client, table: TABLE, fenceTtl: 30, rowTtl: 3600, autoMigrate: false });
 
+	it('keeps a separate position for each name across claims', async () => {
+		const r = runner();
+		const enqueue = async (tenant, n, name) => { for (let i = 0; i < n; i++) await r.enqueue(name, { input: owner(tenant, name + i) }); };
+		await enqueue('aaa', 10, 'heavy');
+		await enqueue('mmm', 1, 'heavy');
+		await enqueue('zzz', 10, 'heavy');
+		await enqueue('zzz', 10, 'light');
+		await enqueue('bbb', 10, 'other');
+		const s = sql();
+		const tenants = async (limit, names) => (await s.claimPending(limit, names)).map((row) => row.input.owner.tenantId).sort();
+		expect(await tenants(1, ['heavy'])).toEqual(['aaa']);
+		// light and other waited longer and fill the claim; heavy's mmm was not
+		// chosen, so heavy stays at aaa.
+		expect(await tenants(2, ['heavy', 'light', 'other'])).toEqual(['bbb', 'zzz']);
+		expect(await tenants(1, ['heavy'])).toEqual(['mmm']);
+		// light moved past zzz, other past bbb: each continues from its own place.
+		expect(await tenants(1, ['light'])).toEqual(['zzz']);
+		expect(await tenants(1, ['other'])).toEqual(['bbb']);
+	});
+
+	it('reaches a victim of one name while a tenant floods two names, one scope per claim', async () => {
+		const r = runner();
+		for (let i = 0; i < 30; i++) await r.enqueue('email', { input: owner('aaa', 'e' + i) });
+		for (let i = 0; i < 30; i++) await r.enqueue('report', { input: owner('aaa', 'r' + i) });
+		const victim = await r.enqueue('report', { input: owner('zzz', 'v') });
+		const s = sql();
+		const served = [];
+		for (let i = 0; i < 4; i++) served.push(...(await s.claimPending(1, ['email', 'report'])).map((row) => row.id));
+		expect(served).toContain(victim);
+	});
+
 	it('claims a later tenant and the unstamped scope in the first sweep behind a large backlog', async () => {
 		const r = runner();
 		const legacy = runner({ forgetIdentity: undefined });
