@@ -44,7 +44,7 @@ Dead-letter writes use the same bounded maintenance as idle passes. Concurrent
 writes share local cleanup ownership. Writes arriving during a pass queue one
 more bounded pass after it, and so does a pass that exhausts its row budget
 (after 1 ms), finds another replica's pass running or times out on a lock
-(after 100 ms). A write waits only for its own pass, and the chain ends once a
+(after 100 ms, doubling up to 6.4 s while passes keep failing to run). A write waits only for its own pass, and the chain ends once a
 pass completes with no write arriving meanwhile. `destroy()` cancels a queued pass.
 TTL selection uses `failed_at`; size cleanup deletes the oldest ids of the
 tenant scope holding the most records (ties to the scope holding the oldest

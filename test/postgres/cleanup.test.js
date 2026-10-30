@@ -130,6 +130,28 @@ describe('bounded PostgreSQL maintenance', () => {
 			} finally { cleanup.stop(); }
 		}
 	});
+	it('backs off retries while another owner keeps the pass, up to a cap, and resets after a pass runs', async () => {
+		vi.useFakeTimers();
+		const { client, tx } = checkout({ acquired: false });
+		const at = [];
+		const connect = client.connect;
+		client.connect = vi.fn(async () => { at.push(Date.now()); return connect(); });
+		const cleanup = scheduleCleanup({ client, table: 'cache', kind: 'dead-letter', interval: 0, coalesce: true, ready: async () => {}, work: async () => {} });
+		try {
+			await cleanup.run();
+			await vi.advanceTimersByTimeAsync(100 + 200 + 400 + 800 + 1600 + 3200 + 6400 * 3);
+			expect(at.slice(1).map((time, index) => time - at[index])).toEqual([100, 200, 400, 800, 1600, 3200, 6400, 6400, 6400]);
+			// A pass that runs ends the chain and resets the delay.
+			tx.query.mockImplementation(async ({ text }) => ({ rows: text.includes('advisory') ? [{ acquired: true }] : [], rowCount: 0 }));
+			await vi.advanceTimersByTimeAsync(6400);
+			expect(vi.getTimerCount()).toBe(0);
+			tx.query.mockImplementation(async ({ text }) => ({ rows: text.includes('advisory') ? [{ acquired: false }] : [], rowCount: 0 }));
+			at.length = 0;
+			await cleanup.run();
+			await vi.advanceTimersByTimeAsync(100);
+			expect(at.slice(1).map((time, index) => time - at[index])).toEqual([100]);
+		} finally { cleanup.stop(); }
+	});
 	it('does not follow a pass of a store that does not coalesce', async () => {
 		vi.useFakeTimers();
 		const { client } = checkout();

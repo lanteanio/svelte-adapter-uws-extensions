@@ -3,8 +3,10 @@ import { clearTimer, monotonicNow, randomFloat, setTimer } from '../shared/runti
 const ROW_BUDGET = 1000;
 const PASS_MS = 1000;
 const BATCH_SIZE = 250;
-// Delay before a coalesced follow-up pass after a pass that could not run.
+// Delay before a coalesced follow-up pass after a pass that could not run,
+// doubling while passes keep failing to run, up to RETRY_MAX_MS.
 const RETRY_MS = 100;
+const RETRY_MAX_MS = 6400;
 const pendingCheckouts = new WeakSet();
 
 // Only retention work uses this transaction namespace. The table OID resolves
@@ -99,11 +101,17 @@ export function scheduleCleanup({ client, table, kind, interval, metrics, ready,
 	let timer;
 	let trailingTimer;
 	let trailingRequested = false;
+	let retryDelay = RETRY_MS;
 	let running = false;
 	function schedule(maxDelay = interval) {
 		if (stopped || interval === 0) return;
 		timer = setTimer(tick, Math.max(1, Math.ceil(randomFloat() * maxDelay)));
 		timer?.unref?.();
+	}
+	function backOff() {
+		const delay = retryDelay;
+		retryDelay = Math.min(retryDelay * 2, RETRY_MAX_MS);
+		return delay;
 	}
 	async function run(trailing = false) {
 		if (stopped) return;
@@ -131,18 +139,22 @@ export function scheduleCleanup({ client, table, kind, interval, metrics, ready,
 			if (result.rows) removed?.inc({ store: kind }, result.rows);
 			if (result.detail !== undefined) committed?.(result.detail);
 			if (result.result !== 'waiting' && result.result !== 'stopped') success?.();
-			if (result.result === 'budget') followUp = 1;
-			else if (result.result === 'contended' || result.result === 'waiting') followUp = RETRY_MS;
+			if (result.result === 'contended' || result.result === 'waiting') followUp = backOff();
+			else {
+				retryDelay = RETRY_MS;
+				if (result.result === 'budget') followUp = 1;
+			}
 			return result;
 		} catch (error) {
 			runs?.inc({ store: kind, result: 'error' });
 			failure?.(error);
-			if (error?.code === '55P03') followUp = RETRY_MS;
+			if (error?.code === '55P03') followUp = backOff();
 		} finally {
 			duration?.observe({ store: kind }, (monotonicNow() - start) / 1000);
 			running = false;
-			// Callers never wait for a queued pass, only for their own.
-			if (trailingRequested) followUp = 1;
+			// Callers never wait for a queued pass, only for their own. A write
+			// during a pass that could not run waits for the backed-off retry.
+			if (trailingRequested && followUp === null) followUp = 1;
 			if (!stopped && coalesce && followUp !== null && !trailingTimer) {
 				trailingTimer = setTimer(() => { trailingTimer = undefined; return run(true); }, followUp);
 				trailingTimer?.unref?.();

@@ -1140,9 +1140,10 @@ Postgres dead-letter migration version 4 adds `scope TEXT NOT NULL DEFAULT ''`
 to `<table>`, an index on `(scope, <table>_id)`, the `<table>_scopes` table
 (record count and oldest id per scope), and statement triggers on `<table>`
 that keep it for every INSERT, UPDATE, DELETE and TRUNCATE. Under a SHARE ROW
-EXCLUSIVE lock on `<table>`, so writers wait for one pass over the table, the
-migration derives the scope of existing rows from their topics and counts
-them. The trigger function lives in the schema of `<table>`, names its tables
+EXCLUSIVE lock on `<table>` the migration derives the scope of existing rows
+from their topics, which rewrites every row with a tenant or untenanted topic,
+and counts them; writers wait for that rewrite and its WAL, so size the
+maintenance window by the row count. The trigger function lives in the schema of `<table>`, names its tables
 with that schema and pins `search_path`, so writers with any search path update
 the same counts.
 
@@ -1166,11 +1167,14 @@ scope.
 Back up and restore `<table>_scopes` with the other two tables: a PostgreSQL
 recovery scope file that lists `dead-letter` must also list
 `dead-letter-tenants`, and the verifier checks the counts against the rows
-(`scope_counts`). A data-only restore into existing tables fires the triggers
-and counts the restored rows a second time; restore with
-`pg_restore --data-only --disable-triggers`. `ready()` compares the counts with
-the rows and rebuilds them when they differ, so a store that starts after such
-a restore repairs them before serving.
+(`scope_counts`). A data-only restore into existing tables with triggers
+enabled counts the restored records as they load: the COPY into `<table>_scopes`
+then fails on a duplicate key, or, when that table loads first, the records
+are counted twice. Restore with `pg_restore --data-only --disable-triggers`.
+`ready()` compares the counts with the rows and rebuilds them when they differ,
+so a store that starts after a double-counting restore repairs them; when
+captures keep the count rows locked, `ready()` resolves and the next cleanup
+pass rebuilds them.
 
 ### `createClusterClock` prefixes `leaderKey`
 

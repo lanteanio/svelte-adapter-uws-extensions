@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createDeadLetter } from '../../src/postgres/dead-letter.js';
 import { createMetrics } from '../../src/prometheus/index.js';
+import { migrate } from '../../src/postgres/migrations.js';
+import { mockPgClient } from '../../src/testing/mock-pg.js';
+import { createCircuitBreaker } from '../../src/shared/breaker.js';
 import { monotonicNow, resetRuntimeEnv, setRuntimeEnv } from '../../src/shared/runtime.js';
 
 // A focused in-memory Postgres double for exactly the queries the dead-letter
@@ -584,6 +587,96 @@ describe('postgres dead-letter fair-share eviction', () => {
 		expect(metrics.serialize()).not.toMatch(/^dead_letter_evicted_total /m);
 		await store.add(rec({ topic: '@t/a/orders' }));
 		expect(metrics.serialize()).toContain('dead_letter_evicted_total 1');
+	});
+});
+
+// The fake answers the store's statements; a migrated schema double answers
+// ready()'s catalog validation, so ready() runs its drift check for real.
+async function withCatalog(fake) {
+	const catalog = mockPgClient();
+	await migrate(catalog, { store: 'dead-letter' });
+	const isCatalog = (text) => !/advisory/.test(text) && /pg_|to_regclass|svti_schema_migrations|has_table_privilege|has_sequence_privilege/.test(text);
+	const query = (sql, values) => {
+		const text = typeof sql === 'string' ? sql : sql.text;
+		return isCatalog(text) ? catalog.query(sql, values) : fake.query(text, sql.values ?? values);
+	};
+	return { ...fake, query, async connect() { return { query, release() {} }; } };
+}
+
+describe('postgres dead-letter count repair', () => {
+	let fake, client, store, issued;
+	beforeEach(async () => {
+		fake = fakePg();
+		client = await withCatalog(fake);
+		issued = [];
+		const query = client.query;
+		client.query = (sql, values) => {
+			const text = (typeof sql === 'string' ? sql : sql.text).replace(/\s+/g, ' ').trim();
+			issued.push(text);
+			return query(sql, values);
+		};
+		client.connect = async () => ({ query: client.query, release() {} });
+	});
+	afterEach(() => store?.destroy());
+	const rebuild = () => issued.filter((text) => /^(LOCK TABLE svti_dead_letter_scopes|DELETE FROM svti_dead_letter_scopes$|INSERT INTO svti_dead_letter_scopes)/.test(text));
+
+	it('ready() leaves matching counts alone and rebuilds drifted ones', async () => {
+		store = createDeadLetter(client, { autoMigrate: false, cleanupInterval: 0 });
+		await store.ready();
+		expect(rebuild()).toEqual([]);
+		fake._drift();
+		const restarted = createDeadLetter(client, { autoMigrate: false, cleanupInterval: 0 });
+		try {
+			await restarted.ready();
+			expect(rebuild()).toHaveLength(3);
+		} finally { restarted.destroy(); }
+	});
+
+	it('ready() resolves under a held count lock and the next cleanup pass rebuilds', async () => {
+		vi.useFakeTimers();
+		fake._drift();
+		const query = client.query;
+		let locked = true;
+		client.query = (sql, values) => {
+			const text = typeof sql === 'string' ? sql : sql.text;
+			if (locked && text.startsWith('LOCK TABLE svti_dead_letter_scopes')) {
+				locked = false;
+				return Promise.reject(Object.assign(new Error('canceling statement due to lock timeout'), { code: '55P03' }));
+			}
+			return query(sql, values);
+		};
+		client.connect = async () => ({ query: client.query, release() {} });
+		store = createDeadLetter(client, { autoMigrate: false, cleanupInterval: 0 });
+		await store.ready();
+		await vi.advanceTimersByTimeAsync(0);
+		// The pass rebuilt inside its own transaction, after the pass lock.
+		const pass = issued.findIndex((text) => text.includes('pg_try_advisory_xact_lock'));
+		expect(pass).toBeGreaterThanOrEqual(0);
+		expect(issued.slice(pass).filter((text) => text.startsWith('INSERT INTO svti_dead_letter_scopes'))).toHaveLength(1);
+		issued.length = 0;
+		await store.add(rec());
+		expect(rebuild()).toEqual([]);
+	});
+
+	it('keeps a cleanup lock timeout out of the breaker', async () => {
+		const query = client.query;
+		let fail = true;
+		client.query = (sql, values) => {
+			const text = typeof sql === 'string' ? sql : sql.text;
+			if (fail && text.trim().startsWith('WITH victims AS')) {
+				fail = false;
+				return Promise.reject(Object.assign(new Error('canceling statement due to lock timeout'), { code: '55P03' }));
+			}
+			return query(sql, values);
+		};
+		client.connect = async () => ({ query: client.query, release() {} });
+		const breaker = createCircuitBreaker({ failureThreshold: 1 });
+		store = createDeadLetter(client, { autoMigrate: false, cleanupInterval: 0, max: 1, breaker });
+		await store.add(rec());
+		expect(await store.add(rec())).not.toBeNull();
+		expect(fail).toBe(false);
+		expect(breaker.state).toBe('healthy');
+		breaker.destroy();
 	});
 });
 

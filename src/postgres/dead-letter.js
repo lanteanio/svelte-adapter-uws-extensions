@@ -56,7 +56,8 @@
  * counts and deletes through the (scope, id) index, never walking the whole
  * record table. `ready()` also compares the counts with the rows and rebuilds
  * them when they differ, which only writes that bypass the triggers cause (a
- * data-only restore with triggers enabled, a session in replica mode).
+ * restore that loads counts and records with triggers enabled, a session in
+ * replica mode).
  * Writes and periodic maintenance share bounded cleanup transactions; large
  * backlogs drain over multiple passes. Reads exclude expired records even while
  * physical deletion is pending. Replica maintenance uses a per-table lock.
@@ -262,6 +263,16 @@ export function createDeadLetter(client, options = {}) {
 			if (count < limit) break;
 		}
 	}
+	// Rebuild the counts from the rows, holding count updates off meanwhile:
+	// a capture waits for the rebuild instead of racing it.
+	const REBUILD = [
+		`LOCK TABLE ${scopeTable} IN EXCLUSIVE MODE`,
+		`DELETE FROM ${scopeTable}`,
+		`INSERT INTO ${scopeTable} (scope, records, oldest) SELECT scope, count(*), min(${pkCol}) FROM ${table} GROUP BY scope`
+	];
+	// Set when ready() found drift but could not take the lock in time; the
+	// next cleanup pass rebuilds first, retrying with the pass backoff.
+	let repairPending = false;
 	let ttlFirst = true;
 	const cleanup = scheduleCleanup({
 		client, table, kind: 'dead-letter', interval: cleanupInterval, metrics: m, coalesce: true,
@@ -272,23 +283,29 @@ export function createDeadLetter(client, options = {}) {
 		// for one met ordinary contention, not a failing database, so it stays
 		// out of the breaker; the next pass retries.
 		failure: error => { if (error?.code !== '55P03') pgFailure(b, error); },
-		committed: evicted => { if (evicted > 0) mEvicted?.inc(evicted); },
+		committed: ({ evicted, repaired }) => {
+			if (repaired) repairPending = false;
+			if (evicted > 0) mEvicted?.inc(evicted);
+		},
 		isolation: READ_COMMITTED_TX.isolation,
 		async work(budget) {
+			const repaired = repairPending;
+			if (repaired) for (const statement of REBUILD) await budget.query(statement);
 			const expiredFirst = ttlFirst;
 			ttlFirst = !ttlFirst;
 			if (expiredFirst) await trimExpired(budget);
 			const evicted = await trimSize(budget);
 			if (!expiredFirst) await trimExpired(budget);
 			await trimPurges(budget);
-			return evicted;
+			return { evicted, repaired };
 		}
 	});
 	// The triggers keep the counts for every writer, so they only drift
-	// through writes that bypass them (a data-only restore with triggers
-	// enabled, a session in replica mode). ready() compares them with the
-	// rows in one read and, on a difference, rebuilds them while holding
-	// count updates off; captures wait for the rebuild instead of racing it.
+	// through writes that bypass them (a restore that loads counts and
+	// records with triggers enabled, a session in replica mode). ready() compares them with the
+	// rows in one read and, on a difference, rebuilds them. When captures keep
+	// the count rows locked past the lock timeout, ready() still resolves and
+	// the cleanup passes take over the rebuild, so boot never fails on load.
 	let reconciled = null;
 	function reconcileCounts() {
 		reconciled ??= (async () => {
@@ -297,12 +314,16 @@ export function createDeadLetter(client, options = {}) {
 				FULL JOIN ${scopeTable} c USING (scope) WHERE r.n IS DISTINCT FROM c.records
 			) AS drifted`));
 			if (!drift.rows[0]?.drifted) return;
-			await withBreaker(b, () => withTransaction(client, async (tx) => {
-				await tx.query("SELECT set_config('lock_timeout', '1000', true)");
-				await tx.query(`LOCK TABLE ${scopeTable} IN EXCLUSIVE MODE`);
-				await tx.query(`DELETE FROM ${scopeTable}`);
-				await tx.query(`INSERT INTO ${scopeTable} (scope, records, oldest) SELECT scope, count(*), min(${pkCol}) FROM ${table} GROUP BY scope`);
-			}, READ_COMMITTED_TX));
+			try {
+				await withTransaction(client, async (tx) => {
+					await tx.query("SELECT set_config('lock_timeout', '1000', true)");
+					for (const statement of REBUILD) await tx.query(statement);
+				}, READ_COMMITTED_TX);
+			} catch (error) {
+				if (error?.code !== '55P03') throw error;
+				repairPending = true;
+				cleanup.run().catch(() => { /* the pass reports its own failure */ });
+			}
 		})().catch((error) => { reconciled = null; throw error; });
 		return reconciled;
 	}
