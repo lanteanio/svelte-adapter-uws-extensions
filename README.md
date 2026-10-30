@@ -703,7 +703,7 @@ The same `resumeHook()` and the same reset-detection are available on the Postgr
 | `storage` | `'sortedset'` | Backend: `'sortedset'` (default) uses ZADD; `'stream'` uses XADD. See [Stream backend](#stream-backend). |
 | `size` | `1000` | Max messages per topic |
 | `ttl` | `0` | Key expiry in seconds (0 = never). Every per-topic key, the epoch included, expires together after `ttl` seconds without a publish. |
-| `maxTopics` | `100` | Max topics holding replay state, as in the core plugin; the least recently published topic is evicted past it. One cap for every instance sharing the key prefix. See [topic limit and generations](docs/replay-topics.md). |
+| `maxTopics` | `100` | Max topics holding replay state, as in the core plugin; the least recently used topic (publishes and reads count) is evicted past it. One cap for every instance sharing the key prefix, the store being the one buffer. See [topic limit and generations](docs/replay-topics.md). |
 | `maxDataBytes` | `262144` | Per-message payload cap, applied by every replay backend (Redis sorted-set, Redis stream, Postgres) so the contract does not differ by which one a deployment runs. Rejects with `ReplaySerializationError`; on the Postgres store `publishBatch` enforces it too. Must be a positive integer - `NaN` and `0` are refused rather than silently disabling the cap. |
 | `durability` | - | Set to `'replicated'` for per-publish replication signalling. See [Replicated durability](#replicated-durability). |
 | `minReplicas` | `1` | Minimum replicas that must ack (only with `durability: 'replicated'`). |
@@ -1833,7 +1833,7 @@ The `epoch` column carries the per-topic seq-space generation used by `resumeHoo
 | `table` | `'svti_replay'` | Table name |
 | `size` | `1000` | Max messages per topic |
 | `ttl` | `0` | Row expiry in seconds (0 = never). A topic not published for longer also loses its `svti_replay_seq` row. |
-| `maxTopics` | `100` | Max topics holding replay state in the table, across every instance; the least recently published topic is evicted past it ([topic limit](docs/replay-topics.md)) |
+| `maxTopics` | `100` | Max topics holding replay state in the table, across every instance; the least recently used topic (publishes and reads count) is evicted past it ([topic limit](docs/replay-topics.md)) |
 | `autoMigrate` | `true` | Apply the versioned schema migrations automatically; `false` only validates an externally migrated schema on `ready()` ([readiness](docs/postgres-support.md#schema-transitions-and-readiness)) |
 | `cleanupInterval` | `60000` | Maximum jitter delay between bounded cleanup passes in ms (0 disables); [retention limits](docs/postgres-retention.md) |
 
