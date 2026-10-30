@@ -1114,7 +1114,6 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				if (script.includes('REPLAY_TOPIC_EVICT')) return evalReplayTopicEvict(args);
 				if (script.includes('REPLAY_TOPIC_SETTLE')) return evalReplayTopicSettle(args);
 				if (script.includes('REPLAY_TOPIC_TOUCH')) return evalReplayTopicTouch(args);
-				if (script.includes('REPLAY_TOPIC_PROBE')) return evalReplayTopicProbe(args);
 				if (script.includes('REPLAY_SEED_LEASE')) return evalReplaySeedLease(args);
 				if (script.includes('REPLAY_SEED_PROGRESS')) return evalReplaySeedProgress(args);
 				if (script.includes('REPLAY_SEED_FINISH')) return evalReplaySeedFinish(args);
@@ -1366,11 +1365,15 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 		// exec() runs them through execBatch.
 		function makeBatch() {
 			const commands = [];
+			// Like ioredis, a batch offers only the scripts defined before it was
+			// created; one defined later is not a method of this batch.
+			const defined = new Set(evalShapedCommands);
 			const p = new Proxy({}, {
 				get(_, method) {
 					if (method === 'exec') {
 						return () => execBatch(commands);
 					}
+					if (evalShapedCommands.has(method) && !defined.has(method)) return undefined;
 					return (...args) => {
 						commands.push({ method, args });
 						return p;
@@ -2087,13 +2090,6 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			if (!store.has(args[0])) return 0;
 			store.set(args[1], String(evalTimeNowMs()));
 			return 1;
-		}
-
-		// args layout: [seqKey, epochKey]. The double tracks no access times,
-		// so it answers as a server under an LFU policy does: idle unknown.
-		function evalReplayTopicProbe(args) {
-			pruneExpiredString(args[1]);
-			return [-1, store.has(args[1]) ? store.get(args[1]) : null];
 		}
 
 		function replaySeedLeaseHeld(gen, token) {

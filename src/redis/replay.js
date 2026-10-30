@@ -277,7 +277,9 @@ export function createReplay(client, options = {}) {
 	// failed stamp does not fail the read.
 	async function readStamped(topic, method, ...args) {
 		if (!topics.readStampDue(topic)) return redis[method](...args);
-		const results = await redis.pipeline()[method](...args)[topics.touchCommand()](2, seqKey(topic), usedKey(topic)).exec();
+		// A pipeline carries only the scripts defined before it was created.
+		const touch = topics.touchCommand();
+		const results = await redis.pipeline()[method](...args)[touch](2, seqKey(topic), usedKey(topic)).exec();
 		if (results[0][0]) throw results[0][0];
 		return results[0][1];
 	}
@@ -503,11 +505,13 @@ export function createReplay(client, options = {}) {
 			// and an in-flight publish cannot pass for a missing entry.
 			let missedRaw, seqRaw;
 			try {
+				// A pipeline carries only the scripts defined before it was created.
+				const touch = topics.readStampDue(topic) ? topics.touchCommand() : null;
 				const pipe = redis.pipeline();
 				pipe.get(seqKey(topic));
 				pipe.zrangebyscore(bk, sinceSeq + 1, '+inf');
 				// The use stamp rides the same round trip (see readStamped).
-				if (topics.readStampDue(topic)) pipe[topics.touchCommand()](2, seqKey(topic), usedKey(topic));
+				if (touch) pipe[touch](2, seqKey(topic), usedKey(topic));
 				const results = await pipe.exec();
 				if (results[0][0]) throw results[0][0];
 				if (results[1][0]) throw results[1][0];

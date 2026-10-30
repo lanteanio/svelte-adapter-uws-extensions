@@ -39,7 +39,7 @@
  */
 
 import { evalCached, evalCachedName } from '../shared/eval-cached.js';
-import { execMultiSlot, firstCommandError } from '../shared/cluster.js';
+import { execMultiSlot } from '../shared/cluster.js';
 import { scanNodes } from '../shared/redis-scan.js';
 import { withBreaker } from '../shared/breaker.js';
 import { createLruMap } from '../shared/lru-map.js';
@@ -236,22 +236,6 @@ return 1
 `;
 
 /**
- * Last access and stored epoch of one existing topic, for seeding. The idle
- * time is -1 where Redis does not track it (an LFU memory policy) or the seq
- * key is gone.
- *
- * KEYS[1] = seq, KEYS[2] = epoch
- */
-const PROBE_SCRIPT = `
--- REPLAY_TOPIC_PROBE
-local ok, idle = pcall(redis.call, 'object', 'idletime', KEYS[1])
-if not ok or type(idle) ~= 'number' then
-  idle = -1
-end
-return {idle, redis.call('get', KEYS[2])}
-`;
-
-/**
  * Take or extend the seed lease. Returns 2 when the deployment is already
  * seeded, 1 when this token holds the lease, 0 when another live one does.
  *
@@ -427,7 +411,6 @@ export function createReplayTopics(client, { maxTopics, breaker: b, onEvicted, o
 		const token = randomUuid();
 		if (Number(await evalCached(redis, SEED_LEASE_SCRIPT, 1, generationKey, token, SEED_LEASE_MS)) !== 1) return;
 		const pattern = client.key('replay:*');
-		const probe = evalCachedName(redis, PROBE_SCRIPT);
 		const nodes = scanNodes(redis);
 		for (let index = 0; index < nodes.length; index++) {
 			const node = nodes[index];
@@ -445,14 +428,23 @@ export function createReplayTopics(client, { maxTopics, breaker: b, onEvicted, o
 				const pairs = [];
 				let floor = 0;
 				if (list.length > 0) {
-					const results = await execMultiSlot(redis, list.map((t) => [probe, 2, keys.seq(t), keys.epoch(t)]));
-					const error = firstCommandError(results);
-					if (error) throw error;
+					// Asked of the node that returned the keys, which owns their
+					// slots. OBJECT IDLETIME is the last access Redis tracks; it
+					// fails under an LFU memory policy (or an ACL without it), and
+					// such a topic then ranks as oldest (-1).
+					const pipe = node.pipeline();
+					for (const t of list) {
+						pipe.object('IDLETIME', keys.seq(t));
+						pipe.get(keys.epoch(t));
+					}
+					const results = await pipe.exec();
 					for (let i = 0; i < list.length; i++) {
-						const [idle, epoch] = results[i][1];
+						const [idleErr, idle] = results[2 * i];
+						const [epochErr, epoch] = results[2 * i + 1];
+						if (epochErr) throw epochErr;
 						const value = parseInt(epoch, 10);
 						if (Number.isSafeInteger(value) && value > floor) floor = value;
-						pairs.push(list[i], Number.isInteger(Number(idle)) ? Number(idle) : -1);
+						pairs.push(list[i], !idleErr && Number.isInteger(idle) ? idle : -1);
 					}
 				}
 				const nextCursor = String(next) === '0' ? 'done' : String(next);

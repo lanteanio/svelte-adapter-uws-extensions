@@ -67,10 +67,12 @@ describeIntegration('replay migration (sorted-set -> stream, integration)', () =
 
 		it('preserves the shared seq + epoch so the stream backend resumes', async () => {
 			await seedSortedSet('chat', 4);
+			const epoch = await createReplay(client).currentEpoch('chat');
+			expect(epoch).toBeGreaterThan(0);
 			await migrateReplayToStream(client, { topics: ['chat'] });
 			const st = createReplay(client, { storage: 'stream' });
 			expect(await st.seq('chat')).toBe(4);
-			expect(await st.currentEpoch('chat')).toBe(1);
+			expect(await st.currentEpoch('chat')).toBe(epoch);
 		});
 
 		it('round-trips a null payload', async () => {
