@@ -291,7 +291,7 @@ rate limits for a Redis user whose key and channel patterns were written for 0.5
 
 **Why.** Hash-tagged keys change the per-entity key strings, and 0.6 adds key
 families: `replay:epoch:{<topic>}`, `replay:used:{<topic>}`,
-`replay:generation:{replay-topics}` and `replay:topics:{replay-topics}`;
+`replay:seed:{replay-topics}` and `replay:topics:{replay-topics}`;
 `presence:pending:{<topic>}`, the private
 identity generations and committed-identity fence that every join writes
 (excluded from roster reads); the idempotency and session erasure indexes under
@@ -307,7 +307,7 @@ is shown and a custom value replaces it:
 
 | Module | Key patterns |
 |---|---|
-| Replay (sorted set and stream) | `replay:*` (sequence, buffer, stream buffer, epoch, last use, producer cache, generation counter, topic registry) |
+| Replay (sorted set and stream) | `replay:*` (sequence, buffer, stream buffer, epoch, last use, producer cache, seed state, topic registry) |
 | Presence | `presence:*` (roster, per-user connections, pending identity) |
 | Cursor, groups | `cursor:*`, `group:*` |
 | CRDT, smooth cluster | `crdt:*`, `smooth:*` |
@@ -432,12 +432,12 @@ is per store - every instance sharing a Redis key prefix or a Postgres table:
 the core plugin refuses multi-worker runtimes, so it keeps exactly one buffer of
 `maxTopics` topics, and the shared store is the one buffer here. Topics stored
 before the upgrade count, ranked by their last use as far as it is known:
-Postgres takes each topic's newest event's `created_at`; Redis takes the last
-access it tracks for the topic's seq key (`OBJECT IDLETIME`), and under an LFU
-`maxmemory-policy`, which tracks none, ranks every existing topic as oldest. A
-deployment with more topics than the cap therefore keeps its most recently used
-topics (on Redis under LFU: an arbitrary subset of the existing ones) and loses
-the buffers of the rest.
+Postgres takes each topic's newest event's `created_at`; Redis stores no time
+per entry, so it ranks every existing topic as least recently used until a
+publish or read after the upgrade stamps it, and evicts the unstamped ones in
+topic-name order. A deployment with more topics than the cap therefore loses
+the buffers of all but the topics it keeps (on Postgres its most recently
+published ones, on Redis the ones used after the upgrade).
 
 **Action.** Before upgrading, count the topics the deployment keeps replay
 history for (Redis: `replay:seq:{*}` keys under the client prefix; Postgres:
@@ -447,51 +447,45 @@ a sustained rate means the cap is too small. A larger cap costs nothing per
 publish; on Postgres, creating a topic and each cleanup pass read the sequence
 table, which the cap bounds.
 
-### Replay epochs come from one generation counter
+### Replay epochs are opaque random integers
 
 **Stop replay writers of the previous release before writers of this release
-start.** They give a new topic epoch 1 and bump epochs by one, outside the
-counter, so a topic they recreate can repeat an epoch a client holds. On
-Postgres an earlier writer that starts after version 3 is in the ledger refuses
-to run, but one already running keeps writing; on Redis an earlier writer
-cannot be detected.
+start.** They number a topic's epochs 1, 2, ... instead of drawing them, so a
+topic they recreate can repeat an epoch a client holds. On Postgres an earlier
+writer that starts after version 3 is in the ledger refuses to run, but one
+already running keeps writing; on Redis an earlier writer cannot be detected.
 
-**Symptom.** Epoch values are no longer consecutive per topic (on Redis they
-are millisecond-scale numbers), a topic's epoch can read 0 again after
-`clear()`, expiry or eviction, and Postgres readiness with `autoMigrate: false`
-fails with an incomplete ledger until replay schema version 3 is applied.
+**Symptom.** Epoch values are no longer small consecutive numbers per topic;
+they look random. A topic's epoch can read 0 again after `clear()`, expiry or
+eviction. Postgres readiness with `autoMigrate: false` fails with an incomplete
+ledger until replay schema version 3 is applied.
 
-**Why.** A topic's epoch now comes from one counter per store - the `next` field
-of the Redis hash `replay:generation:{replay-topics}`, kept at or above the
-Redis server clock in milliseconds, and the Postgres sequence
-`svti_replay_seq_epoch_seq` - and is never handed out twice, also after the
-Redis counter is lost. Per-topic metadata can then be deleted safely: with a
-`ttl`, the Redis epoch and last-use keys expire with the buffer, and Postgres
-cleanup deletes the sequence row of a topic not used for longer than the `ttl`;
-`clear()` deletes every epoch and the topic registry; `maxTopics` eviction
-deletes the evicted topic's epoch. A recreated topic takes a new generation, so
-a client holding the old epoch rehydrates. `clearTopic` sets a new epoch which
-the topic's next publish continues under, on every backend. A `replay()` or
+**Why.** As in the adapter, a topic's epoch is an opaque random 32-bit integer
+drawn from the runtime RNG when its seq space is created or recreated, compared
+only for equality and carrying no time and no count; a draw equal to the epoch
+still stored for the topic is replaced by the next value. Per-topic metadata can
+then be deleted: with a `ttl`, the Redis epoch and last-use keys expire with the
+buffer, and Postgres cleanup deletes the sequence row of a topic not used for
+longer than the `ttl`; `clear()` deletes every epoch and the topic registry;
+`maxTopics` eviction deletes the evicted topic's epoch. A recreated topic draws
+anew, so a client holding the old epoch rehydrates. `clearTopic` sets a new epoch
+which the topic's next publish continues under, on every backend. A `replay()` or
 `gap()` from a nonzero position on a topic with no seq space now reports
 truncation. On Redis one instance scans the `replay:*` keys once per deployment
 under a lease, resuming from its stored cursor after a failure, to enroll the
-existing topics and raise the counter above every stored epoch; a topic created
-meanwhile waits for it at most two seconds. Postgres version 3 seeds the
-sequence above the stored epochs and each topic's `last_used_at` from its newest
-event. `migrate()` now checks the columns of a manually provisioned schema
-against every version's definitions before it runs any DDL.
+existing topics; a topic created meanwhile waits for it at most two seconds.
+Postgres version 3 adds `last_used_at TIMESTAMPTZ NOT NULL DEFAULT now()` to
+`svti_replay_seq`, seeded from each topic's newest event. `migrate()` now checks
+the columns of a manually provisioned schema against every version's
+definitions before it runs any DDL.
 
 **Action.** With the default `autoMigrate: true` version 3 is applied on first
 use. With `autoMigrate: false`, apply it (`postgresMigrations({ store: 'replay' })`)
-before writers of this release start, and grant the runtime role `USAGE` on
-`svti_replay_seq_epoch_seq` (substitute configured names). The Redis user needs
-the `SCAN`, `OBJECT` (`IDLETIME`) and `TIME` commands, for example
-`+scan +object|idletime +time`, and the `replay:generation:{replay-topics}`,
+before writers of this release start. The Redis user needs the `SCAN` and `TIME`
+commands, for example `+scan +time`, and the `replay:seed:{replay-topics}`,
 `replay:topics:{replay-topics}` and `replay:used:{*}` keys where replay keys are
 listed explicitly; with `SCAN` denied the existing topics are never enrolled.
-Back up and restore the Redis counter and registry with the replay keys, and the
-Postgres sequence with its table; never restore the counter below a stored
-epoch, and do not empty the Postgres tables with `TRUNCATE ... RESTART IDENTITY`.
+Back up and restore a topic's epoch with its sequence and buffer.
 
 ### Ordered alarm generations
 

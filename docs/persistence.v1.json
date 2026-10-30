@@ -63,7 +63,6 @@
 					"topic"
 				]
 			],
-			"serialColumn": "epoch",
 			"restoreGroup": "postgres-replay"
 		},
 		{
@@ -310,9 +309,9 @@
 					"template": "replay:idmp:<producer>:{<topic>}"
 				},
 				{
-					"id": "generation",
+					"id": "seed-state",
 					"type": "hash",
-					"template": "replay:generation:{replay-topics}"
+					"template": "replay:seed:{replay-topics}"
 				},
 				{
 					"id": "topic-registry",
@@ -320,7 +319,7 @@
 					"template": "replay:topics:{replay-topics}"
 				}
 			],
-			"notes": "Restore all selected buffer backends, sequence, epoch, last-use, producer-cache, generation and topic-registry keys at one cut. Empty buffers and an absent epoch (zero) are valid; retained events require sequence authority. The generation counter (the `next` field of its hash) must not be restored below any stored epoch: a lower counter hands an epoch out again."
+			"notes": "Restore all selected buffer backends, sequence, epoch, last-use, producer-cache, seed-state and topic-registry keys at one cut. Empty buffers and an absent epoch (zero) are valid; retained events require sequence authority."
 		},
 		{
 			"id": "dead-letter",
