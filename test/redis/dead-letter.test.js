@@ -157,7 +157,7 @@ describe('redis dead-letter store', () => {
 		expect(await store.count()).toBe(0);
 		expect(await store.list()).toEqual([]);
 		expect(await store.summary()).toMatchObject({ total: 0, byTopic: {} });
-		for (const key of ['seq', 'recs', 'order', 'tenant', 'tenant-order', 'tenant-size']) {
+		for (const key of ['seq', 'recs', 'order', 'tenant', 'tenant-order', 'tenant-size', 'tenant-rank']) {
 			expect(await client.redis.exists(client.key(`dlq:${key}:{dlq}`))).toBe(0);
 		}
 	});
@@ -179,10 +179,10 @@ describe('redis dead-letter fair-share eviction', () => {
 		expect(await s.count({ topic: '@t/victim/orders' })).toBe(5);
 		// The noisy tenant lost its own oldest records.
 		expect((await s.list({ topic: '@t/noisy/orders' })).map((r) => r.data.n)).toEqual([9, 8, 7, 6, 5]);
-		expect(metrics.serialize()).toContain('dead_letter_evicted_total{store="redis"} 5');
+		expect(metrics.serialize()).toContain('dead_letter_evicted_total 5');
 		for (let n = 10; n < 30; n++) await s.add(rec({ topic: '@t/noisy/orders', data: { n } }));
 		expect(await s.count({ topic: '@t/victim/orders' })).toBe(5);
-		expect(metrics.serialize()).toContain('dead_letter_evicted_total{store="redis"} 25');
+		expect(metrics.serialize()).toContain('dead_letter_evicted_total 25');
 		expect(await size('victim')).toBe('5');
 		expect(await size('noisy')).toBe('5');
 	});
@@ -217,20 +217,38 @@ describe('redis dead-letter fair-share eviction', () => {
 		expect(await s.count()).toBe(4);
 	});
 
-	it('counts records captured before tenant accounting in one scope of their own', async () => {
+	it('breaks a tie between equally large scopes on the oldest record, whatever the tenant names', async () => {
+		for (const order of [['a', 'b', 'z'], ['z', 'b', 'a']]) {
+			const s = createDeadLetter(client, { max: 2 });
+			await s.clear();
+			const ids = [];
+			for (const tenant of order) ids.push(await s.add(rec({ topic: `@t/${tenant}/x` })));
+			// The capture just made survives; the oldest record's tenant pays.
+			expect(await s.get(ids[2])).not.toBeNull();
+			expect((await s.list()).map((r) => r.topic).sort()).toEqual(order.slice(1).map((t) => `@t/${t}/x`).sort());
+		}
+	});
+
+	it('gives records stored before tenant accounting the scope of their stored topic', async () => {
 		// Records an earlier version wrote: hash and order set, no tenant entries.
-		for (let id = 1; id <= 6; id++) {
-			await client.redis.hset(client.key('dlq:recs:{dlq}'), String(id), JSON.stringify({ ...rec({ topic: '@t/victim/orders', data: { n: id } }), failedAt: id }));
-			await client.redis.zadd(client.key('dlq:order:{dlq}'), id, String(id));
+		const topics = ['@t/victim/orders', '@t/victim/orders', '@t/victim/orders', 'orders', 'orders', '@t/x'];
+		for (const [index, topic] of topics.entries()) {
+			const id = String(index + 1);
+			await client.redis.hset(client.key('dlq:recs:{dlq}'), id, JSON.stringify({ ...rec({ topic, data: { n: id } }), failedAt: index + 1 }));
+			await client.redis.zadd(client.key('dlq:order:{dlq}'), index + 1, id);
 		}
 		await client.redis.set(client.key('dlq:seq:{dlq}'), '6');
-		const s = createDeadLetter(client, { max: 8 });
-		for (let n = 0; n < 4; n++) await s.add(rec({ topic: '@t/fresh/orders', data: { n } }));
-		// The six earlier records form the largest scope, so they pay for the overflow.
-		expect(await s.count({ topic: '@t/fresh/orders' })).toBe(4);
-		expect((await s.list({ topic: '@t/victim/orders' })).map((r) => r.id)).toEqual(['6', '5', '4', '3']);
-		expect(await size('')).toBe('4');
-		expect(await client.redis.hlen(client.key('dlq:tenant:{dlq}'))).toBe(8);
+		const s = createDeadLetter(client, { max: 6 });
+		for (let n = 0; n < 3; n++) await s.add(rec({ topic: '@t/fresh/orders', data: { n } }));
+		// victim is largest, then ties with ~ and fresh at two and holds the
+		// oldest record; then fresh is largest.
+		expect((await s.list({ limit: 10 })).map((r) => r.id)).toEqual(['9', '8', '6', '5', '4', '3']);
+		expect(await size('victim')).toBe('1');
+		expect(await size('~')).toBe('2');
+		expect(await size('')).toBe('1');
+		expect(await size('fresh')).toBe('2');
+		expect(await client.redis.hlen(client.key('dlq:tenant:{dlq}'))).toBe(6);
+		expect(await client.redis.zcard(client.key('dlq:tenant-rank:{dlq}'))).toBe(4);
 	});
 
 	it('counts a malformed tenant topic in the unknown scope', async () => {

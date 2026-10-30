@@ -2,6 +2,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { wallEpoch, randomU32, setTimer } from '../shared/runtime.js';
 import { keySlot } from '../shared/cluster.js';
 import { evaluateAlarmGeneration } from './_alarm-generation.js';
+import { topicTenantScope } from '../shared/tenant-topic.js';
 
 /**
  * The matcher SCAN MATCH, KEYS and PSUBSCRIBE all run through in Redis,
@@ -2176,12 +2177,13 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 
 		// Dead-letter capture and removal (DLQ_ADD / DLQ_DROP): the same steps as
 		// the Lua over the record hash, the failedAt order set, the record ->
-		// tenant scope hash, the `<scope>/<padded id>` index and the per-scope
-		// counts. Key TTLs stay inert, like this double's PEXPIRE surface.
+		// tenant scope hash, the `<scope>/<padded id>` index, the per-scope
+		// counts and the scope ranks. Key TTLs stay inert, like this double's PEXPIRE surface.
 		function evalDeadLetter(numKeys, args, add) {
-			const [seqKey, recsKey, orderKey, tenantKey, tenantOrderKey, sizeKey] = args.slice(0, numKeys).map(String);
+			const [seqKey, recsKey, orderKey, tenantKey, tenantOrderKey, sizeKey, rankKey] = args.slice(0, numKeys).map(String);
 			const argv = args.slice(numKeys).map(String);
-			const entry = (scope, id) => scope + '/' + id.padStart(20, '0');
+			const pad = (id) => id.padStart(20, '0');
+			const entry = (scope, id) => scope + '/' + pad(id);
 			const hash = (key) => { if (!hashes.has(key)) hashes.set(key, new Map()); return hashes.get(key); };
 			const hdel = (key, field) => {
 				const h = hashes.get(key);
@@ -2189,6 +2191,8 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				if (h && h.size === 0) hashes.delete(key);
 				return removed;
 			};
+			const members = (key) => (sortedSets.get(key) ?? []).map((e) => String(e.member));
+			const zscore = (key, member) => sortedSets.get(key)?.find((e) => String(e.member) === member)?.score;
 			const zadd = (key, score, member) => {
 				if (!sortedSets.has(key)) sortedSets.set(key, []);
 				const set = sortedSets.get(key);
@@ -2196,7 +2200,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				if (existing) existing.score = score;
 				else set.push({ score, member });
 				set.sort((a, b) => a.score - b.score);
-				return existing ? existing.score : score;
+				return score;
 			};
 			const zrem = (key, member) => {
 				const set = sortedSets.get(key);
@@ -2205,33 +2209,55 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				if (index !== -1) set.splice(index, 1);
 				if (set.length === 0) sortedSets.delete(key);
 			};
-			const zincr = (key, member, delta) => {
-				const current = sortedSets.get(key)?.find((e) => String(e.member) === member);
-				return zadd(key, (current ? current.score : 0) + delta, member);
+			const zincr = (key, member, delta) => zadd(key, (zscore(key, member) ?? 0) + delta, member);
+			// ZRANGEBYLEX LIMIT 0 1 over score-0 members: the lowest member.
+			const lowest = (key, prefix = '') => members(key).filter((m) => m.startsWith(prefix)).sort()[0];
+			const rankOf = (scope) => {
+				const count = zscore(sizeKey, scope);
+				const first = lowest(tenantOrderKey, scope + '/');
+				if (count === undefined || first === undefined) return undefined;
+				return String(999999999999999 - count).padStart(15, '0') + '/' + first.slice(scope.length + 1) + '/' + scope;
+			};
+			const rerank = (scope, change) => {
+				const before = rankOf(scope);
+				const result = change();
+				const after = rankOf(scope);
+				if (before !== after) {
+					if (before !== undefined) zrem(rankKey, before);
+					if (after !== undefined) zadd(rankKey, 0, after);
+				}
+				return result;
 			};
 			const drop = (id) => {
-				const removed = hdel(recsKey, id);
-				zrem(orderKey, id);
 				const scope = hashes.get(tenantKey)?.get(id);
-				if (scope !== undefined) {
+				if (scope === undefined) { zrem(orderKey, id); return hdel(recsKey, id); }
+				return rerank(scope, () => {
 					hdel(tenantKey, id);
 					zrem(tenantOrderKey, entry(scope, id));
 					if (zincr(sizeKey, scope, -1) <= 0) zrem(sizeKey, scope);
-				}
-				return removed;
+					zrem(orderKey, id);
+					return hdel(recsKey, id);
+				});
+			};
+			const scopeOf = (json) => {
+				let rec;
+				try { rec = JSON.parse(json); } catch { return ''; }
+				return (rec && typeof rec === 'object' ? topicTenantScope(rec.topic) : null) ?? '';
 			};
 			if (!add) return argv.reduce((removed, id) => removed + drop(id), 0);
-			const ordered = () => (sortedSets.get(orderKey) ?? []).map((e) => String(e.member));
-			if ((hashes.get(tenantKey)?.size ?? 0) !== ordered().length) {
-				sortedSets.delete(tenantOrderKey);
-				sortedSets.delete(sizeKey);
-				const live = new Set(ordered());
+			if ((hashes.get(tenantKey)?.size ?? 0) !== members(orderKey).length || members(rankKey).length !== members(sizeKey).length) {
+				for (const key of [tenantOrderKey, sizeKey, rankKey]) sortedSets.delete(key);
+				const live = new Set(members(orderKey));
 				for (const id of [...(hashes.get(tenantKey)?.keys() ?? [])]) if (!live.has(id)) hdel(tenantKey, id);
-				for (const id of ordered()) {
+				for (const id of members(orderKey)) {
 					let scope = hashes.get(tenantKey)?.get(id);
-					if (scope === undefined) { scope = ''; hash(tenantKey).set(id, scope); }
+					if (scope === undefined) { scope = scopeOf(hashes.get(recsKey)?.get(id)); hash(tenantKey).set(id, scope); }
 					zadd(tenantOrderKey, 0, entry(scope, id));
 					zincr(sizeKey, scope, 1);
+				}
+				for (const scope of members(sizeKey)) {
+					const rank = rankOf(scope);
+					if (rank !== undefined) zadd(rankKey, 0, rank);
 				}
 			}
 			const [json, failedAt, scope, max, ttlMs, cutoff] = argv;
@@ -2240,28 +2266,26 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			store.set(seqKey, id);
 			hash(recsKey).set(id, json);
 			zadd(orderKey, Number(failedAt), id);
-			hash(tenantKey).set(id, scope);
-			zadd(tenantOrderKey, 0, entry(scope, id));
-			zincr(sizeKey, scope, 1);
+			rerank(scope, () => {
+				hash(tenantKey).set(id, scope);
+				zadd(tenantOrderKey, 0, entry(scope, id));
+				zincr(sizeKey, scope, 1);
+			});
 			if (Number(ttlMs) > 0) {
 				for (const e of [...(sortedSets.get(orderKey) ?? [])]) if (e.score <= Number(cutoff)) drop(String(e.member));
 			}
 			let evicted = 0;
-			while ((sortedSets.get(orderKey)?.length ?? 0) > Number(max)) {
-				// ZREVRANGE 0 0: the highest count, ties to the greatest member.
-				let heaviest;
-				for (const e of sortedSets.get(sizeKey) ?? []) {
-					const member = String(e.member);
-					if (heaviest === undefined || e.score > heaviest.score || (e.score === heaviest.score && member > heaviest.member)) heaviest = { score: e.score, member };
-				}
-				if (heaviest === undefined) break;
-				const prefix = heaviest.member + '/';
-				// ZRANGEBYLEX [<scope>/ (<scope>0 LIMIT 0 1: the lowest member with the prefix.
-				const oldest = (sortedSets.get(tenantOrderKey) ?? []).map((e) => String(e.member)).filter((m) => m.startsWith(prefix)).sort()[0];
-				if (oldest === undefined) { zrem(sizeKey, heaviest.member); continue; }
-				const victim = /^0*(\d+)$/.exec(oldest.slice(prefix.length))?.[1];
+			while (members(orderKey).length > Number(max)) {
+				const top = lowest(rankKey);
+				if (top === undefined) break;
+				const topScope = top.slice(37);
+				const oldest = lowest(tenantOrderKey, topScope + '/');
+				const victim = oldest === undefined ? undefined : /^0*(\d+)$/.exec(oldest.slice(topScope.length + 1))?.[1];
 				if (victim !== undefined) evicted += drop(victim);
-				zrem(tenantOrderKey, oldest);
+				if (oldest !== undefined) zrem(tenantOrderKey, oldest);
+				zrem(rankKey, top);
+				const rank = rankOf(topScope);
+				if (rank !== undefined) zadd(rankKey, 0, rank);
 			}
 			return [id, evicted];
 		}

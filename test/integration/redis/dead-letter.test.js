@@ -160,7 +160,7 @@ describe('redis dead-letter (integration)', () => {
 
 		expect((await dlq.list({ topic: '@t/victim/orders' })).map((r) => r.data.n)).toEqual([4, 3, 2, 1, 0]);
 		expect((await dlq.list({ topic: '@t/noisy/orders' })).map((r) => r.data.n)).toEqual([29, 28, 27, 26, 25]);
-		expect(metrics.serialize()).toContain('dead_letter_evicted_total{store="redis"} 25');
+		expect(metrics.serialize()).toContain('dead_letter_evicted_total 25');
 		// Every structure agrees after the script's evictions.
 		expect(await client.redis.hlen(client.key('dlq:recs:{dlq}'))).toBe(10);
 		expect(await client.redis.zcard(client.key('dlq:order:{dlq}'))).toBe(10);
@@ -182,24 +182,43 @@ describe('redis dead-letter (integration)', () => {
 		for (let n = 0; n < 4; n++) await dlq.add(rec({ topic: '@t/b/orders', data: { n }, failedAt }));
 		expect(await dlq.count({ topic: '@t/a/orders' })).toBe(1);
 		await dlq.clear();
-		for (const key of ['seq', 'recs', 'order', 'tenant', 'tenant-order', 'tenant-size']) {
+		for (const key of ['seq', 'recs', 'order', 'tenant', 'tenant-order', 'tenant-size', 'tenant-rank']) {
 			expect(await client.redis.exists(client.key(`dlq:${key}:{dlq}`))).toBe(0);
 		}
 	});
 
-	it('counts records captured before tenant accounting in one scope of their own', async () => {
+	it('breaks a tie between equally large scopes on the oldest record, whatever the tenant names', async () => {
+		for (const order of [['a', 'b', 'z'], ['z', 'b', 'a']]) {
+			const dlq = createDeadLetter(client, { max: 2 });
+			await dlq.clear();
+			const failedAt = await redisNowMs(client);
+			const ids = [];
+			for (const tenant of order) ids.push(await dlq.add(rec({ topic: `@t/${tenant}/x`, failedAt })));
+			// The capture just made survives; the oldest record's tenant pays.
+			expect(await dlq.get(ids[2])).not.toBeNull();
+			expect((await dlq.list()).map((r) => r.topic).sort()).toEqual(order.slice(1).map((t) => `@t/${t}/x`).sort());
+			expect(await client.redis.zcard(client.key('dlq:tenant-rank:{dlq}'))).toBe(2);
+		}
+	});
+
+	it('gives records stored before tenant accounting the scope of their stored topic', async () => {
 		const now = await redisNowMs(client);
-		for (let id = 1; id <= 6; id++) {
-			await client.redis.hset(client.key('dlq:recs:{dlq}'), String(id), JSON.stringify({ ...rec({ topic: '@t/victim/orders', data: { n: id } }), failedAt: now - 1000 + id }));
-			await client.redis.zadd(client.key('dlq:order:{dlq}'), now - 1000 + id, String(id));
+		// Records an earlier version wrote: hash and order set, no tenant entries.
+		const topics = ['@t/victim/orders', '@t/victim/orders', '@t/victim/orders', 'orders', 'orders', '@t/x'];
+		for (const [index, topic] of topics.entries()) {
+			const id = String(index + 1);
+			await client.redis.hset(client.key('dlq:recs:{dlq}'), id, JSON.stringify({ ...rec({ topic, data: { n: id } }), failedAt: now - 1000 + index }));
+			await client.redis.zadd(client.key('dlq:order:{dlq}'), now - 1000 + index, id);
 		}
 		await client.redis.set(client.key('dlq:seq:{dlq}'), '6');
-		const dlq = createDeadLetter(client, { max: 8 });
-		for (let n = 0; n < 4; n++) await dlq.add(rec({ topic: '@t/fresh/orders', data: { n }, failedAt: now }));
-		expect(await dlq.count({ topic: '@t/fresh/orders' })).toBe(4);
-		expect((await dlq.list({ topic: '@t/victim/orders' })).map((r) => r.id)).toEqual(['6', '5', '4', '3']);
-		expect(await client.redis.zrange(client.key('dlq:tenant-size:{dlq}'), 0, -1, 'WITHSCORES')).toEqual(['', '4', 'fresh', '4']);
-		expect(await client.redis.hlen(client.key('dlq:tenant:{dlq}'))).toBe(8);
+		const dlq = createDeadLetter(client, { max: 6 });
+		for (let n = 0; n < 3; n++) await dlq.add(rec({ topic: '@t/fresh/orders', data: { n }, failedAt: now }));
+		// victim is largest, then ties with ~ and fresh at two and holds the
+		// oldest record; then fresh is largest.
+		expect((await dlq.list({ limit: 10 })).map((r) => r.id).sort()).toEqual(['3', '4', '5', '6', '8', '9']);
+		expect(await client.redis.zrange(client.key('dlq:tenant-size:{dlq}'), 0, -1, 'WITHSCORES')).toEqual(['', '1', 'victim', '1', 'fresh', '2', '~', '2']);
+		expect(await client.redis.hlen(client.key('dlq:tenant:{dlq}'))).toBe(6);
+		expect(await client.redis.zcard(client.key('dlq:tenant-rank:{dlq}'))).toBe(4);
 	});
 
 	it('hides records past ttlMs from reads before any later add evicts them', async () => {

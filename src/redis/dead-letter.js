@@ -17,6 +17,9 @@
  *     `<scope>/<id zero-padded to 20 digits>`, so a lex range yields one
  *     scope's records oldest first
  *   - `{prefix}dlq:tenant-size:{dlq}`  - sorted set, member = scope, score = its record count
+ *   - `{prefix}dlq:tenant-rank:{dlq}`  - sorted set, score 0, one member per scope:
+ *     `<999999999999999 - count, 15 digits>/<oldest id, 20 digits>/<scope>`, so
+ *     the lowest member is the largest scope, ties to the oldest record
  *
  * The literal `{dlq}` braces are a Redis Cluster hash tag, so every key shares
  * one slot and each mutation is one Lua script over all of them: a record can
@@ -26,12 +29,15 @@
  * bottleneck.
  *
  * Fair-share eviction: above `max`, the capture script evicts the oldest record
- * of the tenant scope holding the most records, one at a time. A scope holding
- * at most `max / scopes present` records is never the largest while the store
- * is over `max`, so another tenant's overflow cannot evict it. The scope is the
- * one the erasure tombstones use (`@t/<tenant>/` topics, `~` for untenanted);
- * a malformed tenant topic, and a record captured before this accounting
- * existed, count in the scope `''`.
+ * of the tenant scope holding the most records, one at a time; between equally
+ * large scopes, the one holding the oldest record pays, so a capture is never
+ * evicted while an older record of an equally large scope exists. A scope
+ * holding at most `max / scopes present` records is never the largest while
+ * the store is over `max`, so another tenant's overflow cannot evict it. The
+ * scope is the one the erasure tombstones use (`@t/<tenant>/` topics, `~` for
+ * untenanted); a malformed tenant topic counts in the scope `''`. A record
+ * stored without accounting (by an earlier release) is assigned the scope of
+ * its stored topic when the next capture rebuilds the accounting.
  *
  * Retention clocks off the SERVER (`TIME`), never the caller-supplied
  * `failedAt`: a skewed or hostile producer stamp can then neither mass-evict
@@ -72,79 +78,120 @@ import { defineOptions, option } from '../shared/options.js';
 // documented residual. Mirrors the in-memory store's 10-minute window.
 const FORGET_TOMBSTONE_MS = 10 * 60 * 1000;
 
-// KEYS: seq, recs, order, tenant, tenant-order, tenant-size. `drop` removes one
-// record from every structure and returns 1 when the record existed.
-const DROP_PRELUDE = `
+// KEYS: seq, recs, order, tenant, tenant-order, tenant-size, tenant-rank.
+// `drop` removes one record from every structure and returns 1 when the
+// record existed; `rerank` keeps a scope's rank member in step with a change
+// to its records. `scope_of` reads a stored record's topic with the tenant
+// rule of topicTenantScope, for records stored without accounting.
+const PRELUDE = `
 local function entry(scope, id)
 	return scope .. '/' .. string.rep('0', 20 - #id) .. id
 end
+local function rank_of(scope)
+	local count = redis.call('ZSCORE', KEYS[6], scope)
+	local first = redis.call('ZRANGEBYLEX', KEYS[5], '[' .. scope .. '/', '(' .. scope .. '0', 'LIMIT', 0, 1)[1]
+	if not count or not first then return nil end
+	return string.format('%015.0f', 999999999999999 - tonumber(count)) .. '/' .. string.sub(first, #scope + 2) .. '/' .. scope
+end
+local function rerank(scope, change)
+	local before = rank_of(scope)
+	local result = change()
+	local after = rank_of(scope)
+	if before ~= after then
+		if before then redis.call('ZREM', KEYS[7], before) end
+		if after then redis.call('ZADD', KEYS[7], 0, after) end
+	end
+	return result
+end
 local function drop(id)
-	local removed = redis.call('HDEL', KEYS[2], id)
-	redis.call('ZREM', KEYS[3], id)
 	local scope = redis.call('HGET', KEYS[4], id)
-	if scope then
+	if not scope then
+		redis.call('ZREM', KEYS[3], id)
+		return redis.call('HDEL', KEYS[2], id)
+	end
+	return rerank(scope, function()
 		redis.call('HDEL', KEYS[4], id)
 		redis.call('ZREM', KEYS[5], entry(scope, id))
 		if tonumber(redis.call('ZINCRBY', KEYS[6], -1, scope)) <= 0 then redis.call('ZREM', KEYS[6], scope) end
-	end
-	return removed
+		redis.call('ZREM', KEYS[3], id)
+		return redis.call('HDEL', KEYS[2], id)
+	end)
+end
+local function scope_of(json)
+	local ok, rec = pcall(cjson.decode, json)
+	local topic = nil
+	if ok and type(rec) == 'table' then topic = rec.topic end
+	if type(topic) ~= 'string' then return '' end
+	if string.sub(topic, 1, 3) ~= '@t/' then return '~' end
+	local stop = string.find(topic, '/', 4, true)
+	if stop and stop > 4 then return string.sub(topic, 4, stop - 1) end
+	return ''
 end
 `;
 
 // ARGV: record json, failedAt, tenant scope, max, ttlMs, expiry cutoff.
 // Returns { id, records evicted by the max cap }.
 const ADD_SCRIPT = `-- DLQ_ADD
-${DROP_PRELUDE}
-if redis.call('HLEN', KEYS[4]) ~= redis.call('ZCARD', KEYS[3]) then
-	-- Records without a tenant entry (captured before tenant accounting, or by
-	-- a writer without it) count in the '' scope; entries whose record is gone
-	-- are dropped, and the index and counts are rebuilt from the order set.
-	redis.call('DEL', KEYS[5], KEYS[6])
+${PRELUDE}
+if redis.call('HLEN', KEYS[4]) ~= redis.call('ZCARD', KEYS[3]) or redis.call('ZCARD', KEYS[7]) ~= redis.call('ZCARD', KEYS[6]) then
+	-- Records without a tenant entry (stored by an earlier release) get the
+	-- scope of their stored topic; entries whose record is gone are dropped,
+	-- and the index, counts and ranks are rebuilt from the order set.
+	redis.call('DEL', KEYS[5], KEYS[6], KEYS[7])
 	for _, id in ipairs(redis.call('HKEYS', KEYS[4])) do
 		if not redis.call('ZSCORE', KEYS[3], id) then redis.call('HDEL', KEYS[4], id) end
 	end
 	for _, id in ipairs(redis.call('ZRANGE', KEYS[3], 0, -1)) do
 		local scope = redis.call('HGET', KEYS[4], id)
 		if not scope then
-			scope = ''
+			scope = scope_of(redis.call('HGET', KEYS[2], id))
 			redis.call('HSET', KEYS[4], id, scope)
 		end
 		redis.call('ZADD', KEYS[5], 0, entry(scope, id))
 		redis.call('ZINCRBY', KEYS[6], 1, scope)
+	end
+	for _, scope in ipairs(redis.call('ZRANGE', KEYS[6], 0, -1)) do
+		local rank = rank_of(scope)
+		if rank then redis.call('ZADD', KEYS[7], 0, rank) end
 	end
 end
 redis.call('INCR', KEYS[1])
 local id = redis.call('GET', KEYS[1])
 redis.call('HSET', KEYS[2], id, ARGV[1])
 redis.call('ZADD', KEYS[3], ARGV[2], id)
-redis.call('HSET', KEYS[4], id, ARGV[3])
-redis.call('ZADD', KEYS[5], 0, entry(ARGV[3], id))
-redis.call('ZINCRBY', KEYS[6], 1, ARGV[3])
+rerank(ARGV[3], function()
+	redis.call('HSET', KEYS[4], id, ARGV[3])
+	redis.call('ZADD', KEYS[5], 0, entry(ARGV[3], id))
+	redis.call('ZINCRBY', KEYS[6], 1, ARGV[3])
+end)
 local ttl = tonumber(ARGV[5])
 if ttl > 0 then
-	for i = 1, 6 do redis.call('PEXPIRE', KEYS[i], ttl) end
+	for i = 1, 7 do redis.call('PEXPIRE', KEYS[i], ttl) end
 	for _, expired in ipairs(redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', ARGV[6])) do drop(expired) end
 end
 local max = tonumber(ARGV[4])
 local evicted = 0
 while redis.call('ZCARD', KEYS[3]) > max do
-	local heaviest = redis.call('ZREVRANGE', KEYS[6], 0, 0)[1]
-	if not heaviest then break end
-	local oldest = redis.call('ZRANGEBYLEX', KEYS[5], '[' .. heaviest .. '/', '(' .. heaviest .. '0', 'LIMIT', 0, 1)[1]
-	if oldest then
-		local victim = string.match(string.sub(oldest, #heaviest + 2), '^0*(%d+)$')
-		if victim then evicted = evicted + drop(victim) end
-		redis.call('ZREM', KEYS[5], oldest)
-	else
-		redis.call('ZREM', KEYS[6], heaviest)
-	end
+	-- The lowest rank member: the largest scope, ties to the oldest record.
+	local top = redis.call('ZRANGEBYLEX', KEYS[7], '-', '+', 'LIMIT', 0, 1)[1]
+	if not top then break end
+	local scope = string.sub(top, 38)
+	local oldest = redis.call('ZRANGEBYLEX', KEYS[5], '[' .. scope .. '/', '(' .. scope .. '0', 'LIMIT', 0, 1)[1]
+	local victim = oldest and string.match(string.sub(oldest, #scope + 2), '^0*(%d+)$')
+	if victim then evicted = evicted + drop(victim) end
+	-- An index or rank entry left without its record goes too, so each
+	-- round removes something and the loop ends.
+	if oldest then redis.call('ZREM', KEYS[5], oldest) end
+	redis.call('ZREM', KEYS[7], top)
+	local rank = rank_of(scope)
+	if rank then redis.call('ZADD', KEYS[7], 0, rank) end
 end
 return { id, evicted }
 `;
 
 // ARGV: record ids. Returns how many existed.
 const DROP_SCRIPT = `-- DLQ_DROP
-${DROP_PRELUDE}
+${PRELUDE}
 local removed = 0
 for i = 1, #ARGV do removed = removed + drop(ARGV[i]) end
 return removed
@@ -224,12 +271,12 @@ export function createDeadLetter(client, options = {}) {
 	const m = options.metrics;
 	const mt = m?.mapTopic || (() => 'all');
 	const mAdded = m?.counter('dead_letter_added_total', 'Undeliverable webhook events captured to the dead-letter store', ['topic']);
-	const mEvicted = m?.counter('dead_letter_evicted_total', 'Dead-letter records evicted by the max cap from the tenant scope holding the most records', ['store']);
+	const mEvicted = m?.counter('dead_letter_evicted_total', 'Dead-letter records evicted by the max cap from the tenant scope holding the most records');
 
 	const seqKey = client.key('dlq:seq:{dlq}');
 	const recsKey = client.key('dlq:recs:{dlq}');
 	const orderKey = client.key('dlq:order:{dlq}');
-	const keys = [seqKey, recsKey, orderKey, client.key('dlq:tenant:{dlq}'), client.key('dlq:tenant-order:{dlq}'), client.key('dlq:tenant-size:{dlq}')];
+	const keys = [seqKey, recsKey, orderKey, client.key('dlq:tenant:{dlq}'), client.key('dlq:tenant-order:{dlq}'), client.key('dlq:tenant-size:{dlq}'), client.key('dlq:tenant-rank:{dlq}')];
 
 	// Forget tombstone for one (tenant scope, user) pair. The purge deletes only
 	// records whose topic is inside its tenant scope, so the tombstone carries
@@ -358,7 +405,7 @@ export function createDeadLetter(client, options = {}) {
 				json, failedAt, topicTenantScope(rec.topic) ?? '', max, ttlMs, ttlMs > 0 ? serverNow - ttlMs : 0
 			));
 			mAdded?.inc({ topic: mt(rec.topic) });
-			if (Number(evicted) > 0) mEvicted?.inc({ store: 'redis' }, Number(evicted));
+			if (Number(evicted) > 0) mEvicted?.inc(Number(evicted));
 			return String(id);
 		},
 
