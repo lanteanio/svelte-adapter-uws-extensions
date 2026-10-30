@@ -62,16 +62,25 @@ A dispatch sweep claims pending rows by tenant scope, not by global creation
 order. A scope is one tenant of rows stamped by `forgetIdentity`, the untenanted
 scope of stamped rows with a `null` tenant, or all rows written without
 `forgetIdentity`. Each claim takes the oldest row of every chosen scope before
-a second row of any scope, and keeps creation order inside a scope. When more
-scopes have pending work than the claim's limit, the next claim from the same
-call site continues after the last scope served. A sweep's first claim covers
-every handler with capacity and takes up to `dispatchBatchSize` scopes, or
-fewer when a worker pool has fewer free threads than that; when it took fewer,
-a second claim covers the inline handlers with the rest of the budget. Each of
-the two keeps its own rotation, whichever pools have capacity, so a tenant with
-pending work is reached within `ceil(scopes / m)` sweeps, where `m` is the
-smallest limit that call site's claims had in those sweeps (at least 1), however
-large another tenant's backlog is. Rotation state is per runner. Only `forgetIdentity` gives a row a tenant: without it every row is in
+a second row of any scope, and keeps creation order inside a scope.
+
+Each handler name keeps its own rotation over the scopes that have pending rows
+of that name. A claim interleaves the next scopes of its names' rotations, one
+name after another with the name served longest ago first, up to its limit,
+and then moves each name past the scopes of its rotation that the claim chose,
+up to the first one it did not. A claim that chooses nothing, or only other
+names' scopes, leaves a name where it was, so neither a busy worker pool, an
+inline-only claim nor another name's work makes a name skip a scope. Every
+claim serves at least the name that has waited longest, so a name with pending
+work is served within `N` claims that cover it, where `N` is the number of
+names with pending work in those claims (every claim, when its limit is at
+least `N`), and each time its rotation moves forward by at least one scope. A
+tenant with pending rows of a name is therefore reached within `S * N` claims
+that cover the name, where `S` is the number of scopes with pending rows of
+that name, however large another tenant's backlog is. A sweep's first claim has limit
+`dispatchBatchSize`, or the free threads of the scarcest worker pool when that
+is lower; its second claim covers the inline handlers. Rotation state is per
+runner. Only `forgetIdentity` gives a row a tenant: without it every row is in
 one scope and dispatch is first in, first out.
 
 The claim reads the `idx_svti_tasks_pending_scope` partial index

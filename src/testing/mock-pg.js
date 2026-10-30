@@ -668,31 +668,33 @@ export function mockPgClient(options = {}) {
 			};
 		}
 
-		// Task claim-pending, first statement: which tenant scopes have pending
-		// rows of the registered names. Tenant ids are walked in code-unit order,
-		// the order of a C-collation index. Row locks do not hide a scope.
-		if (sql.includes('AS legacy') && sql.includes('AS untenanted') && sql.includes('AS head')) {
-			const names = new Set(values[0]);
+		// Task claim-pending, first statement: for each registered name, which
+		// tenant scopes have pending rows of it, the walk after that name's
+		// position and the walk from the start. Tenant ids are walked in
+		// code-unit order, the order of a C-collation index. Row locks do not
+		// hide a scope.
+		if (sql.includes('AS legacy') && sql.includes('AS untenanted') && sql.includes('AS head') && sql.includes('q(name, cursor)')) {
 			const limit = Number(values[1]);
-			const cursor = values[2];
-			let legacy = null, untenanted = null;
-			const tenants = new Set();
-			for (const row of taskRows.values()) {
-				if (row.status !== 'pending' || !names.has(row.name)) continue;
-				if (row.identity_version == null) { if (row.tenant_id == null) legacy = true; }
-				else if (row.tenant_id == null) untenanted = true;
-				else tenants.add(row.tenant_id);
-			}
-			const sorted = [...tenants].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-			return {
-				rows: [{
+			const rows = values[0].map((name, i) => {
+				const cursor = values[2][i];
+				let legacy = false, untenanted = false;
+				const tenants = new Set();
+				for (const row of taskRows.values()) {
+					if (row.status !== 'pending' || row.name !== name) continue;
+					if (row.identity_version == null) { if (row.tenant_id == null) legacy = true; }
+					else if (row.tenant_id == null) untenanted = true;
+					else tenants.add(row.tenant_id);
+				}
+				const sorted = [...tenants].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+				return {
+					name,
 					legacy,
 					untenanted,
 					after: cursor == null ? [] : sorted.filter((tenant) => tenant > cursor).slice(0, limit),
 					head: sorted.slice(0, limit)
-				}],
-				rowCount: 1
-			};
+				};
+			});
+			return { rows, rowCount: rows.length };
 		}
 
 		// Task claim-pending, second statement: up to $5 oldest rows of each

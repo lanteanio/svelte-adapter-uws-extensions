@@ -127,7 +127,7 @@ describe('postgres tasks per-tenant dispatch', () => {
 		const sql = createTaskSql({ client, table: 'svti_tasks', fenceTtl: 30, rowTtl: 3600, autoMigrate: true });
 		await sql.ensureTable();
 		const enqueue = (tenantId, n, name = 'job') => Promise.all(Array.from({ length: n }, (_, i) => r.enqueue(name, { input: owner(tenantId, 'u' + i) })));
-		const claim = async (limit = 10, names = ['job'], site) => (await sql.claimPending(limit, names, site)).map((row) => client._getTaskRows().get(row.id));
+		const claim = async (limit = 10, names = ['job']) => (await sql.claimPending(limit, names)).map((row) => client._getTaskRows().get(row.id));
 		return { client, r, sql, enqueue, claim };
 	}
 
@@ -172,15 +172,15 @@ describe('postgres tasks per-tenant dispatch', () => {
 		expect(new Set(first.map((row) => row.tenant_id)).size).toBe(10);
 	});
 
-	it('keeps one rotation per call site when a sweep claims twice', async () => {
+	it('keeps the rotation when a sweep claims twice', async () => {
 		const { enqueue, claim } = await setup();
 		await enqueue('aaa', 20, 'heavy');
 		const [victim] = await enqueue('zzz', 1, 'heavy');
 		const served = [];
 		// A sweep with a pooled handler at capacity 1 and an inline handler.
 		for (let sweep = 0; sweep < 2; sweep++) {
-			served.push(...(await claim(1, ['heavy', 'light'], 'sweep')).map((row) => row.id));
-			await claim(9, ['light'], 'inline');
+			served.push(...(await claim(1, ['heavy', 'light'])).map((row) => row.id));
+			await claim(9, ['light']);
 		}
 		expect(served).toContain(victim);
 	});
@@ -191,7 +191,36 @@ describe('postgres tasks per-tenant dispatch', () => {
 		const [victim] = await enqueue('zzz', 1, 'heavy');
 		const served = [];
 		for (let sweep = 0; sweep < 3; sweep++) {
-			served.push(...(await claim(1, ['heavy', 'pool' + sweep], 'sweep')).map((row) => row.id));
+			served.push(...(await claim(1, ['heavy', 'pool' + sweep])).map((row) => row.id));
+		}
+		expect(served).toContain(victim);
+	});
+
+	it('keeps the rotation through claims that choose nothing while a pool is busy', async () => {
+		const { enqueue, claim } = await setup();
+		await enqueue('aaa', 40, 'heavy');
+		const [victim] = await enqueue('zzz', 1, 'heavy');
+		const served = [];
+		for (let sweep = 0; sweep < 3; sweep++) {
+			served.push(...(await claim(1, ['heavy', 'light'])).map((row) => row.id));
+			await claim(9, ['light']);
+			// The pool is busy with that row: the next sweep claims inline only.
+			await claim(10, ['light']);
+		}
+		expect(served).toContain(victim);
+	});
+
+	it('does not pass over a scope because a claim for other names chose later scopes', async () => {
+		const { enqueue, claim } = await setup();
+		await enqueue('aaa', 40, 'heavy');
+		const [victim] = await enqueue('mmm', 1, 'heavy');
+		await enqueue('bbb', 40, 'light');
+		await enqueue('zzz', 40, 'light');
+		const served = [];
+		for (let sweep = 0; sweep < 4; sweep++) {
+			served.push(...(await claim(1, ['heavy', 'light'])).map((row) => row.id));
+			await claim(9, ['light']);
+			await claim(10, ['light']);
 		}
 		expect(served).toContain(victim);
 	});
@@ -217,6 +246,39 @@ describe('postgres tasks per-tenant dispatch', () => {
 		}
 	});
 
+	it('serves every name in turn when a claim takes fewer scopes than there are names', async () => {
+		const { enqueue, claim } = await setup();
+		await enqueue('aaa', 10, 'heavy');
+		await enqueue('bbb', 10, 'light');
+		const served = [];
+		for (let i = 0; i < 4; i++) served.push(...(await claim(1, ['heavy', 'light'])).map((row) => row.name));
+		expect(served.sort()).toEqual(['heavy', 'heavy', 'light', 'light']);
+	});
+
+	it('moves a name only past its leading scopes the claim chose', async () => {
+		const { enqueue, claim } = await setup();
+		await enqueue('aaa', 10, 'heavy');
+		await enqueue('mmm', 1, 'heavy');
+		await enqueue('zzz', 10, 'heavy');
+		await enqueue('zzz', 10, 'light');
+		await enqueue('bbb', 10, 'other');
+		expect((await claim(1, ['heavy'])).map((row) => row.tenant_id)).toEqual(['aaa']);
+		// light and other waited longer and fill the claim with zzz and bbb:
+		// heavy's next scopes are mmm, not chosen, and zzz, chosen for light.
+		expect((await claim(2, ['heavy', 'light', 'other'])).map((row) => row.tenant_id).sort()).toEqual(['bbb', 'zzz']);
+		expect((await claim(1, ['heavy'])).map((row) => row.tenant_id)).toEqual(['mmm']);
+	});
+
+	it('keeps the place of a name while other names take the claim', async () => {
+		const { enqueue, claim } = await setup();
+		await enqueue('aaa', 10, 'heavy');
+		await enqueue('zzz', 1, 'heavy');
+		await enqueue('bbb', 10, 'light');
+		const heavy = [];
+		for (let i = 0; i < 4; i++) heavy.push(...(await claim(1, ['heavy', 'light'])).filter((row) => row.name === 'heavy').map((row) => row.tenant_id));
+		expect(heavy).toEqual(['aaa', 'zzz']);
+	});
+
 	it('claims only registered names', async () => {
 		const { enqueue, claim } = await setup();
 		await enqueue('ta', 2, 'other');
@@ -235,6 +297,19 @@ describe('postgres tasks per-tenant dispatch', () => {
 		const done = rowsOf(client).filter((row) => row.tenant_id === 'aaa' && row.status === 'committed').length;
 		expect(done).toBeLessThan(5);
 	});
+
+	it('serves a later tenant while a slow worker pool handler is busy between sweeps', async () => {
+		const client = mockPgClient();
+		const r = runner(client, { dispatchInterval: 15, dispatchBatchSize: 10 });
+		r.register('heavy', null, { worker: { path: new URL('../helpers/workers/slow.js', import.meta.url), pool: { size: 1, idleTimeout: 5000 } } });
+		r.register('light', async () => 'ok');
+		const slow = (tenantId, userId) => ({ ...owner(tenantId, userId), delayMs: 60 });
+		for (let i = 0; i < 12; i++) await r.enqueue('heavy', { input: slow('aaa', 'u' + i) });
+		const victim = await r.enqueue('heavy', { input: slow('zzz', 'v') });
+		await r.await(victim, { timeout: 20000, pollInterval: 5 });
+		const done = rowsOf(client).filter((row) => row.tenant_id === 'aaa' && row.status === 'committed').length;
+		expect(done).toBeLessThan(4);
+	}, 30000);
 
 	it('runs a later tenant\'s task in the first dispatch sweep', async () => {
 		const client = mockPgClient();
