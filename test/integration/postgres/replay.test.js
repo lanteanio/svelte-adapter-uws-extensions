@@ -400,8 +400,9 @@ describe('postgres replay (integration)', () => {
 			expect(platform.sent.at(-1)).toMatchObject({ event: 'end', data: { truncated: true } });
 		});
 
-		it('returns clean for an unknown topic', async () => {
-			expect(await replay.gap('nonexistent', 5)).toEqual({ truncated: false, missingFrom: null });
+		it('returns clean for an unknown topic at position 0, truncated past it', async () => {
+			expect(await replay.gap('nonexistent', 0)).toEqual({ truncated: false, missingFrom: null });
+			expect(await replay.gap('nonexistent', 5)).toEqual({ truncated: true, missingFrom: 6 });
 		});
 	});
 
@@ -568,11 +569,10 @@ describe('postgres replay (integration)', () => {
 			expect(platform.sent.find((s) => s.topic === '__replay:stale' && s.event === 'rehydrate')).toBeDefined();
 		});
 
-		it('keeps the epoch monotonic across a data-only reap then republish', async () => {
-			// Size/TTL cleanup deletes data rows but never the seq-table row, so a
-			// reaped-then-republished topic takes the UPDATE branch (seq 0 -> 1)
-			// and the epoch keeps climbing rather than snapping back to 1. A
-			// resuming client holding the pre-reap epoch must still MATCH.
+		it('keeps the epoch across a data-only reap then republish', async () => {
+			// Size/TTL cleanup of data rows leaves the seq-table row of a topic in
+			// use, so a reaped-then-republished topic takes the UPDATE branch and
+			// keeps its epoch. A resuming client holding that epoch must MATCH.
 			await replay.publish(platform, 'chat', 'msg', { id: 1 });
 			await replay.publish(platform, 'chat', 'msg', { id: 2 });
 			const epoch = await replay.currentEpoch('chat');
@@ -590,6 +590,75 @@ describe('postgres replay (integration)', () => {
 			await hook({}, { lastSeenSeqs: { chat: 2 }, lastSeenEpochs: { chat: epoch }, platform });
 			expect(platform.sent.find((s) => s.event === 'rehydrate')).toBeUndefined();
 			expect(platform.sent.find((s) => s.event === 'end')).toBeDefined();
+		});
+	});
+
+	describe('maxTopics and generations against real Postgres', () => {
+		it('a publish creating a topic past maxTopics evicts the least recently published with its rows', async () => {
+			const r = createReplay(client, { table: TABLE, size: 5, cleanupInterval: 0, maxTopics: 2 });
+			try {
+				await r.publish(platform, 'a', 'msg', { id: 1 });
+				await r.publish(platform, 'b', 'msg', { id: 1 });
+				await r.publish(platform, 'a', 'msg', { id: 2 });
+				const bEpoch = await r.currentEpoch('b');
+				await r.publish(platform, 'c', 'msg', { id: 1 });
+				expect(await r.seq('a')).toBe(2);
+				expect(await r.seq('b')).toBe(0);
+				expect((await client.query(`SELECT count(*)::int AS n FROM ${TABLE} WHERE topic = 'b'`)).rows[0].n).toBe(0);
+				expect((await client.query(`SELECT count(*)::int AS n FROM ${TABLE}_seq`)).rows[0].n).toBe(2);
+
+				await r.publishBatch(platform, [{ topic: 'b', event: 'msg', data: 2 }]);
+				expect(await r.currentEpoch('b')).toBeGreaterThan(bEpoch);
+				platform.reset();
+				await r.resumeHook()({}, { lastSeenSeqs: { b: 1 }, lastSeenEpochs: { b: bEpoch }, platform });
+				expect(platform.sent.some((s) => s.topic === '__replay:b' && s.event === 'rehydrate')).toBe(true);
+			} finally {
+				r.destroy();
+			}
+		});
+
+		it('version 3 starts the epoch sequence above epochs stored under version 2', async () => {
+			await replay.ready();
+			// Return the table to its version 2 shape with a legacy topic at epoch 41.
+			await client.query(`ALTER TABLE ${TABLE}_seq ALTER COLUMN epoch SET DEFAULT 0`);
+			await client.query(`DROP SEQUENCE ${TABLE}_seq_epoch_seq`);
+			await client.query(`ALTER TABLE ${TABLE}_seq DROP COLUMN last_used_at`);
+			await client.query('DELETE FROM svti_schema_migrations WHERE table_name = $1 AND version = 3', [TABLE]);
+			await client.query(`INSERT INTO ${TABLE}_seq (topic, seq, epoch) VALUES ('room', 50, 41)`);
+
+			const r = createReplay(client, { table: TABLE, size: 5, cleanupInterval: 0, maxTopics: 1 });
+			try {
+				await r.ready();
+				await r.publish(platform, 'fresh', 'msg', { id: 1 });
+				expect(await r.currentEpoch('fresh')).toBe(42);
+				// The legacy row counted toward the cap and was the least recently used.
+				expect(await r.seq('room')).toBe(0);
+				await r.publish(platform, 'room', 'msg', { id: 1 });
+				expect(await r.currentEpoch('room')).toBeGreaterThan(42);
+			} finally {
+				r.destroy();
+			}
+		});
+
+		it('reads leave last_used_at alone', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			const before = (await client.query(`SELECT last_used_at FROM ${TABLE}_seq WHERE topic = 'chat'`)).rows[0].last_used_at;
+			await replay.seq('chat');
+			await replay.since('chat', 0);
+			await replay.gap('chat', 1);
+			await replay.replay({}, 'chat', 0, platform);
+			const after = (await client.query(`SELECT last_used_at FROM ${TABLE}_seq WHERE topic = 'chat'`)).rows[0].last_used_at;
+			expect(after.getTime()).toBe(before.getTime());
+		});
+
+		it('clear deletes both tables and a republished topic takes a new epoch', async () => {
+			await replay.publish(platform, 'chat', 'msg', { id: 1 });
+			const before = await replay.currentEpoch('chat');
+			await replay.clear();
+			expect((await client.query(`SELECT count(*)::int AS n FROM ${TABLE}_seq`)).rows[0].n).toBe(0);
+			expect(await replay.currentEpoch('chat')).toBe(0);
+			await replay.publish(platform, 'chat', 'msg', { id: 2 });
+			expect(await replay.currentEpoch('chat')).toBeGreaterThan(before);
 		});
 	});
 

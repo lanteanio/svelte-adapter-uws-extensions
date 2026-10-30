@@ -97,6 +97,24 @@ it('a hot early replay topic cannot starve retention for later topics', async ()
 	} finally { replay.destroy(); }
 });
 
+it('replay cleanup deletes idle topic rows past the ttl and topics past maxTopics', async () => {
+	const ticks = timers();
+	const replay = createReplay(client, { table: tables[2], size: 10, ttl: 60, maxTopics: 5, cleanupInterval: 1000, forgetUserId: () => null });
+	try {
+		const platform = { publish: () => true };
+		for (const topic of ['idle', 'a', 'b']) await replay.publish(platform, topic, 'event', { topic });
+		// Rows written before the cap existed: four more topics, used 30 s ago.
+		await client.query(`INSERT INTO ${tables[3]} (topic, seq, last_used_at) SELECT 'legacy-' || i, 1, now() - interval '30 seconds' FROM generate_series(1, 4) i`);
+		await client.query(`UPDATE ${tables[3]} SET last_used_at = now() - interval '2 minutes' WHERE topic = 'idle'`);
+		for (let pass = 0; pass < 3; pass++) await ticks[0].cb();
+		const left = (await client.query(`SELECT topic FROM ${tables[3]} ORDER BY topic`)).rows.map(row => row.topic);
+		expect(left).toHaveLength(5);
+		expect(left).not.toContain('idle');
+		expect(left).toEqual(expect.arrayContaining(['a', 'b']));
+		expect((await client.query(`SELECT count(*)::int AS n FROM ${tables[2]} WHERE topic = 'idle'`)).rows[0].n).toBe(0);
+	} finally { replay.destroy(); }
+});
+
 
 it('accelerates exhausted passes until incoming expired rows and the backlog drain', async () => {
 	const ticks = timers();

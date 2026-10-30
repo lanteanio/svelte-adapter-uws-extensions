@@ -95,12 +95,27 @@ export function mockPgClient(options = {}) {
 	/**
 	 * topic -> epoch. Lives on the same logical row as seqCounters (the
 	 * svti_replay_seq row), mirroring the durable `epoch` column. A
-	 * never-published topic has no entry and reads 0; the first publish of a
-	 * fresh seq space and every clearTopic bump it by 1, and the row survives
-	 * data cleanup so a reaped-then-republished topic keeps climbing.
+	 * never-published topic has no entry and reads 0; a new topic row and
+	 * every clearTopic take the next value of the epoch sequence
+	 * (`replayGeneration`), which is never handed out twice, so a topic whose
+	 * row was evicted or expired comes back under a generation no client saw.
 	 * @type {Map<string, number>}
 	 */
 	const epochCounters = new Map();
+	/** topic -> last publish (ms), the `last_used_at` column. @type {Map<string, number>} */
+	const lastUsedAt = new Map();
+	/** The `<table>_seq_epoch_seq` sequence: the last value handed out. */
+	let replayGeneration = 0;
+	/** Drop topic rows and their events, as the eviction and idle statements do. */
+	function dropReplayTopics(topics) {
+		const gone = new Set(topics);
+		for (const topic of gone) {
+			seqCounters.delete(topic);
+			epochCounters.delete(topic);
+			lastUsedAt.delete(topic);
+		}
+		rows = rows.filter((r) => !gone.has(r.topic));
+	}
 
 	/** @type {Map<string, {status: string, result: any, expires_at: number}>} */
 	const idemRows = new Map();
@@ -1084,7 +1099,7 @@ export function mockPgClient(options = {}) {
 		// Batched epoch read (resume hook): SELECT topic, COALESCE(epoch, 0)
 		// FROM *_seq WHERE topic = ANY($1). Topics with no seq row are simply
 		// absent from the result (the store reads them as the baseline 0).
-		if (sql.includes('AS epoch') && sql.includes('_seq') && sql.includes('WHERE topic = ANY($1)')) {
+		if (sql.startsWith('SELECT') && sql.includes('AS epoch') && sql.includes('_seq') && sql.includes('WHERE topic = ANY($1)')) {
 			const rows = [];
 			for (const topic of values[0] || []) {
 				if (seqCounters.has(topic) || epochCounters.has(topic)) {
@@ -1096,7 +1111,7 @@ export function mockPgClient(options = {}) {
 
 		// Epoch read-through: SELECT COALESCE(epoch, 0) FROM *_seq WHERE topic = $1.
 		// A topic with no seq row reads the baseline 0.
-		if (sql.includes('AS epoch') && sql.includes('_seq') && sql.includes('WHERE topic = $1')) {
+		if (sql.startsWith('SELECT') && sql.includes('AS epoch') && sql.includes('_seq') && sql.includes('WHERE topic = $1')) {
 			const topic = values[0];
 			if (seqCounters.has(topic) || epochCounters.has(topic)) {
 				return { rows: [{ epoch: String(epochCounters.get(topic) || 0) }], rowCount: 1 };
@@ -1104,40 +1119,59 @@ export function mockPgClient(options = {}) {
 			return { rows: [], rowCount: 0 };
 		}
 
-		// clearTopic upsert: keep the seq-table row, reset seq to 0, bump epoch.
-		// INSERT ... ON CONFLICT DO UPDATE SET seq = 0, epoch = epoch + 1 RETURNING epoch.
+		// clearTopic upsert: keep the seq-table row, reset seq to 0, take the
+		// next generation. INSERT ... VALUES ($1, 0, nextval(...), now())
+		// ON CONFLICT DO UPDATE SET seq = 0, epoch = EXCLUDED.epoch.
 		if (
 			sql.includes('INSERT INTO') &&
 			sql.includes('_seq') &&
 			sql.includes('ON CONFLICT') &&
-			sql.includes('epoch + 1') &&
+			sql.includes('EXCLUDED.epoch') &&
 			sql.includes('RETURNING epoch')
 		) {
 			const topic = values[0];
-			const next = (epochCounters.get(topic) || 0) + 1;
+			const created = !seqCounters.has(topic);
+			const next = ++replayGeneration;
 			epochCounters.set(topic, next);
 			// Keep the row with seq reset to 0 so the next publish's UPDATE
-			// branch issues seq = 1 (and carries the climbed epoch forward).
+			// branch issues seq = 1 and carries this epoch forward.
 			seqCounters.set(topic, 0);
-			return { rows: [{ epoch: String(next) }], rowCount: 1 };
+			lastUsedAt.set(topic, now());
+			return { rows: [{ epoch: String(next), created }], rowCount: 1 };
 		}
 
-		// clear (global): bump every topic's epoch and zero its seq, keeping
-		// rows. UPDATE *_seq SET seq = 0, epoch = epoch + 1.
-		if (sql.startsWith('UPDATE') && sql.includes('_seq') && sql.includes('epoch + 1')) {
-			for (const topic of seqCounters.keys()) {
-				seqCounters.set(topic, 0);
-				epochCounters.set(topic, (epochCounters.get(topic) || 0) + 1);
-			}
-			return { rows: [], rowCount: seqCounters.size };
+		// maxTopics eviction: topic rows past the newest $1 by last use, at
+		// most $2, deleted with their events. RETURNING the evicted topics.
+		if (sql.includes('WITH victims AS') && sql.includes('last_used_at DESC')) {
+			const keep = parseInt(values[0], 10);
+			const limit = parseInt(values[1], 10);
+			const ordered = [...seqCounters.keys()].sort((a, b) =>
+				(lastUsedAt.get(b) ?? 0) - (lastUsedAt.get(a) ?? 0) || (a < b ? 1 : a > b ? -1 : 0));
+			const victims = ordered.slice(keep, keep + limit);
+			dropReplayTopics(victims);
+			return { rows: victims.map((topic) => ({ topic })), rowCount: victims.length };
+		}
+
+		// Idle topic expiry: rows not used for $1 seconds, oldest first, at
+		// most $2, deleted with their events.
+		if (sql.includes('WITH idle AS') && sql.includes('last_used_at <')) {
+			const cutoff = now() - parseInt(values[0], 10) * 1000;
+			const limit = parseInt(values[1], 10);
+			const idle = [...seqCounters.keys()]
+				.filter((topic) => (lastUsedAt.get(topic) ?? 0) < cutoff)
+				.sort((a, b) => (lastUsedAt.get(a) ?? 0) - (lastUsedAt.get(b) ?? 0))
+				.slice(0, limit);
+			dropReplayTopics(idle);
+			return { rows: [], rowCount: idle.length };
 		}
 
 		// Batch CTE publish: UNNEST arrays -> per-topic seq bump + multi-row
 		// insert in one statement. Mirrors the single-publish branches exactly:
-		// a topic with no seq row seeds seq=n, epoch=1 (INSERT branch); an
-		// existing row takes seq+=n and carries its epoch forward (UPDATE
-		// branch). Per-topic seqs are assigned contiguously in caller order.
-		// Returns one row per distinct topic: { topic, new_high, epoch }.
+		// a topic with no seq row seeds seq=n under the next generation (INSERT
+		// branch); an existing row takes seq+=n and carries its epoch forward
+		// (UPDATE branch). Both stamp the last use. Per-topic seqs are assigned
+		// contiguously in caller order. Returns one row per distinct topic:
+		// { topic, new_high, epoch, created }.
 		if (sql.includes('UNNEST') && sql.includes('ON CONFLICT') && sql.includes('new_high')) {
 			const [batchTopics, batchEvents, batchDatas, batchUserIds] = values;
 			const perTopic = new Map();
@@ -1152,9 +1186,10 @@ export function mockPgClient(options = {}) {
 				const base = seqCounters.get(topic) || 0;
 				const high = base + indexes.length;
 				seqCounters.set(topic, high);
+				lastUsedAt.set(topic, now());
 				let epoch;
 				if (!hadRow) {
-					epoch = 1;
+					epoch = ++replayGeneration;
 					epochCounters.set(topic, epoch);
 				} else {
 					epoch = epochCounters.get(topic) || 0;
@@ -1172,26 +1207,27 @@ export function mockPgClient(options = {}) {
 						created_at: new Date(now()) // determinism-allow: created_at is the seam clock (now()) as a Date
 					});
 				}
-				out.push({ topic, new_high: String(high), epoch: String(epoch) });
+				out.push({ topic, new_high: String(high), epoch: String(epoch), created: !hadRow });
 			}
 			return { rows: out, rowCount: out.length };
 		}
 
 		// CTE publish: atomic seq increment + insert in one query.
 		// The reset edge is the INSERT branch (a topic with no seq row, i.e.
-		// brand-new or fully cleared): seq starts at 1 and epoch is seeded to
-		// 1. An existing row takes the UPDATE branch (seq + 1) and carries its
-		// epoch forward unchanged, so steady-state publishes never move the
-		// epoch.
-		if (sql.includes('WITH new_seq') && sql.includes('ON CONFLICT') && sql.includes('RETURNING seq')) {
+		// brand-new, evicted, expired or globally cleared): seq starts at 1
+		// under the next generation. An existing row takes the UPDATE branch
+		// (seq + 1) and carries its epoch forward unchanged, so steady-state
+		// publishes never move the epoch. Both branches stamp the last use.
+		if (sql.includes('WITH bumped AS') && sql.includes('ON CONFLICT') && sql.includes('RETURNING seq')) {
 			const topic = values[0];
 			const hadRow = seqCounters.has(topic);
 			const current = seqCounters.get(topic) || 0;
 			const next = current + 1;
 			seqCounters.set(topic, next);
+			lastUsedAt.set(topic, now());
 			let epoch;
 			if (!hadRow) {
-				epoch = 1;
+				epoch = ++replayGeneration;
 				epochCounters.set(topic, epoch);
 			} else {
 				epoch = epochCounters.get(topic) || 0;
@@ -1206,7 +1242,7 @@ export function mockPgClient(options = {}) {
 				created_at: new Date(now()) // determinism-allow: created_at is the seam clock (now()) as a Date
 			};
 			rows.push(row);
-			return { rows: [{ seq: String(next), epoch: String(epoch) }], rowCount: 1 };
+			return { rows: [{ seq: String(next), epoch: String(epoch), created: !hadRow }], rowCount: 1 };
 		}
 
 		// INSERT INTO *_seq (atomic sequence generation)
@@ -1393,6 +1429,8 @@ export function mockPgClient(options = {}) {
 		if (sql.includes('DELETE FROM') && sql.includes('_seq') && sql.includes('WHERE topic')) {
 			const topic = values[0];
 			seqCounters.delete(topic);
+			epochCounters.delete(topic);
+			lastUsedAt.delete(topic);
 			return { rows: [], rowCount: 1 };
 		}
 
@@ -1404,10 +1442,13 @@ export function mockPgClient(options = {}) {
 			return { rows: [], rowCount: before - rows.length };
 		}
 
-		// DELETE FROM *_seq (clear all sequences)
+		// DELETE FROM *_seq (clear all sequences; the epoch sequence keeps going)
 		if (sql.includes('DELETE FROM') && sql.includes('_seq')) {
+			const before = seqCounters.size;
 			seqCounters.clear();
-			return { rows: [], rowCount: 0 };
+			epochCounters.clear();
+			lastUsedAt.clear();
+			return { rows: [], rowCount: before };
 		}
 
 		// DELETE FROM table (clear all)
@@ -1580,6 +1621,8 @@ export function mockPgClient(options = {}) {
 			tableColumns.clear();
 			seqCounters.clear();
 			epochCounters.clear();
+			lastUsedAt.clear();
+			replayGeneration = 0;
 			idemRows.clear();
 			taskRows.clear();
 			taskInsSeq = 1;

@@ -121,7 +121,7 @@ export async function collectPostgresPlans({ connectionString, rows = 20000, req
 		}
 		await client.query('CREATE SCHEMA ' + schema);
 		created = true;
-		const replay = createReplay(observed, { table: 'plan_replay', size: rows + 100, ttl: 60, cleanupInterval: 0 });
+		const replay = createReplay(observed, { table: 'plan_replay', size: rows + 100, ttl: 60, cleanupInterval: 0, maxTopics: 1000 });
 		stores.push(replay);
 		const jobs = createJobQueue(observed, { table: 'plan_jobs' });
 		const tasks = createTaskRunner(observed, { table: 'plan_tasks', dispatchInterval: 0, recoveryInterval: 0, cleanupInterval: 0 });
@@ -206,7 +206,7 @@ export async function collectPostgresPlans({ connectionString, rows = 20000, req
 		runtimeOverridden = true;
 		for (const [name, factory, table] of [['replay', createReplay, 'plan_replay'], ['idempotency', createIdempotencyStore, 'plan_idempotency'], ['tasks', createTaskRunner, 'plan_tasks']]) {
 			const offset = ticks.length;
-			const store = factory(observed, { table, cleanupInterval: 1000, autoMigrate: false, size: 100, ttl: 60, rowTtl: 60, dispatchInterval: 0, recoveryInterval: 0 });
+			const store = factory(observed, { table, cleanupInterval: 1000, autoMigrate: false, size: 100, ttl: 60, rowTtl: 60, dispatchInterval: 0, recoveryInterval: 0, maxTopics: 1000 });
 			stores.push(store);
 			await capture(name + '.cleanup', () => ticks[offset].cb());
 			if (name === 'replay')

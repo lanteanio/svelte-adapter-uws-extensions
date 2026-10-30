@@ -210,4 +210,17 @@ describe('PostgreSQL migration contracts', () => {
 		await expect(migrate(client, { store: 'jobs' })).rejects.toBe(error);
 		expect(release).toHaveBeenCalledExactlyOnceWith(true);
 	});
+
+	it('adds replay last use and a seeded epoch sequence as version 3', () => {
+		const versions = postgresMigrations({ store: 'replay' });
+		expect(versions.map(entry => entry.version)).toEqual([1, 2, 3]);
+		expect(versions[2].statements[0]).toBe('ALTER TABLE svti_replay_seq ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()');
+		const seed = versions[2].statements[1];
+		expect(seed).toContain('CREATE SEQUENCE IF NOT EXISTS svti_replay_seq_epoch_seq AS BIGINT OWNED BY svti_replay_seq.epoch;');
+		// Seeded from the highest stored epoch before any new topic can take one.
+		expect(seed.indexOf('MAX(epoch)')).toBeLessThan(seed.indexOf('SET DEFAULT nextval'));
+		expect(seed).toContain("ALTER TABLE svti_replay_seq ALTER COLUMN epoch SET DEFAULT nextval('svti_replay_seq_epoch_seq'::regclass)");
+		const long = postgresMigrations({ store: 'replay', table: 'a'.repeat(42) })[2].statements.join(' ');
+		for (const [name] of long.matchAll(/\ba{42}_[a-z_]+/g)) expect(name.length, name).toBeLessThanOrEqual(63);
+	});
 });

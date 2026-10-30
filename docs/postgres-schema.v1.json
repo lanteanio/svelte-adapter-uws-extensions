@@ -22,9 +22,10 @@
 				"svti_replay_seq.epoch BIGINT NOT NULL DEFAULT 0",
 				"idx_svti_replay_user(user_id)",
 				"idx_svti_replay_created_at(created_at)",
-				"UNIQUE idx_svti_replay_identity(topic,seq); replaces idx_svti_replay_topic_seq"
+				"UNIQUE idx_svti_replay_identity(topic,seq); replaces idx_svti_replay_topic_seq",
+				"version 3: svti_replay_seq.last_used_at TIMESTAMPTZ NOT NULL DEFAULT now(); epoch default from the owned sequence svti_replay_seq_epoch_seq, seeded above the highest stored epoch"
 			],
-			"rollbackLimit": "Column-only old readers remain possible; old reset/resume code does not honor the new epoch. Do not mix reset authorities."
+			"rollbackLimit": "Column-only old readers remain possible; old reset/resume code does not honor the new epoch and takes epochs outside the sequence. Do not mix reset authorities; stop old writers before writers of this release start."
 		},
 		{
 			"subpath": "postgres/idempotency",
@@ -135,7 +136,7 @@
 			3,
 			4
 		],
-		"version3Stores": ["postgres/tasks", "postgres/dead-letter", "postgres/alarm-store"],
+		"version3Stores": ["postgres/replay", "postgres/tasks", "postgres/dead-letter", "postgres/alarm-store"],
 		"version4Stores": ["postgres/tasks", "postgres/dead-letter", "postgres/alarm-store"],
 		"checksum": "sha256",
 		"restoreWithStores": true

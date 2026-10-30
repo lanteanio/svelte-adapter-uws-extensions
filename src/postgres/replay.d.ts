@@ -9,7 +9,7 @@ export interface PgReplayOptions {
 	table?: string;
 	/** Max messages per topic. @default 1000 */
 	size?: number;
-	/** TTL in seconds (0 = no expiry). @default 0 */
+	/** TTL in seconds (0 = no expiry). Events older than this are deleted, and so is the sequence row of a topic not published for longer. @default 0 */
 	ttl?: number;
 	/** Apply the versioned schema migrations automatically through a session-capable connection; false only validates the schema read-only on ready(). @default true */
 	autoMigrate?: boolean;
@@ -40,6 +40,15 @@ export interface PgReplayOptions {
 	 * @default 262144
 	 */
 	maxDataBytes?: number;
+	/**
+	 * Max number of topics holding replay state in the table, as in the core
+	 * replay plugin: creating a topic past the cap evicts the least recently
+	 * used topic's events and sequence row. One cap for every instance sharing
+	 * the table. A topic's use is its last publish or `clearTopic`; reads do
+	 * not refresh it.
+	 * @default 100
+	 */
+	maxTopics?: number;
 	/**
 	 * Right-to-erasure: extract a buffered event's authoring userId at publish
 	 * time into a `user_id` column so `live.forget` can `DELETE WHERE user_id`.
@@ -212,12 +221,13 @@ export interface PgReplayBuffer extends PostgresStoreReadiness {
 	purgeUser(tenantId: string | null, userId: string): Promise<number>;
 
 	/**
-	 * Current stored generation of a topic's seq space. A topic whose seq
-	 * space has never reset reads as the baseline `0`. Bumped whenever the
-	 * authoritative seq numbering for the topic restarts (`clearTopic`, or a
-	 * publish landing on a fresh/cleared empty seq space). The resume hook
-	 * compares this to the client's presented epoch to choose gap-fill (match)
-	 * or cold-rehydrate (mismatch).
+	 * Current stored generation of a topic's seq space; `0` for a topic with
+	 * no sequence row. Replaced by the next value of the epoch sequence
+	 * whenever the authoritative seq numbering for the topic restarts
+	 * (`clearTopic`, or a publish creating the topic's row again after
+	 * eviction, idle expiry or `clear()`). The resume hook compares this to the
+	 * client's presented epoch to choose gap-fill (match) or cold-rehydrate
+	 * (mismatch).
 	 */
 	currentEpoch(topic: string): Promise<number>;
 

@@ -435,9 +435,15 @@ describe('postgres replay', () => {
 			expect(await replay.gap('chat', 1)).toEqual({ truncated: true, missingFrom: 2 });
 		});
 
-		it('returns not truncated for an unknown topic', async () => {
+		it('returns not truncated for an unknown topic at position 0', async () => {
 			expect(await replay.gap('nonexistent', 0)).toEqual({ truncated: false, missingFrom: null });
-			expect(await replay.gap('nonexistent', 5)).toEqual({ truncated: false, missingFrom: null });
+		});
+
+		it('returns truncated for a nonzero position on a topic with no seq space', async () => {
+			// The position belongs to a numbering the store no longer holds (the
+			// topic went idle past the ttl, was evicted or cleared); seqs the
+			// topic issues next restart at 1 and would sit below it.
+			expect(await replay.gap('nonexistent', 5)).toEqual({ truncated: true, missingFrom: 6 });
 		});
 
 		it('returns not truncated when consumer is ahead of the buffer', async () => {
@@ -780,7 +786,7 @@ describe('postgres replay', () => {
 			expect(await replay.seq('todos')).toBe(1);
 		});
 
-		it('clear deletes data and bumps every epoch inside one BEGIN/COMMIT transaction', async () => {
+		it('clear deletes the sequence rows and the data inside one BEGIN/COMMIT transaction', async () => {
 			await replay.ready();
 			// Spy on pool.connect() to capture the transaction-control statements.
 			const seen = [];
@@ -803,20 +809,16 @@ describe('postgres replay', () => {
 			}
 			expect(seen[0]).toBe('BEGIN');
 			expect(seen[seen.length - 1]).toBe('COMMIT');
-			// The data rows are deleted and the seq-table rows are bump-and-kept
-			// (UPDATE ... epoch + 1), not deleted, so the epoch survives a global
-			// clear and a republished topic keeps climbing.
-			expect(seen.filter((s) => s.startsWith('DELETE')).length).toBe(1);
-			expect(seen.some((s) => s.startsWith('UPDATE') && s.includes('epoch + 1'))).toBe(true);
-			// Lock order: the seq-counter reset (which locks the row a publish
+			// Both the data rows and the seq-table rows go. A republished topic
+			// takes its epoch from the epoch sequence, which a clear never resets.
+			const deletes = seen.filter((s) => s.startsWith('DELETE'));
+			expect(deletes).toEqual(['DELETE FROM svti_replay_seq', 'DELETE FROM svti_replay']);
+			// Lock order: the seq-counter delete (which locks the rows a publish
 			// contends on) must run BEFORE the data delete, so a concurrent publish
 			// cannot interleave between them and duplicate a (topic, seq).
-			const clearReset = seen.findIndex((s) => s.startsWith('UPDATE') && s.includes('epoch + 1'));
-			const clearDelete = seen.findIndex((s) => s.startsWith('DELETE'));
-			expect(clearReset).toBeLessThan(clearDelete);
 		});
 
-		it('clearTopic deletes data and bumps the epoch inside one BEGIN/COMMIT transaction', async () => {
+		it('clearTopic deletes data and takes a new epoch inside one BEGIN/COMMIT transaction', async () => {
 			await replay.ready();
 			const seen = [];
 			const origConnect = client.pool.connect.bind(client.pool);
@@ -839,13 +841,13 @@ describe('postgres replay', () => {
 			expect(seen[0]).toBe('BEGIN');
 			expect(seen[seen.length - 1]).toBe('COMMIT');
 			// The data row is deleted; the seq-table row is kept (seq reset to 0,
-			// epoch bumped) via an upsert so the epoch survives the reset.
+			// new generation) via an upsert, so the next publish continues under it.
 			expect(seen.filter((s) => s.startsWith('DELETE')).length).toBe(1);
-			expect(seen.some((s) => s.startsWith('INSERT') && s.includes('epoch + 1'))).toBe(true);
+			expect(seen.some((s) => s.startsWith('INSERT') && s.includes('nextval('))).toBe(true);
 			// Lock order: the seq-counter upsert (which locks the row a publish to
 			// this topic contends on) must run BEFORE the data delete, so a
 			// concurrent publish cannot interleave and duplicate a (topic, seq).
-			const topicReset = seen.findIndex((s) => s.startsWith('INSERT') && s.includes('epoch + 1'));
+			const topicReset = seen.findIndex((s) => s.startsWith('INSERT') && s.includes('nextval('));
 			const topicDelete = seen.findIndex((s) => s.startsWith('DELETE'));
 			expect(topicReset).toBeLessThan(topicDelete);
 		});

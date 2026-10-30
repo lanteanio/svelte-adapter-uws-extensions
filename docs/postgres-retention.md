@@ -35,10 +35,15 @@ uses `expires_at`; task cleanup uses the partial terminal-row `updated_at` index
 and never deletes pending or running tasks. Replay TTL selection uses
 `created_at`. Replay size cleanup walks at most 32 sequence-table topics per
 pass and resumes from an indexed topic cursor. The cursor advances even when a
-busy topic consumes the row budget, so other topics still progress. TTL and size
-cleanup alternate priority. Larger backlogs drain over several passes; cleanup
+busy topic consumes the row budget, so other topics still progress. Replay topic
+cleanup removes sequence-table rows, with their events, for topics past
+`maxTopics` (least recently published first) and, with a `ttl`, for topics not
+published for longer than the `ttl`; it walks that table, which `maxTopics`
+bounds, eight topics per statement. TTL, size and topic cleanup take turns
+going first. Larger backlogs drain over several passes; cleanup
 is not a hard physical-storage cap or an exact expiry alarm. Replay publish-time
-trimming and logical read-expiry checks keep their existing behavior.
+trimming and logical read-expiry checks keep their existing behavior, and a
+publish that creates a topic evicts up to four topics past `maxTopics` itself.
 
 Dead-letter writes use the same bounded maintenance as idle passes. Concurrent
 writes share local cleanup ownership. Writes arriving during a pass queue one

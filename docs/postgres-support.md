@@ -263,7 +263,7 @@ server for every store.
 
 | Store | Change from 0.5.10 | Initialization with `autoMigrate: true` | Startup gate |
 | --- | --- | --- | --- |
-| Replay | Adds event `user_id`, unique identity and retention indexes, and sequence `epoch` with default 0. | First store operation or `ready()`. | Await `store.ready()`. |
+| Replay | Adds event `user_id`, unique identity and retention indexes, sequence `epoch` drawn from the owned sequence `svti_replay_seq_epoch_seq`, and sequence `last_used_at`. | First store operation or `ready()`. | Await `store.ready()`. |
 | Idempotency | Adds `user_id`, `tenant_id`, `owner_token` and tenant/user index. | Starts at construction. | Await `store.ready()`. |
 | Jobs | Adds nullable trace columns, nonnegative attempts and consistent claim timestamps. | First store operation or `ready()`. | Await `queue.ready()`. |
 | Tasks | Adds nullable trace columns, `user_id` and user index. | Starts at construction. | Await `runner.ready()` before producers and handlers. |
@@ -350,8 +350,9 @@ start stores with `autoMigrate: false`. Readiness requires these privileges:
 | Alarm executions `svti_alarms_executions` | SELECT, INSERT, UPDATE, DELETE |
 | Migration ledger `svti_schema_migrations` | SELECT |
 
-Grant `USAGE` (or `UPDATE`) on the owned serial sequences for replay, jobs and
-dead letters. Substitute configured names and grant only the stores in use.
+Grant `USAGE` (or `UPDATE`) on the owned serial sequences for replay (both the
+event id sequence and `svti_replay_seq_epoch_seq`), jobs and dead letters.
+Substitute configured names and grant only the stores in use.
 Replay and dead-letter cleanup select rows with `FOR UPDATE SKIP LOCKED`, so
 `UPDATE` is required even though their public event operations insert and delete
 rather than updating stored payloads. The dead-letter scope-count triggers run as the
@@ -364,11 +365,14 @@ grants. Trigger behavior and row-level policies still need application tests.
 
 `postgresMigrations({ store, table })` returns the versioned SQL and SHA-256
 checksums. Version 1 establishes the existing baseline and additive columns;
-version 2 adds constraints and replay uniqueness. Tasks version 3 adds the
+version 2 adds constraints and replay uniqueness. Replay version 3 adds the
+sequence table's `last_used_at` and moves its `epoch` default to an owned
+sequence seeded above the highest stored epoch, so a deleted topic row never
+hands its epoch out again. Tasks version 3 adds the
 pending-created index. Dead-letter version 3 adds the tenant/user erasure-fence
 table and its expiry index. Alarm-store version 3 adds
 [ordered generation authority](./alarm-generations.md) and version 4 adds retained
-executions; replay, idempotency and jobs remain at version 2. Idempotency states are
+executions; idempotency and jobs remain at version 2. Idempotency states are
 `pending`/`committed`; task states are `pending`/`running`/`committed`/`failed`.
 Jobs and tasks require nonnegative attempts. Job claim timestamps must both be
 null or both present with expiry at or after claim time. Replay's unique
@@ -436,13 +440,17 @@ Additive SQL is not proof of mixed-writer safety. The rehearsal verifies old
 jobs/tasks rows and column-only readers, plus preserved replay sequence values
 and idempotency results. It does not certify concurrent old/new worker binaries.
 Old idempotency writers do not honor the new owner token; old replay reset/resume
-code does not honor epochs. Keep one compatible writer cohort for those stores.
+code does not honor epochs, and old replay writers give a new topic epoch 1
+instead of drawing from the epoch sequence. Keep one compatible writer cohort for
+those stores.
 There is no destructive down migration: leave added columns and indexes in place,
 stop new producers, drain active work, then revert dependants in the order in the
 [migration guide](../MIGRATION.md#rollback-and-fleet-compatibility).
 
-Restore replay events together with their sequence/epoch table. Restoring only
-one can reuse sequence numbers or claim history that is absent. Restore dead
+Restore replay events together with their sequence/epoch table and its epoch
+sequence. Restoring only one can reuse sequence numbers or claim history that is
+absent, and an epoch sequence restored below the highest stored epoch hands an
+epoch out again. Restore dead
 letters with their tenant/user erasure fences, and reapply erasures newer than
 the backup before retrying deliveries. Old dead-letter writers do not honor
 these fences: stop them and drain in-flight deliveries before downgrade. Restore task

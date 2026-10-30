@@ -72,6 +72,11 @@ export function mockPgSchema() {
 				const columns = tables.get(addition[1]);
 				if (!columns.some(entry => entry.column_name === 'generation')) columns.push(column(addition[2] + ' NOT NULL'));
 			}
+			const serial = /ALTER TABLE (\w+) ALTER COLUMN (\w+) SET DEFAULT nextval\(/.exec(sql);
+			if (serial) {
+				const entry = tables.get(serial[1])?.find(item => item.column_name === serial[2]);
+				if (entry) entry.column_default = "nextval('sequence')";
+			}
 			const match = /ALTER TABLE (\w+) ADD CONSTRAINT (\w+) CHECK \((.*)\) NOT VALID;/.exec(sql);
 			if (match && !checks.has(match[2])) checks.set(match[2], { table: match[1], name: match[2], expression: match[3], valid: false });
 			// Every relation of this double lives in "public"; the migration
