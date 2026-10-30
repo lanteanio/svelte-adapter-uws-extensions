@@ -33,6 +33,17 @@ function scanTargets(redis) {
 }
 
 /**
+ * The nodes a keyspace scan must cover, for a caller that drives the SCAN
+ * cursor itself (to resume it later, for example). See scanTargets.
+ *
+ * @param {import('ioredis').Redis | import('ioredis').Cluster} redis
+ * @returns {Array<import('ioredis').Redis>}
+ */
+export function scanNodes(redis) {
+	return scanTargets(redis);
+}
+
+/**
  * Collect every key matching `pattern` across the keyspace without modifying
  * anything - the read-only counterpart of `scanAndUnlink`. Same cluster-aware
  * enumeration (one SCAN per master). Returns the matched keys in no particular

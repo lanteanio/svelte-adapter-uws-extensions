@@ -88,6 +88,8 @@ export const EXTENSIONS_ERROR_IDS = Object.freeze({
 	REDIS_REPLAY_RETENTION_UNBOUNDED: 'EXTENSIONS-ERR-REDIS-REPLAY-RETENTION-UNBOUNDED',
 	REDIS_REPLAY_STREAM_RETENTION_UNBOUNDED: 'EXTENSIONS-ERR-REDIS-REPLAY-STREAM-RETENTION-UNBOUNDED',
 	POSTGRES_REPLAY_RETENTION_UNBOUNDED: 'EXTENSIONS-ERR-POSTGRES-REPLAY-RETENTION-UNBOUNDED',
+	REDIS_REPLAY_TOPICS_OVER_CAP: 'EXTENSIONS-ERR-REDIS-REPLAY-TOPICS-OVER-CAP',
+	POSTGRES_REPLAY_TOPICS_OVER_CAP: 'EXTENSIONS-ERR-POSTGRES-REPLAY-TOPICS-OVER-CAP',
 	REDIS_DEAD_LETTER_RETENTION_UNBOUNDED: 'EXTENSIONS-ERR-REDIS-DEAD-LETTER-RETENTION-UNBOUNDED',
 	POSTGRES_DEAD_LETTER_RETENTION_UNBOUNDED: 'EXTENSIONS-ERR-POSTGRES-DEAD-LETTER-RETENTION-UNBOUNDED',
 	RATELIMIT_STORE_FLOOR: 'EXTENSIONS-ERR-RATELIMIT-STORE-FLOOR',
@@ -759,6 +761,26 @@ export const EXTENSIONS_ERROR_REGISTRY = Object.freeze([
 		automaticRecovery: 'None; this is configuration.',
 		nextAction: 'Set ttl to the longest time a record must be kept, set forgetUserId to map a record to the user it belongs to, or both.',
 		sources: ['src/postgres/replay.js'], anchor: 'extensions-err-postgres-replay-retention-unbounded'
+	}),
+	direct({
+		id: EXTENSIONS_ERROR_IDS.REDIS_REPLAY_TOPICS_OVER_CAP,
+		event: 'redis.replay.topics-over-cap', component: 'runtime.redis.replay', severity: 'warn',
+		problemPrefix: 'The Redis replay store holds more topics than maxTopics, so the least recently used ones are being evicted with their history.',
+		cause: 'The one-time scan of the replay keys found more existing topics than the maxTopics option allows. The topics attribute is the number found and maxTopics the configured cap; the cap covers every instance sharing the key prefix.',
+		consequence: 'Each topic created from now on evicts the least recently used topic past the cap: its buffer, sequence counter and epoch are deleted, and a client resuming it rehydrates. Reported once per process.',
+		automaticRecovery: 'None; this is configuration.',
+		nextAction: 'Set maxTopics to at least the number of topics the deployment keeps replay history for, on every instance. replay_topic_evictions_total shows the eviction rate.',
+		sources: ['src/redis/replay.js', 'src/redis/replay-stream.js'], anchor: 'extensions-err-redis-replay-topics-over-cap'
+	}),
+	direct({
+		id: EXTENSIONS_ERROR_IDS.POSTGRES_REPLAY_TOPICS_OVER_CAP,
+		event: 'postgres.replay.topics-over-cap', component: 'runtime.postgres.replay', severity: 'warn',
+		problemPrefix: 'The Postgres replay table holds more topics than maxTopics, so the least recently used ones are being evicted with their history.',
+		cause: 'The first topic count after the store became ready found more sequence rows than the maxTopics option allows. The topics attribute is the number found and maxTopics the configured cap; the cap covers every instance sharing the table.',
+		consequence: 'The bounded cleanup and each topic creation evict the least recently used topics past the cap: their events and sequence rows are deleted, and a client resuming one rehydrates. Reported once per process.',
+		automaticRecovery: 'None; this is configuration.',
+		nextAction: 'Set maxTopics to at least the number of topics the deployment keeps replay history for, on every instance. replay_topic_evictions_total shows the eviction rate.',
+		sources: ['src/postgres/replay.js'], anchor: 'extensions-err-postgres-replay-topics-over-cap'
 	}),
 	direct({
 		id: EXTENSIONS_ERROR_IDS.REDIS_DEAD_LETTER_RETENTION_UNBOUNDED,

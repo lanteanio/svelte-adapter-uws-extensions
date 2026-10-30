@@ -105,6 +105,13 @@ export const MAX_REMOTE_SLICE_ENTRIES = 1_000;
 export const MAX_REPLAY_EPOCH_CACHE_TOPICS = 50_000;
 
 /**
+ * A replay read refreshes its topic's last use (the `maxTopics` recency) at
+ * most this often per topic per process, so a resume storm costs one stamp
+ * per topic per minute rather than one per read.
+ */
+export const REPLAY_READ_USE_INTERVAL_MS = 60_000;
+
+/**
  * Topics accepted from ONE client resume frame (`lastSeenSeqs`). A legit
  * reconnect presents the topics it actually subscribed to; thousands of
  * forged topics is a pre-authorization resource-growth attempt.

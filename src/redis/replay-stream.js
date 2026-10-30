@@ -21,7 +21,6 @@
 
 import { scanUnlinkExcept, scanKeys } from '../shared/redis-scan.js';
 import { createReplayTopics, parseMaxTopics } from './_replay-topics.js';
-import { now } from '../shared/runtime.js';
 import { evalCached } from '../shared/eval-cached.js';
 import { parseReplayOptions, awaitReplicationGrouped, ReplayStorageError, ReplaySerializationError, createResumeHook } from '../shared/replay-helpers.js';
 import { execMultiSlot, firstCommandError } from '../shared/cluster.js';
@@ -53,8 +52,7 @@ import { defineOptions, option } from '../shared/options.js';
  * ARGV[5] = event
  * ARGV[6] = data (JSON-encoded)
  * ARGV[7] = hashFieldTTL supported (1 = per-field HPEXPIRE, 0 = whole-hash EXPIRE)
- * ARGV[8] = now (ms), the topic's use stamp for `maxTopics` eviction
- * ARGV[9] = generation for a fresh seq space (0 = none reserved yet)
+ * ARGV[8] = generation for a fresh seq space (0 = none reserved yet)
  *
  * Returns {isDuplicate (1|0), seq}, or {-1, 0} without writing anything when
  * the seq space is fresh and no generation was passed.
@@ -95,13 +93,16 @@ local idmpTtl = tonumber(ARGV[4])
 local event = ARGV[5]
 local data = ARGV[6]
 local hexpire = ARGV[7] == '1'
-local generation = tonumber(ARGV[9])
+local generation = tonumber(ARGV[8])
 if maxSize == nil or ttl == nil or idmpTtl == nil or generation == nil then
   return redis.error_reply('REPLAY_IDMP_PUBLISH: maxSize/ttl/idmpTtl/generation must be numeric')
 end
 
 local live = redis.call('exists', seqKey) == 1
-local curEpoch = tonumber(redis.call('get', epochKey) or '0')
+-- The epoch stays text for the dedup value: number formatting of a large
+-- epoch is not something the stored value should depend on.
+local epochText = redis.call('get', epochKey) or '0'
+local curEpoch = tonumber(epochText)
 local cached = redis.call('hget', idmpKey, requestId)
 if cached and live then
   local sep = string.find(cached, ':', 1, true)
@@ -126,14 +127,14 @@ if not live then
     return {-1, 0}
   end
   redis.call('unlink', bufKey)
-  redis.call('set', epochKey, ARGV[9])
-  curEpoch = generation
+  redis.call('set', epochKey, ARGV[8])
+  epochText = ARGV[8]
 end
 local seq = redis.call('incr', seqKey)
 local id = seq .. '-0'
 redis.call('xadd', bufKey, 'MAXLEN', '~', maxSize, id, 'v', '1', 'event', event, 'data', data)
 
-redis.call('hset', idmpKey, requestId, curEpoch .. ':' .. seq)
+redis.call('hset', idmpKey, requestId, epochText .. ':' .. seq)
 if idmpTtl > 0 then
   if hexpire then
     redis.call('hpexpire', idmpKey, idmpTtl * 1000, 'FIELDS', 1, requestId)
@@ -142,7 +143,8 @@ if idmpTtl > 0 then
   end
 end
 
-redis.call('set', usedKey, ARGV[8])
+local serverTime = redis.call('time')
+redis.call('set', usedKey, tonumber(serverTime[1]) * 1000 + math.floor(tonumber(serverTime[2]) / 1000))
 if ttl > 0 then
   redis.call('expire', seqKey, ttl)
   redis.call('expire', bufKey, ttl)
@@ -165,8 +167,7 @@ return {0, seq}
  * ARGV[2] = ttl seconds (0 = no expiry)
  * ARGV[3] = event
  * ARGV[4] = data (JSON-encoded)
- * ARGV[5] = now (ms), the topic's use stamp for `maxTopics` eviction
- * ARGV[6] = generation for a fresh seq space (0 = none reserved yet)
+ * ARGV[5] = generation for a fresh seq space (0 = none reserved yet)
  *
  * Returns the new sequence number, or -1 without writing anything when the
  * seq space is fresh and no generation was passed.
@@ -193,7 +194,7 @@ local maxSize = tonumber(ARGV[1])
 local ttl = tonumber(ARGV[2])
 local event = ARGV[3]
 local data = ARGV[4]
-local generation = tonumber(ARGV[6])
+local generation = tonumber(ARGV[5])
 if maxSize == nil or ttl == nil or generation == nil then
   return redis.error_reply('REPLAY_PUBLISH: maxSize/ttl/generation must be numeric')
 end
@@ -203,13 +204,14 @@ if redis.call('exists', seqKey) == 0 then
     return -1
   end
   redis.call('unlink', bufKey)
-  redis.call('set', epochKey, ARGV[6])
+  redis.call('set', epochKey, ARGV[5])
 end
 local seq = redis.call('incr', seqKey)
 local id = seq .. '-0'
 redis.call('xadd', bufKey, 'MAXLEN', '~', maxSize, id, 'v', '1', 'event', event, 'data', data)
 
-redis.call('set', usedKey, ARGV[5])
+local serverTime = redis.call('time')
+redis.call('set', usedKey, tonumber(serverTime[1]) * 1000 + math.floor(tonumber(serverTime[2]) / 1000))
 if ttl > 0 then
   redis.call('expire', seqKey, ttl)
   redis.call('expire', bufKey, ttl)
@@ -293,6 +295,7 @@ export function createStreamReplay(client, options = {}) {
 	const m = options.metrics;
 	const mt = m?.mapTopic || (() => 'all');
 	const mPublishes = m?.counter('replay_publishes_total', 'Messages published to replay buffer', ['topic']);
+	const mEvictions = m?.counter('replay_topic_evictions_total', 'Topics evicted past maxTopics with their replay history');
 	const mReplayed = m?.counter('replay_messages_replayed_total', 'Messages replayed to clients', ['topic']);
 	const mTruncations = m?.counter('replay_truncations_total', 'Truncation events detected', ['topic']);
 	const mResumeTopicOverflows = m?.counter(
@@ -344,8 +347,29 @@ export function createStreamReplay(client, options = {}) {
 	const topics = createReplayTopics(client, {
 		maxTopics,
 		breaker: b,
-		onEvicted: (topic) => epochCache.delete(topic)
+		onEvicted: (topic) => {
+			epochCache.delete(topic);
+			mEvictions?.inc();
+		},
+		onSeeded: (count) => {
+			if (count > maxTopics && firstReportInProcess(EXTENSIONS_ERROR_IDS.REDIS_REPLAY_TOPICS_OVER_CAP)) {
+				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.REDIS_REPLAY_TOPICS_OVER_CAP, { attributes: { topics: count, maxTopics } });
+			}
+		}
 	});
+
+	// One read command, with the topic's use stamp added to the same round
+	// trip when this process has not stamped it within
+	// REPLAY_READ_USE_INTERVAL_MS.
+	// Reads count as use for maxTopics, as in the core plugin; the stamp shares
+	// the topic's hash slot, so the pipeline stays single-slot on a cluster. A
+	// failed stamp does not fail the read.
+	async function readStamped(topic, method, ...args) {
+		if (!topics.readStampDue(topic)) return redis[method](...args);
+		const results = await redis.pipeline()[method](...args)[topics.touchCommand()](2, seqKey(topic), usedKey(topic)).exec();
+		if (results[0][0]) throw results[0][0];
+		return results[0][1];
+	}
 
 	async function currentEpoch(topic) {
 		const val = await withBreaker(b, () => redis.get(epochKey(topic)));
@@ -428,7 +452,7 @@ export function createStreamReplay(client, options = {}) {
 			try {
 				result = await withBreaker(b, () =>
 					evalCached(redis, IDMP_PUBLISH_SCRIPT, 5, ik, sk, bk, ek, uk,
-						requestId, maxSize, ttl, idmpTtl, event, payload, hexOk ? '1' : '0', now(), 0)
+						requestId, maxSize, ttl, idmpTtl, event, payload, hexOk ? '1' : '0', 0)
 				);
 				// A fresh seq space answers -1 without writing; reserve its
 				// generation (see publish below) and retry with it.
@@ -436,7 +460,7 @@ export function createStreamReplay(client, options = {}) {
 					const generation = await topics.reserve(topic);
 					result = await withBreaker(b, () =>
 						evalCached(redis, IDMP_PUBLISH_SCRIPT, 5, ik, sk, bk, ek, uk,
-							requestId, maxSize, ttl, idmpTtl, event, payload, hexOk ? '1' : '0', now(), generation)
+							requestId, maxSize, ttl, idmpTtl, event, payload, hexOk ? '1' : '0', generation)
 					);
 				}
 			} catch (err) {
@@ -492,12 +516,12 @@ export function createStreamReplay(client, options = {}) {
 				// generation (and may evict another topic past maxTopics) and
 				// the write is retried with it.
 				seq = Number(await withBreaker(b, () =>
-					evalCached(redis, PUBLISH_SCRIPT, 4, sk, bk, ek, uk, maxSize, ttl, event, payload, now(), 0)
+					evalCached(redis, PUBLISH_SCRIPT, 4, sk, bk, ek, uk, maxSize, ttl, event, payload, 0)
 				));
 				if (seq === -1) {
 					const generation = await topics.reserve(topic);
 					seq = Number(await withBreaker(b, () =>
-						evalCached(redis, PUBLISH_SCRIPT, 4, sk, bk, ek, uk, maxSize, ttl, event, payload, now(), generation)
+						evalCached(redis, PUBLISH_SCRIPT, 4, sk, bk, ek, uk, maxSize, ttl, event, payload, generation)
 					));
 				}
 			} catch (err) {
@@ -531,7 +555,7 @@ export function createStreamReplay(client, options = {}) {
 		},
 
 		async seq(topic) {
-			const val = await withBreaker(b, () => redis.get(seqKey(topic)));
+			const val = await withBreaker(b, () => readStamped(topic, 'get', seqKey(topic)));
 			return val ? parseInt(val, 10) : 0;
 		},
 
@@ -546,7 +570,7 @@ export function createStreamReplay(client, options = {}) {
 
 			let entries;
 			try {
-				entries = await redis.xrange(bufKey(topic), `${target}-0`, '+', 'COUNT', 1);
+				entries = await readStamped(topic, 'xrange', bufKey(topic), `${target}-0`, '+', 'COUNT', 1);
 			} catch (err) {
 				b?.failure(err);
 				throw err;
@@ -599,7 +623,7 @@ export function createStreamReplay(client, options = {}) {
 			// API and needs its own gate.
 			if (!Number.isInteger(since) || since < 0) return [];
 			const startId = `(${since}-0`;
-			const entries = await withBreaker(b, () => redis.xrange(bufKey(topic), startId, '+'));
+			const entries = await withBreaker(b, () => readStamped(topic, 'xrange', bufKey(topic), startId, '+'));
 			const result = [];
 			for (const [id, flat] of entries) {
 				// Versioned read: seq from the stream id, topic from the per-topic
@@ -647,6 +671,8 @@ export function createStreamReplay(client, options = {}) {
 				const pipe = redis.pipeline();
 				pipe.get(seqKey(topic));
 				pipe.xrange(bufKey(topic), startId, '+');
+				// The use stamp rides the same round trip (see readStamped).
+				if (topics.readStampDue(topic)) pipe[topics.touchCommand()](2, seqKey(topic), usedKey(topic));
 				const results = await pipe.exec();
 				if (results[0][0]) throw results[0][0];
 				if (results[1][0]) throw results[1][0];

@@ -96,11 +96,13 @@ describe('migrateReplayToStream (sorted-set -> stream)', () => {
 
 		it('the stream backend reads the SAME seq/epoch after migration (resume survives)', async () => {
 			await seedSortedSet('chat', 4);
+			const epoch = await createReplay(client).currentEpoch('chat');
+			expect(epoch).toBeGreaterThan(0);
 			const st = createReplay(client, { storage: 'stream' });
 			await migrateReplayToStream(client, { topics: ['chat'] });
 			// seq high-water and epoch are shared keys; the stream backend reads them.
 			expect(await st.seq('chat')).toBe(4);
-			expect(await st.currentEpoch('chat')).toBe(1);
+			expect(await st.currentEpoch('chat')).toBe(epoch);
 		});
 
 		it('never writes the source sorted set (non-destructive)', async () => {

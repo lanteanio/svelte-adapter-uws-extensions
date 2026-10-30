@@ -423,13 +423,53 @@ describeIntegration('redis replay (integration)', () => {
 				const r = createReplay(client, { storage, size: 5, maxTopics: 1 });
 
 				await r.publish(platform, 'fresh', 'created', { id: 1 });
-				expect(Number(await client.redis.get(client.key('replay:generation:{replay-topics}')))).toBeGreaterThan(40);
+				expect(Number(await client.redis.hget(client.key('replay:generation:{replay-topics}'), 'next'))).toBeGreaterThan(40);
 				expect(await r.currentEpoch('fresh')).toBeGreaterThan(40);
 				// Never published since the upgrade, so evicted first.
 				expect(await r.seq('room')).toBe(0);
 
 				await r.publish(platform, 'room', 'created', { id: 1 });
 				expect(await r.currentEpoch('room')).toBeGreaterThan(40);
+			});
+		}
+
+		for (const storage of ['sortedset', 'stream']) {
+			it(`${storage}: ranks topics stored before the upgrade by their last access`, async () => {
+				await client.redis.set(client.key('replay:seq:{stale}'), '3');
+				await client.redis.set(client.key('replay:seq:{recent}'), '3');
+				await new Promise((resolve) => setTimeout(resolve, 2100));
+				await client.redis.get(client.key('replay:seq:{recent}'));
+				const r = createReplay(client, { storage, size: 5, maxTopics: 2 });
+				await r.publish(platform, 'fresh', 'created', { id: 1 });
+				expect(await r.seq('stale')).toBe(0);
+				expect(await r.seq('recent')).toBe(3);
+			}, 10_000);
+
+			it(`${storage}: a lost counter restarts above every epoch still stored`, async () => {
+				const r = createReplay(client, { storage, size: 5, maxTopics: 10 });
+				await r.publish(platform, 'a', 'created', { id: 1 });
+				// An epoch issued ahead of the clock by a burst, then the counter is lost.
+				const ahead = Date.now() + 3_600_000;
+				await client.redis.set(client.key('replay:epoch:{a}'), String(ahead));
+				await client.redis.del(client.key('replay:generation:{replay-topics}'));
+				const other = createReplay(client, { storage, size: 5, maxTopics: 10 });
+				await other.publish(platform, 'b', 'created', { id: 1 });
+				expect(await other.currentEpoch('b')).toBeGreaterThan(ahead);
+			});
+
+			it(`${storage}: a read stamps the topic's use in the same round trip`, async () => {
+				const r = createReplay(client, { storage, size: 5, maxTopics: 10, ttl: 600 });
+				await r.publish(platform, 'chat', 'created', { id: 1 });
+				await client.redis.set(client.key('replay:used:{chat}'), '1', 'EX', 600);
+				const reader = createReplay(client, { storage, size: 5, maxTopics: 10, ttl: 600 });
+				expect((await reader.since('chat', 0)).map((m) => m.seq)).toEqual([1]);
+				expect(Number(await client.redis.get(client.key('replay:used:{chat}')))).toBeGreaterThan(1);
+				const ttl = await client.redis.ttl(client.key('replay:used:{chat}'));
+				expect(ttl).toBeGreaterThan(0);
+				expect(ttl).toBeLessThanOrEqual(600);
+				// An unknown topic gets no keys from a read.
+				await reader.seq('ghost');
+				expect(await client.redis.exists(client.key('replay:used:{ghost}'))).toBe(0);
 			});
 		}
 

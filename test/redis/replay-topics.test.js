@@ -5,6 +5,11 @@ import { mockWs } from '../helpers/mock-ws.js';
 import { countRedisIO } from '../helpers/redis-io-counter.js';
 import { createReplay } from '../../src/redis/replay.js';
 import { setRuntimeEnv, resetRuntimeEnv } from '../../src/shared/runtime.js';
+import { setOperationalEventSink } from '../../src/shared/diagnostic.js';
+import { EXTENSIONS_ERROR_IDS, extensionsErrorDefinition } from '../../src/error-registry.js';
+import { createMetrics } from '../../src/prometheus/index.js';
+
+const FIRST_REPORTS = Symbol.for('svelte-adapter-uws-extensions.first-reports.v1');
 
 const BACKENDS = [
 	{ name: 'sorted-set', options: {}, buf: 'buf' },
@@ -14,7 +19,7 @@ const BACKENDS = [
 let clock;
 beforeEach(() => {
 	clock = 1_700_000_000_000;
-	setRuntimeEnv({ clock: { now: () => clock } });
+	setRuntimeEnv({ clock: { now: () => clock, wallEpoch: () => clock } });
 });
 afterEach(() => {
 	resetRuntimeEnv();
@@ -98,6 +103,82 @@ for (const backend of BACKENDS) {
 				expect(await replay.publishIdempotent(platform, 'room', 'msg', { id: 1 }, opts)).toEqual({ seq: 1, isDuplicate: false });
 			});
 		}
+
+		it('a lost counter restarts above every epoch still stored', async () => {
+			const replay = create({ maxTopics: 10 });
+			clock = 1000;
+			for (const topic of ['a', 'b', 'c']) await replay.publish(platform, topic, 'msg', 1);
+			// Three generations in the same millisecond run ahead of the clock.
+			const top = Math.max(...await Promise.all(['a', 'b', 'c'].map((t) => replay.currentEpoch(t))));
+			expect(top).toBeGreaterThan(1000);
+			await client.redis.del(client.key('replay:generation:{replay-topics}'));
+			const other = create({ maxTopics: 10 });
+			await other.publish(platform, 'd', 'msg', 1);
+			expect(await other.currentEpoch('d')).toBeGreaterThan(top);
+		});
+
+		it('a counter lost with every key restarts at the server clock', async () => {
+			const replay = create({ maxTopics: 10 });
+			clock = 1000;
+			await replay.publish(platform, 'c', 'msg', 1);
+			const before = await replay.currentEpoch('c');
+			const [, all] = await client.redis.scan('0', 'MATCH', client.key('*'));
+			await client.redis.del(...all);
+			clock = 5000;
+			await create({ maxTopics: 10 }).publish(platform, 'c', 'msg', 1);
+			const after = await replay.currentEpoch('c');
+			expect(after).toBeGreaterThanOrEqual(5000);
+			expect(after).not.toBe(before);
+		});
+
+		it('scans for existing topics in one instance only', async () => {
+			let scans = 0;
+			const scan = client.redis.scan;
+			client.redis.scan = (...args) => { scans++; return scan.apply(client.redis, args); };
+			try {
+				await create({ maxTopics: 10 }).publish(platform, 'a', 'msg', 1);
+				const first = scans;
+				expect(first).toBeGreaterThan(0);
+				await create({ maxTopics: 10 }).publish(platform, 'b', 'msg', 1);
+				expect(scans).toBe(first);
+			} finally {
+				client.redis.scan = scan;
+			}
+		});
+
+		it('creates a topic within a bounded wait while another instance holds the seed lease', async () => {
+			clock = Date.now();
+			const generation = client.key('replay:generation:{replay-topics}');
+			await client.redis.hset(generation, 'lease', 'other', 'leaseUntil', String(clock + 600_000));
+			await client.redis.set(key('seq', 'legacy'), '4');
+			const started = Date.now();
+			const replay = create({ maxTopics: 10 });
+			await replay.publish(platform, 'fresh', 'msg', 1);
+			expect(Date.now() - started).toBeLessThan(5000);
+			expect(await replay.currentEpoch('fresh')).toBeGreaterThanOrEqual(clock);
+			// The scan belongs to the lease holder: nothing was enrolled here.
+			expect(await client.redis.zrange(registryKey(), 0, -1)).not.toContain('legacy');
+		}, 10_000);
+
+		it('warns once and counts evictions when existing topics exceed the cap', async () => {
+			delete globalThis[FIRST_REPORTS];
+			const records = [];
+			const dispose = setOperationalEventSink((record) => { records.push(record); });
+			try {
+				for (const topic of ['l1', 'l2', 'l3']) await client.redis.set(key('seq', topic), '1');
+				const metrics = createMetrics();
+				const replay = create({ maxTopics: 2, metrics });
+				await publishAt(replay, 1000, 'fresh');
+				const { event } = extensionsErrorDefinition(EXTENSIONS_ERROR_IDS.REDIS_REPLAY_TOPICS_OVER_CAP);
+				const warnings = records.filter((r) => r.event === event);
+				expect(warnings).toHaveLength(1);
+				expect(warnings[0].attributes).toEqual({ topics: 3, maxTopics: 2 });
+				expect(await metrics.serialize()).toMatch(/replay_topic_evictions_total 2/);
+			} finally {
+				dispose();
+				delete globalThis[FIRST_REPORTS];
+			}
+		});
 
 		it('removes every per-topic key of an evicted topic', async () => {
 			const replay = create({ maxTopics: 1 });
@@ -189,20 +270,55 @@ for (const backend of BACKENDS) {
 			expect(meter.read()).toBe(3);
 		});
 
-		it('reads write nothing', async () => {
+		for (const kind of ['seq', 'since', 'gap', 'replay']) {
+			it(`${kind}() counts as use at most once a minute per topic, in its own round trip`, async () => {
+				const meter = countRedisIO(client);
+				const replay = createReplay(meter.client, { ...backend.options, maxTopics: 5 });
+				const read = {
+					seq: () => replay.seq('room'),
+					since: () => replay.since('room', 0),
+					gap: () => replay.gap('room', 1),
+					replay: () => replay.replay(mockWs({}), 'room', 1, platform)
+				}[kind];
+				await publishAt(replay, 1000, 'room', 3);
+				const registry = await client.redis.zrange(registryKey(), 0, -1);
+				clock = 2000;
+				meter.reset();
+				await read();
+				const trips = meter.read();
+				expect(await client.redis.get(key('used', 'room'))).toBe('2000');
+				clock = 30_000;
+				meter.reset();
+				await read();
+				expect(meter.read()).toBe(trips);
+				// Coalesced: the stamp did not move within the minute.
+				expect(await client.redis.get(key('used', 'room'))).toBe('2000');
+				clock = 70_000;
+				meter.reset();
+				await read();
+				expect(meter.read()).toBe(trips);
+				expect(await client.redis.get(key('used', 'room'))).toBe('70000');
+				expect(await client.redis.zrange(registryKey(), 0, -1)).toEqual(registry);
+			});
+		}
+
+		it('keeps a topic that is only read over one published earlier', async () => {
+			const replay = create({ maxTopics: 2 });
+			await publishAt(replay, 1000, 'readonly');
+			await publishAt(replay, 2000, 'written');
+			clock = 70_000;
+			await replay.since('readonly', 0);
+			await publishAt(replay, 71_000, 'third');
+			expect(await replay.seq('readonly')).toBe(1);
+			expect(await replay.seq('written')).toBe(0);
+		});
+
+		it('a read never creates keys for an unknown topic', async () => {
 			const replay = create({ maxTopics: 5 });
-			await publishAt(replay, 1000, 'room', 3);
-			const used = await client.redis.get(key('used', 'room'));
-			const registry = await client.redis.zrange(registryKey(), 0, -1);
-			clock = 9000;
-			await replay.seq('room');
-			await replay.since('room', 0);
-			await replay.gap('room', 1);
-			await replay.currentEpoch('room');
-			await replay.replay(mockWs({}), 'room', 1, platform);
-			await replay.resumeHook()(mockWs({}), { lastSeenSeqs: { room: 1 }, lastSeenEpochs: { room: await replay.currentEpoch('room') }, platform });
-			expect(await client.redis.get(key('used', 'room'))).toBe(used);
-			expect(await client.redis.zrange(registryKey(), 0, -1)).toEqual(registry);
+			clock = 70_000;
+			await replay.seq('ghost');
+			await replay.since('ghost', 0);
+			expect(await client.redis.exists(key('used', 'ghost'))).toBe(0);
 		});
 
 		it('still stores and broadcasts when eviction fails', async () => {

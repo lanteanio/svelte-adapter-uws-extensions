@@ -785,10 +785,11 @@ describe('redis replay', () => {
 
 		it('bumps the epoch on the first publish of a fresh topic', async () => {
 			await replay.publish(platform, 'chat', 'msg', { id: 1 });
-			expect(await replay.currentEpoch('chat')).toBe(1);
+			const epoch = await replay.currentEpoch('chat');
+			expect(epoch).toBeGreaterThan(0);
 			// Steady-state publishes do not move the epoch.
 			await replay.publish(platform, 'chat', 'msg', { id: 2 });
-			expect(await replay.currentEpoch('chat')).toBe(1);
+			expect(await replay.currentEpoch('chat')).toBe(epoch);
 		});
 
 		it('bumps the epoch when clearTopic resets the seq space', async () => {
@@ -808,8 +809,9 @@ describe('redis replay', () => {
 
 		it('exposes the epoch synchronously via cachedEpoch after a read', async () => {
 			await replay.publish(platform, 'chat', 'msg', { id: 1 });
-			await replay.currentEpoch('chat');
-			expect(replay.cachedEpoch('chat')).toBe(1);
+			const epoch = await replay.currentEpoch('chat');
+			expect(epoch).toBeGreaterThan(0);
+			expect(replay.cachedEpoch('chat')).toBe(epoch);
 			// A topic this process has not observed reads the baseline.
 			expect(replay.cachedEpoch('never-touched')).toBe(0);
 		});

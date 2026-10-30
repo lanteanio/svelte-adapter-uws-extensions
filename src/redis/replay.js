@@ -31,7 +31,6 @@ import { createLruMap } from '../shared/lru-map.js';
 import { evalCached } from '../shared/eval-cached.js';
 import { scanUnlinkExcept, scanKeys } from '../shared/redis-scan.js';
 import { createReplayTopics, parseMaxTopics } from './_replay-topics.js';
-import { now } from '../shared/runtime.js';
 import { ReplicationTimeoutError, ReplayStorageError, ReplaySerializationError, parseReplayOptions, awaitReplicationGrouped, createResumeHook } from '../shared/replay-helpers.js';
 import { execMultiSlot, firstCommandError } from '../shared/cluster.js';
 import { withBreaker } from '../shared/breaker.js';
@@ -79,8 +78,7 @@ export { migrateReplayToStream } from './replay-migrate.js';
  * ARGV[2] = data (JSON-encoded)
  * ARGV[3] = maxSize
  * ARGV[4] = ttl (seconds, 0 = no expiry)
- * ARGV[5] = now (ms), the topic's use stamp for `maxTopics` eviction
- * ARGV[6] = generation for a fresh seq space (0 = none reserved yet)
+ * ARGV[5] = generation for a fresh seq space (0 = none reserved yet)
  *
  * Returns the new sequence number, or -1 without writing anything when the
  * seq space is fresh and no generation was passed.
@@ -98,8 +96,10 @@ export { migrateReplayToStream } from './replay-migrate.js';
  * from the shared counter, which no topic has held before. A resuming client
  * holding an earlier epoch then mismatches and re-reads instead of trusting
  * an offset into the restarted numbering. A stale buffer left in the slot is
- * dropped so its entries cannot pass for the new numbering. With a `ttl`, all
- * four keys share it, so a topic's metadata expires with its entries.
+ * dropped so its entries cannot pass for the new numbering. The use stamp read
+ * by `maxTopics` eviction is the server's time, so instance clocks do not
+ * matter. With a `ttl`, all four keys share it, so a topic's metadata expires
+ * with its entries.
  */
 const PUBLISH_SCRIPT = `
 local seqKey = KEYS[1]
@@ -110,7 +110,7 @@ local event = ARGV[1]
 local data = ARGV[2]
 local maxSize = tonumber(ARGV[3])
 local ttl = tonumber(ARGV[4])
-local generation = tonumber(ARGV[6])
+local generation = tonumber(ARGV[5])
 if maxSize == nil or ttl == nil or generation == nil then
   return redis.error_reply('REPLAY_PUBLISH: maxSize/ttl/generation must be numeric')
 end
@@ -120,7 +120,7 @@ if redis.call('exists', seqKey) == 0 then
     return -1
   end
   redis.call('unlink', bufKey)
-  redis.call('set', epochKey, ARGV[6])
+  redis.call('set', epochKey, ARGV[5])
 end
 local seq = redis.call('incr', seqKey)
 local envelope = cjson.encode({v = 1, seq = seq, event = event})
@@ -132,7 +132,8 @@ if count > maxSize then
   redis.call('zremrangebyrank', bufKey, 0, count - maxSize - 1)
 end
 
-redis.call('set', usedKey, ARGV[5])
+local serverTime = redis.call('time')
+redis.call('set', usedKey, tonumber(serverTime[1]) * 1000 + math.floor(tonumber(serverTime[2]) / 1000))
 if ttl > 0 then
   redis.call('expire', seqKey, ttl)
   redis.call('expire', bufKey, ttl)
@@ -198,6 +199,7 @@ export function createReplay(client, options = {}) {
 	const m = options.metrics;
 	const mt = m?.mapTopic || (() => 'all');
 	const mPublishes = m?.counter('replay_publishes_total', 'Messages published to replay buffer', ['topic']);
+	const mEvictions = m?.counter('replay_topic_evictions_total', 'Topics evicted past maxTopics with their replay history');
 	const mReplayed = m?.counter('replay_messages_replayed_total', 'Messages replayed to clients', ['topic']);
 	const mTruncations = m?.counter('replay_truncations_total', 'Truncation events detected', ['topic']);
 	const mResumeTopicOverflows = m?.counter(
@@ -256,8 +258,29 @@ export function createReplay(client, options = {}) {
 	const topics = createReplayTopics(client, {
 		maxTopics,
 		breaker: b,
-		onEvicted: (topic) => epochCache.delete(topic)
+		onEvicted: (topic) => {
+			epochCache.delete(topic);
+			mEvictions?.inc();
+		},
+		onSeeded: (count) => {
+			if (count > maxTopics && firstReportInProcess(EXTENSIONS_ERROR_IDS.REDIS_REPLAY_TOPICS_OVER_CAP)) {
+				emitRegisteredFailure(EXTENSIONS_ERROR_IDS.REDIS_REPLAY_TOPICS_OVER_CAP, { attributes: { topics: count, maxTopics } });
+			}
+		}
 	});
+
+	// One read command, with the topic's use stamp added to the same round
+	// trip when this process has not stamped it within
+	// REPLAY_READ_USE_INTERVAL_MS.
+	// Reads count as use for maxTopics, as in the core plugin; the stamp shares
+	// the topic's hash slot, so the pipeline stays single-slot on a cluster. A
+	// failed stamp does not fail the read.
+	async function readStamped(topic, method, ...args) {
+		if (!topics.readStampDue(topic)) return redis[method](...args);
+		const results = await redis.pipeline()[method](...args)[topics.touchCommand()](2, seqKey(topic), usedKey(topic)).exec();
+		if (results[0][0]) throw results[0][0];
+		return results[0][1];
+	}
 
 
 	// Read the stored epoch for a topic. A topic whose seq space has never reset
@@ -336,12 +359,12 @@ export function createReplay(client, options = {}) {
 				// generation (and may evict another topic past maxTopics) and
 				// the write is retried with it.
 				seq = Number(await withBreaker(b, () =>
-					evalCached(redis, PUBLISH_SCRIPT, 4, sk, bk, ek, uk, event, payload, maxSize, ttl, now(), 0)
+					evalCached(redis, PUBLISH_SCRIPT, 4, sk, bk, ek, uk, event, payload, maxSize, ttl, 0)
 				));
 				if (seq === -1) {
 					const generation = await topics.reserve(topic);
 					seq = Number(await withBreaker(b, () =>
-						evalCached(redis, PUBLISH_SCRIPT, 4, sk, bk, ek, uk, event, payload, maxSize, ttl, now(), generation)
+						evalCached(redis, PUBLISH_SCRIPT, 4, sk, bk, ek, uk, event, payload, maxSize, ttl, generation)
 					));
 				}
 			} catch (err) {
@@ -381,7 +404,7 @@ export function createReplay(client, options = {}) {
 		},
 
 		async seq(topic) {
-			const val = await withBreaker(b, () => redis.get(seqKey(topic)));
+			const val = await withBreaker(b, () => readStamped(topic, 'get', seqKey(topic)));
 			return val ? parseInt(val, 10) : 0;
 		},
 
@@ -396,7 +419,7 @@ export function createReplay(client, options = {}) {
 
 			let raw;
 			try {
-				raw = await redis.zrangebyscore(bufKey(topic), target, '+inf');
+				raw = await readStamped(topic, 'zrangebyscore', bufKey(topic), target, '+inf');
 			} catch (err) {
 				b?.failure(err);
 				throw err;
@@ -439,7 +462,7 @@ export function createReplay(client, options = {}) {
 			// against buggy host code that forwards client input
 			// unchecked.
 			if (!Number.isInteger(since) || since < 0) return [];
-			const raw = await withBreaker(b, () => redis.zrangebyscore(bufKey(topic), since + 1, '+inf'));
+			const raw = await withBreaker(b, () => readStamped(topic, 'zrangebyscore', bufKey(topic), since + 1, '+inf'));
 			const result = [];
 			for (let i = 0; i < raw.length; i++) {
 				const decoded = decodeSortedSetMember(raw[i], topic);
@@ -483,6 +506,8 @@ export function createReplay(client, options = {}) {
 				const pipe = redis.pipeline();
 				pipe.get(seqKey(topic));
 				pipe.zrangebyscore(bk, sinceSeq + 1, '+inf');
+				// The use stamp rides the same round trip (see readStamped).
+				if (topics.readStampDue(topic)) pipe[topics.touchCommand()](2, seqKey(topic), usedKey(topic));
 				const results = await pipe.exec();
 				if (results[0][0]) throw results[0][0];
 				if (results[1][0]) throw results[1][0];

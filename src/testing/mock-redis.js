@@ -1113,8 +1113,11 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				if (script.includes('REPLAY_TOPIC_CANDIDATES')) return evalReplayTopicCandidates(args);
 				if (script.includes('REPLAY_TOPIC_EVICT')) return evalReplayTopicEvict(args);
 				if (script.includes('REPLAY_TOPIC_SETTLE')) return evalReplayTopicSettle(args);
-				if (script.includes('REPLAY_TOPIC_ENROLL')) return evalReplayTopicEnroll(args);
-				if (script.includes('REPLAY_GENERATION_SEED')) return evalReplayGenerationSeed(args);
+				if (script.includes('REPLAY_TOPIC_TOUCH')) return evalReplayTopicTouch(args);
+				if (script.includes('REPLAY_TOPIC_PROBE')) return evalReplayTopicProbe(args);
+				if (script.includes('REPLAY_SEED_LEASE')) return evalReplaySeedLease(args);
+				if (script.includes('REPLAY_SEED_PROGRESS')) return evalReplaySeedProgress(args);
+				if (script.includes('REPLAY_SEED_FINISH')) return evalReplaySeedFinish(args);
 				if (script.includes('REPLAY_CLEAR_TOPIC')) return evalReplayClearTopic(args);
 				// Replay publish script (atomic incr + zadd + trim)
 				if (script.includes('zremrangebyrank') && script.includes('cjson.encode')) {
@@ -2050,23 +2053,96 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			return out;
 		}
 
-		// args layout: [generationKey, registryKey, topic, now, maxTopics, batch]
+		// The generation hash the replay scripts share (see redis/_replay-topics.js).
+		function replayGenerationHash(key) {
+			if (!hashes.has(key)) hashes.set(key, new Map());
+			return hashes.get(key);
+		}
+
+		// args layout: [generationKey, registryKey, topic, maxTopics, batch, create]
 		function evalReplayTopicReserve(args) {
 			const [generationKey, registryKey, topic] = args;
-			const usedAt = Number(args[3]);
-			const maxTopics = Number(args[4]);
-			const batch = Number(args[5]);
-			pruneExpiredString(generationKey);
-			if (!store.has(generationKey)) return [0];
-			const generation = parseInt(store.get(generationKey), 10) + 1;
-			store.set(generationKey, String(generation));
+			const maxTopics = Number(args[3]);
+			const batch = Number(args[4]);
+			const h = hashes.get(generationKey);
+			const last = h?.has('next') ? Number(h.get('next')) : null;
+			if (last === null && String(args[5]) !== '1') return [0, 0];
+			const nowMs = evalTimeNowMs();
+			const generation = last !== null && last >= nowMs ? last + 1 : nowMs;
+			const gen = replayGenerationHash(generationKey);
+			gen.set('next', String(generation));
+			const seeded = gen.get('seeded') === '1' ? 1 : 0;
 			const set = zsetEntries(registryKey);
 			const existing = set.find((e) => String(e.member) === topic);
-			if (existing) existing.score = usedAt;
-			else set.push({ score: usedAt, member: topic });
+			if (existing) existing.score = nowMs;
+			else set.push({ score: nowMs, member: topic });
 			zsetSort(set);
 			const over = Math.min(set.length - maxTopics, batch);
-			return over > 0 ? [generation, ...zsetLowest(registryKey, over, topic)] : [generation];
+			return over > 0 ? [generation, seeded, ...zsetLowest(registryKey, over, topic)] : [generation, seeded];
+		}
+
+		// args layout: [seqKey, usedKey]
+		function evalReplayTopicTouch(args) {
+			pruneExpiredString(args[0]);
+			if (!store.has(args[0])) return 0;
+			store.set(args[1], String(evalTimeNowMs()));
+			return 1;
+		}
+
+		// args layout: [seqKey, epochKey]. The double tracks no access times,
+		// so it answers as a server under an LFU policy does: idle unknown.
+		function evalReplayTopicProbe(args) {
+			pruneExpiredString(args[1]);
+			return [-1, store.has(args[1]) ? store.get(args[1]) : null];
+		}
+
+		function replaySeedLeaseHeld(gen, token) {
+			return gen.get('lease') === String(token);
+		}
+
+		// args layout: [generationKey, token, leaseMs]
+		function evalReplaySeedLease(args) {
+			const gen = replayGenerationHash(args[0]);
+			if (gen.get('seeded') === '1') return 2;
+			const nowMs = evalTimeNowMs();
+			const owner = gen.get('lease');
+			if (owner && owner !== String(args[1]) && Number(gen.get('leaseUntil')) > nowMs) return 0;
+			gen.set('lease', String(args[1]));
+			gen.set('leaseUntil', String(nowMs + Number(args[2])));
+			return 1;
+		}
+
+		// args layout: [generationKey, registryKey, token, leaseMs, node, cursor, floor, (topic, idle)...]
+		function evalReplaySeedProgress(args) {
+			const gen = replayGenerationHash(args[0]);
+			if (!replaySeedLeaseHeld(gen, args[2])) return 0;
+			const nowMs = evalTimeNowMs();
+			const set = zsetEntries(args[1]);
+			for (let i = 7; i + 1 < args.length; i += 2) {
+				const topic = String(args[i]);
+				const idle = Number(args[i + 1]);
+				const score = Number.isFinite(idle) && idle >= 0 ? nowMs - idle * 1000 : 0;
+				if (!set.some((e) => String(e.member) === topic)) set.push({ score, member: topic });
+			}
+			zsetSort(set);
+			if (set.length === 0) sortedSets.delete(args[1]);
+			if (Number(args[6]) > Number(gen.get('floor') || '0')) gen.set('floor', String(args[6]));
+			gen.set('cursor:' + args[4], String(args[5]));
+			gen.set('leaseUntil', String(nowMs + Number(args[3])));
+			return 1;
+		}
+
+		// args layout: [generationKey, registryKey, token]
+		function evalReplaySeedFinish(args) {
+			const gen = replayGenerationHash(args[0]);
+			if (!replaySeedLeaseHeld(gen, args[2])) return -1;
+			const next = Math.max(Number(gen.get('next') || '0'), Number(gen.get('floor') || '0'), evalTimeNowMs());
+			gen.set('next', String(next));
+			gen.set('seeded', '1');
+			for (const field of [...gen.keys()]) {
+				if (field === 'lease' || field === 'leaseUntil' || field === 'floor' || field.startsWith('cursor:')) gen.delete(field);
+			}
+			return (sortedSets.get(args[1]) || []).length;
 		}
 
 		// args layout: [registryKey, maxTopics, batch, topic]
@@ -2107,29 +2183,10 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			return removed;
 		}
 
-		// args layout: [registryKey, ...topics]
-		function evalReplayTopicEnroll(args) {
-			const set = zsetEntries(args[0]);
-			for (let i = 1; i < args.length; i++) {
-				const topic = String(args[i]);
-				if (!set.some((e) => String(e.member) === topic)) set.push({ score: 0, member: topic });
-			}
-			zsetSort(set);
-			return args.length - 1;
-		}
-
-		// args layout: [generationKey, floor]
-		function evalReplayGenerationSeed(args) {
-			const [generationKey, floor] = args;
-			pruneExpiredString(generationKey);
-			const current = store.has(generationKey) ? parseInt(store.get(generationKey), 10) : -1;
-			if (current < Number(floor)) store.set(generationKey, String(floor));
-			return store.get(generationKey);
-		}
-
-		// args layout: [seqKey, bufKey, epochKey, usedKey, generation, now, ttl]
+		// args layout: [seqKey, bufKey, epochKey, usedKey, generation, ttl]
 		function evalReplayClearTopic(args) {
-			const [seqKey, bufKey, epochKey, usedKey, generation, usedAt] = args;
+			const [seqKey, bufKey, epochKey, usedKey, generation] = args;
+			const usedAt = evalTimeNowMs();
 			r.del(bufKey);
 			store.set(seqKey, '0');
 			stringExpiry.delete(seqKey);
@@ -2141,7 +2198,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 		}
 
 		// Streams idempotent replay publish Lua script simulation
-		// args layout: [idmpKey, seqKey, bufKey, epochKey, usedKey, requestId, maxSize, ttl, idmpTtl, event, dataJson, hexpireSupported, now, generation]
+		// args layout: [idmpKey, seqKey, bufKey, epochKey, usedKey, requestId, maxSize, ttl, idmpTtl, event, dataJson, hexpireSupported, generation]
 		function evalIdmpStreamReplayPublish(numKeys, args) {
 			const idmpKey = args[0];
 			const seqKey = args[1];
@@ -2154,8 +2211,8 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			const event = args[9];
 			const dataJson = args[10];
 			const hexpire = String(args[11]) === '1';
-			const usedAt = args[12];
-			const generation = Number(args[13]);
+			const usedAt = evalTimeNowMs();
+			const generation = Number(args[12]);
 
 			// Match the real server: a per-field-expired dedup entry is gone before
 			// the HGET, so it reads as a fresh publish.
@@ -2219,7 +2276,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 		}
 
 		// Streams replay publish Lua script simulation
-		// args layout: [seqKey, bufKey, epochKey, usedKey, maxSize, ttl, event, dataJson, now, generation]
+		// args layout: [seqKey, bufKey, epochKey, usedKey, maxSize, ttl, event, dataJson, generation]
 		function evalStreamReplayPublish(numKeys, args) {
 			const seqKey = args[0];
 			const bufKey = args[1];
@@ -2228,8 +2285,8 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			const maxSize = Number(args[4]);
 			const event = args[6];
 			const dataJson = args[7];
-			const usedAt = args[8];
-			const generation = Number(args[9]);
+			const usedAt = evalTimeNowMs();
+			const generation = Number(args[8]);
 
 			if (!replayFreshSpace(seqKey, bufKey, epochKey, generation)) return -1;
 			const seq = parseInt(store.get(seqKey) || '0', 10) + 1;
@@ -2253,7 +2310,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 		}
 
 		// Replay publish Lua script simulation
-		// args layout: [seqKey, bufKey, epochKey, usedKey, event, dataJson, maxSize, ttl, now, generation]
+		// args layout: [seqKey, bufKey, epochKey, usedKey, event, dataJson, maxSize, ttl, generation]
 		function evalReplayPublish(numKeys, args) {
 			const seqKey = args[0];
 			const bufKey = args[1];
@@ -2262,8 +2319,8 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 			const event = args[4];
 			const dataJson = args[5];
 			const maxSize = Number(args[6]);
-			const usedAt = args[8];
-			const generation = Number(args[9]);
+			const usedAt = evalTimeNowMs();
+			const generation = Number(args[8]);
 
 			if (!replayFreshSpace(seqKey, bufKey, epochKey, generation)) return -1;
 			const seq = parseInt(store.get(seqKey) || '0', 10) + 1;
