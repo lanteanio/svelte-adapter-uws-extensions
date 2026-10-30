@@ -559,6 +559,25 @@ the earlier release first: their task purge deletes by raw user id, including
 rows stamped for other tenants. To use `forgetIdentity`, follow the
 [tenant-qualified erasure rollout](docs/tenant-erasure-identity.md#rollout).
 
+### Tasks schema version 5: enqueue receipts
+
+Only for tables migrated outside the package, with `autoMigrate: false`. With
+the default `autoMigrate: true` version 5 is applied on first use.
+
+**Symptom.** `relation "svti_tasks_receipts" does not exist` from task
+`purgeUser`, `postgres.tasks.sweep.failed` from the cleanup sweep, and a
+rejected `ready()`.
+
+**Why.** `enqueueOnce()` stores its receipts in `<table>_receipts`, the cleanup
+sweep deletes expired receipts, and erasure deletes a user's receipts with
+their task rows.
+
+**Action.** Run `migrate(client, { store: 'tasks' })` before deploying, and
+grant runtime roles SELECT, INSERT, UPDATE and DELETE on `svti_tasks_receipts`.
+Existing task rows get no receipts. Earlier releases neither read nor erase
+receipts, so stop them before relying on `enqueueOnce()` erasure, and keep the
+table through a rollback ([durable enqueue receipts](docs/durable-enqueue-receipts.md#migration)).
+
 ### Other PostgreSQL stores and readiness
 
 Replay adds a user identity and sequence epoch; idempotency adds erasure identity
