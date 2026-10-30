@@ -174,6 +174,33 @@ reported the difference. `NaN` is the sharp one: it *is* a number, and every
 reading the value from an environment variable, `Number(process.env.X)` yields
 `NaN` for an unset one - use a fallback.
 
+### Factory options refuse values they cannot honor
+
+**Symptom.** A `TypeError` from the factory call, shaped
+`<module>: <option> must be <what it accepts> - got <value> (<type>).`, for
+example `postgres jobs: autoMigrate must be true or false - got "false"
+(string).` Two more shapes cover the numeric bounds:
+`<module>: <option> must be no greater than 2147483647 milliseconds, because
+Node stores a timer delay in a signed 32-bit integer ...` and `<module>:
+<option> must be a whole number of milliseconds - got 1500.5. Redis refuses a
+fractional expiry ...`. Separately, a `console.warn` starting
+`[extensions] unknown <factory> option(s):` names keys the factory ignores.
+
+**Why.** Each refused value used to be accepted and then did something other
+than what it said: a string flag read as its opposite (`autoMigrate: 'false'`
+still migrated), a string or zero lease fell back to the default, an interval
+above 2147483647 ms made Node fire the timer every millisecond, and a
+fractional Redis lifetime failed every write that set it. The
+[changelog](CHANGELOG.md) lists every option. `undefined` and `null` are
+still "not set", and a falsy `breaker` or `metrics` is still none.
+
+**Action.** Pass the type the message names. Convert environment values
+explicitly (`process.env.AUTO_MIGRATE !== 'false'`, `Number(process.env.TTL_MS)`),
+round lifetimes to whole milliseconds, keep intervals at or below 2147483647 ms
+(about 24.8 days), and disable the presence consistency auditor with `0`
+rather than a negative number. For the warning, fix the spelling it suggests or
+drop the key; it never stops startup.
+
 ### `redis/ratelimit` no longer exports its in-process floor helpers
 
 **Symptom.** `SyntaxError: The requested module
