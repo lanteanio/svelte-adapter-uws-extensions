@@ -30,13 +30,13 @@ beforeAll(() => {
 });
 beforeEach(async () => {
 	while (runners.length) runners.pop().destroy();
-	await client.query(`DROP TABLE IF EXISTS ${TABLE}, ${UPGRADE}`);
+	await client.query(`DROP TABLE IF EXISTS ${TABLE}, ${UPGRADE}, ${TABLE}_receipts, ${UPGRADE}_receipts`);
 	await forgetFixtureMigrations(client, [TABLE, UPGRADE]);
 	await migrate(client, { store: 'tasks', table: TABLE });
 });
 afterAll(async () => {
 	while (runners.length) runners.pop().destroy();
-	await client.query(`DROP TABLE IF EXISTS ${TABLE}, ${UPGRADE}`);
+	await client.query(`DROP TABLE IF EXISTS ${TABLE}, ${UPGRADE}, ${TABLE}_receipts, ${UPGRADE}_receipts`);
 	await forgetFixtureMigrations(client, [TABLE, UPGRADE]);
 	await client.end();
 });
@@ -239,7 +239,7 @@ describe('postgres tasks version 4 upgrade (integration)', () => {
 		await migrate(client, { store: 'tasks', table: UPGRADE });
 
 		const ledger = await client.query('SELECT version FROM svti_schema_migrations WHERE table_name = $1 ORDER BY version', [UPGRADE]);
-		expect(ledger.rows.map((row) => row.version)).toEqual([1, 2, 3, 4]);
+		expect(ledger.rows.map((row) => row.version)).toEqual(versions.map((version) => version.version));
 		const indexes = (await client.query('SELECT indexname FROM pg_indexes WHERE tablename = $1', [UPGRADE])).rows.map((row) => row.indexname);
 		expect(indexes).toEqual(expect.arrayContaining([`idx_${UPGRADE}_identity`, `idx_${UPGRADE}_pending_scope`]));
 		expect(indexes).not.toContain(`idx_${UPGRADE}_pending_created`);

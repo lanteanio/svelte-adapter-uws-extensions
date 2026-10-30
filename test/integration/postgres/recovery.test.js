@@ -64,8 +64,8 @@ it('restores a real PostgreSQL archive and detects partial replay and sequence r
 			env: { ...process.env, RECOVERY_POSTGRES_URL: readerUrl.href }
 		}));
 		expect(report.ok, JSON.stringify(report)).toBe(true);
-		expect(Object.keys(report.postgres.observations)).toHaveLength(12);
-		expect(report.postgres.observations['schema-migrations'].rows).toBe('19');
+		expect(Object.keys(report.postgres.observations)).toHaveLength(13);
+		expect(report.postgres.observations['schema-migrations'].rows).toBe('20');
 		expect(report.postgres.checks).toContainEqual({ scope: 'dead-letter', name: 'scope_counts', ok: true });
 		expect(report.postgres.checks).toContainEqual({ scope: 'alarms', name: 'execution_authority', ok: true });
 		expect(JSON.stringify(report)).not.toMatch(/private-room|private-payload|private-key/);
