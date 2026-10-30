@@ -1169,6 +1169,19 @@ that `attach` or the subscribe handshake grants. The gate lives in
 directly, as earlier README examples did, skips it. Route those frames through
 `cursors.hooks.message`.
 
+### `recovered` frames ask for a refetch after lost delivery
+
+On a pub/sub bus with a breaker, a `recovered` frame carries
+`recovery: { refetch: true }` when the instance's subscriber may have missed
+messages, and an instance whose relays were dropped publishes one
+`recovered` envelope on `systemChannel` to the other instances when its
+breaker recovers, so their clients get such a frame too. A client that treated
+every `recovered` frame as the end of its own instance's outage now also sees
+one without a `degraded` before it. During a rolling deploy an instance of the
+previous release delivers that envelope to its clients unchanged, even while
+its own breaker is open. A degradation policy whose `recovery` envelope sets
+`refetch` keeps its value.
+
 ## 5. Test-only
 
 ### `mockRedisClient` SCAN matches the real matcher

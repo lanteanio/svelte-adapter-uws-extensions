@@ -126,3 +126,32 @@ for the complete refresh at your deployment's cardinality.
 
 For backup scope, coupled restore groups and the read-only verification command,
 see [Storage recovery](./recovery.md).
+
+## Refetch after lost pub/sub delivery
+
+The pub/sub bus queues nothing during an outage, so a recovery does not replay
+what was lost. On a bus with a `breaker`, a `recovered` event on
+`systemChannel` carries `recovery: { refetch: true }` when messages may have
+been lost, and the client reloads the affected state (svelte-realtime puts it
+on its `degradation` store).
+
+- An instance asks its own clients when its subscriber missed messages: the
+  Redis connection dropped and the channel had to be restored, or activation
+  failed before it succeeded. The event goes out once the breaker is healthy
+  and the channel is back, without a `degraded` before it when the breaker
+  never opened.
+- An instance whose relays were dropped (refused by the open breaker, failed
+  in Redis before the breaker tripped, or shed by a full relay queue) cannot
+  reach the other instances' clients itself. When its breaker recovers it
+  relays one `recovered` envelope on `systemChannel`. Every instance with a
+  breaker answers it with a `recovered` event of its own once its own breaker
+  is healthy; an instance without one delivers the envelope unchanged.
+
+In an asymmetric partition, where one instance loses Redis and the others keep
+it, the clients on both sides are therefore asked to refetch. The envelope
+carries the request and a timestamp, nothing about the sender's outage. A
+degradation policy whose `recovery` envelope sets `refetch` keeps its value;
+otherwise `refetch: true` is added to it. Drops that never trip the breaker are
+reported at its next recovery. The bookkeeping is two flags per bus, set only on
+the failure paths. The sharded bus and the PostgreSQL notification bridge
+publish no `degraded` or `recovered` events.
