@@ -72,12 +72,13 @@ export function resolveCursorOptions(options = {}) {
 	const throttleMs = options.throttle ?? 16;
 	const topicThrottleMs = options.topicThrottle ?? 16;
 	const snapshotIntervalMs = options.snapshotIntervalMs ?? 100;
-	if (options.select != null && typeof options.select !== 'function') {
-		throw new Error('redis cursor: select must be a function');
-	}
 	// Zero-config cursors announce only the connection's `id`. An explicit
 	// select is the application's own policy and its result is used as-is.
-	const select = options.select ?? defaultCursorSelect;
+	// Any falsy select takes the default, as in the adapter's in-memory plugin.
+	const select = options.select || defaultCursorSelect;
+	if (typeof select !== 'function') {
+		throw new Error('redis cursor: select must be a function');
+	}
 	const cursorTtl = options.ttl ?? 30;
 
 	// Read {x, y} out of the app's cursor `data` for the jitter filter. The

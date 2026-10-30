@@ -32,14 +32,12 @@ const EMIT_OPTIONS = Object.freeze({ compress: true, seq: false });
  */
 export function createPresenceState(client, options = {}) {
 	const keyField = options.key || 'id';
-	if (options.select != null && typeof options.select !== 'function') {
-		throw new Error('redis presence: select must be a function');
-	}
 	// Zero-config presence copies the dedup key and nothing else. An explicit
 	// select is the application's own policy and its result is used as-is, apart
-	// from the reserved names the join drops (see withoutReservedNames).
-	const select = options.select ?? makeDefaultPresenceSelect(keyField);
-	if (options.select == null && (isSensitiveFieldName(keyField) || isStructurallyUnsafeFieldName(keyField))) {
+	// from the reserved names the join drops (see withoutReservedNames). Any
+	// falsy select takes the default, as in the adapter's in-memory plugin.
+	const select = options.select || makeDefaultPresenceSelect(keyField);
+	if (!options.select && (isSensitiveFieldName(keyField) || isStructurallyUnsafeFieldName(keyField))) {
 		console.warn(
 			`[extensions] redis presence: key field '${keyField}' is private or transport metadata, so the default ` +
 			'projection drops it and each connection gets its own presence entry. A presence key is ' +
@@ -134,7 +132,11 @@ export function createPresenceState(client, options = {}) {
 		}
 	}
 	if (typeof heartbeatInterval !== 'number' || !Number.isFinite(heartbeatInterval) || heartbeatInterval < 1) {
-		throw new Error('redis presence: heartbeat must be a positive number (ms)');
+		throw new Error(
+			'redis presence: heartbeat must be a positive number (ms). Unlike the in-memory plugin, 0 cannot turn it ' +
+			'off here: each heartbeat also renews the Redis TTL of every local entry, so without it every present ' +
+			'user would expire from the shared roster after `ttl` seconds.'
+		);
 	}
 	if (typeof presenceTtl !== 'number' || !Number.isFinite(presenceTtl) || presenceTtl < 1) {
 		throw new Error('redis presence: ttl must be a positive number (seconds)');
