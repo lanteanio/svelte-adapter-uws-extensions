@@ -898,7 +898,7 @@ export async function close(ws, { platform }) {
 |---|---|---|
 | `key` | `'id'` | Field in the selected data for user dedup (multi-tab). The default `select` never copies a credential-shaped or transport name; with one here, presence warns and gives each connection its own key, so the value cannot leak as the roster property name. |
 | `select` | the `key` field only | Extract the public roster data from userData; must return an object (`join()` throws a `TypeError` otherwise). The default copies only the `key` field, and only a string or finite-number value. An explicit `select` is used as-is apart from top-level `__`-prefixed, `constructor` and `prototype` names, so make it an allowlist. |
-| `heartbeat` | `30000` | TTL refresh interval in ms. Must be positive: unlike the in-memory plugin, `0` cannot turn it off, since without it every entry would expire after `ttl`. |
+| `heartbeat` | `30000` | TTL refresh interval in ms; any value above 0. Unlike the in-memory plugin, `0` cannot turn it off, since without it every entry would expire after `ttl`. |
 | `ttl` | `90` | Per-entry expiry in seconds. Entries from crashed instances expire individually after this period, even if other instances are still active on the same topic. |
 | `maxFieldsBytes` | `8192` | Maximum serialized bytes in one update; oversized or unserializable updates are dropped. |
 | `maxTotalFieldsBytes` | `65536` | Cumulative field budget per user, including serialized names and framing. An update exceeding it is dropped as a whole. |
@@ -1489,7 +1489,7 @@ export async function close(ws, { platform }) {
 
 | Option | Default | Description |
 |---|---|---|
-| `maxMembers` | `Infinity` | Maximum members allowed (enforced atomically) |
+| `maxMembers` | `1_000_000` | Maximum members allowed (enforced atomically); `Infinity` disables the cap |
 | `meta` | `{}` | Initial group metadata |
 | `memberTtl` | `120` | Member entry TTL in seconds. Entries from crashed instances expire after this period. |
 | `onJoin` | - | Called after a member joins |

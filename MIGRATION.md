@@ -209,6 +209,18 @@ round lifetimes to whole milliseconds, keep intervals at or below 2147483647 ms
 rather than a negative number. For the warning, fix the spelling it suggests or
 drop the key; it never stops startup.
 
+### Redis groups cap members at 1,000,000 by default
+
+**Symptom.** `group.join()` resolves `false` and `onFull` fires once a group
+holds 1,000,000 members, where it used to keep admitting.
+
+**Why.** `createGroup` takes the in-memory groups plugin's default cap, so a
+group behaves the same whichever implementation backs it. `group.maxMembers`
+reports the cap in effect.
+
+**Action.** Pass `maxMembers` explicitly for a group that should hold more,
+or `maxMembers: Infinity` for no cap.
+
 ### `redis/ratelimit` no longer exports its in-process floor helpers
 
 **Symptom.** `SyntaxError: The requested module

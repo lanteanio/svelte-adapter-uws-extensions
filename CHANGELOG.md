@@ -55,6 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Redis groups default `maxMembers` to `1_000_000`, as the in-memory groups plugin does, instead of no cap, and expose the resolved cap as `group.maxMembers`. A group that should hold more members passes a larger `maxMembers` or `Infinity`. See the [migration guide](MIGRATION.md#redis-groups-cap-members-at-1000000-by-default).
 - The Redis presence heartbeat timer starts on the tracker's first `join` or `sync`, as the in-memory plugin's does, instead of at construction; a tracker that is never used runs no timer.
 
 ### Changed
@@ -71,6 +72,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A `null` factory option takes the default, as an omitted one does. Many options were checked with `!== undefined` or destructuring defaults, so `null` failed construction instead: among them Redis replay `size` and `ttl`, alarm store, fence and idempotency `keyPrefix`, idempotency `ttl`, dead-letter `max`, Postgres `cleanupInterval`, presence `clientUpdateFields`, session `maxAgeMs`, task-runner `fenceTtl`, and `createNtpSource` `transport`. The pub/sub `systemChannel: null` keeps turning the health events off.
 - The Redis rate limiters accept a fractional `interval` or `blockDuration`, as the adapter's in-memory limiter does. Every expiry their scripts set is rounded up to whole milliseconds; a fractional value used to fail every consume or ban with a Redis error, and made the Redis upgrade bucket fail open.
 - Redis group `meta` is shallow-copied as the in-memory groups plugin copies it, and an empty `meta` object no longer fails the initial write.
+- Redis presence accepts a `heartbeat` between 0 and 1 ms, as the in-memory plugin does; Node runs such an interval every millisecond. Only `0` is still refused.
 - Redis presence and cursor read `select` as the in-memory plugins do: any falsy value (`false`, `''`, `0`) takes the default projection instead of throwing. The cursor still refuses a truthy non-function; presence, like the in-memory presence plugin, only fails on one when a join calls it.
 - Presence, cursor, groups and the pub/sub system channel use the adapter's tracked subscription helpers instead of writing its registry directly. Native membership, the per-connection cap, shared-codec cohorts and subscription accounting now move together, preventing uncharged internal topics and negative close totals.
 - The PostgreSQL schema inventory and operations guide include tasks version 3 and every alarm companion relation. A documentation regression derives store versions and relation names from the migration declarations.
