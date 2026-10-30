@@ -215,8 +215,8 @@ describe('redis groups', () => {
 
 		it('when a concurrent join fills the group after the count, the atomic join refuses and onFull gets the requested role', async () => {
 			// Both joins pass the count (the group is empty), so both run onJoin;
-			// the JOIN script admits one. This race is the only case where onJoin
-			// runs for a join that ends full.
+			// the JOIN script admits one. This race and the per-instance member
+			// cap are the only cases where onJoin runs for a join that ends full.
 			const calls = [];
 			const g = createGroup(client, 'race', {
 				maxMembers: 1,
@@ -232,9 +232,10 @@ describe('redis groups', () => {
 			g.destroy();
 		});
 
-		it('a capped join below the cap costs one HLEN and no count script; an uncapped one neither', async () => {
-			const cost = async (maxMembers) => {
-				const g = createGroup(client, 'cost-' + maxMembers, { maxMembers });
+		it('a capped join with onJoin below the cap costs one HLEN and no count script; otherwise neither', async () => {
+			let seq = 0;
+			const cost = async (maxMembers, onJoin) => {
+				const g = createGroup(client, 'cost-' + (seq++), { maxMembers, onJoin });
 				const evalSpy = vi.spyOn(client.redis, 'eval');
 				const hlenSpy = vi.spyOn(client.redis, 'hlen');
 				await g.join(mockWs({ id: 'a' }), platform);
@@ -244,8 +245,46 @@ describe('redis groups', () => {
 				g.destroy();
 				return counted;
 			};
-			expect(await cost(10)).toEqual({ hlen: 1, count: 0 });
-			expect(await cost(Infinity)).toEqual({ hlen: 0, count: 0 });
+			const onJoin = () => {};
+			expect(await cost(10, onJoin)).toEqual({ hlen: 1, count: 0 });
+			expect(await cost(Infinity, onJoin)).toEqual({ hlen: 0, count: 0 });
+			// Without onJoin the JOIN script's refusal has the same outcome.
+			expect(await cost(10, undefined)).toEqual({ hlen: 0, count: 0 });
+		});
+
+		it('a close() that lands during the capacity read stops the join before onJoin', async () => {
+			const calls = [];
+			const g = createGroup(client, 'close-during-read', { maxMembers: 5, onJoin: () => { calls.push('join'); } });
+			const hlen = client.redis.hlen.bind(client.redis);
+			const hlenSpy = vi.spyOn(client.redis, 'hlen').mockImplementation(async (key) => {
+				await g.close(platform);
+				return hlen(key);
+			});
+			expect(await g.join(mockWs({ id: 'a' }), platform)).toBe(false);
+			expect(calls).toEqual([]);
+			hlenSpy.mockRestore();
+			g.destroy();
+		});
+
+		it('a join of the same socket that completes during the capacity read makes the second one a no-op', async () => {
+			const calls = [];
+			const g = createGroup(client, 'same-ws', { maxMembers: 5, onJoin: () => { calls.push('join'); } });
+			const ws = mockWs({ id: 'a' });
+			const hlen = client.redis.hlen.bind(client.redis);
+			let first = null;
+			const hlenSpy = vi.spyOn(client.redis, 'hlen').mockImplementation(async (key) => {
+				// The second join's read resolves only after the first join is done.
+				if (first) await first;
+				return hlen(key);
+			});
+			first = g.join(ws, platform);
+			const second = g.join(ws, platform);
+			expect(await first).toBe(true);
+			expect(await second).toBe(true);
+			expect(calls).toEqual(['join']);
+			expect(await g.count()).toBe(1);
+			hlenSpy.mockRestore();
+			g.destroy();
 		});
 
 		it('a group whose stored entries reach the cap but are partly stale still admits, through the full count', async () => {

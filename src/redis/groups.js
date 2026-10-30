@@ -732,14 +732,16 @@ export function createGroup(client, name, options = {}) {
 
 			// As in the in-memory groups plugin, a full group refuses before
 			// onJoin runs, and onFull receives the role the caller asked for.
-			// With a finite cap that costs one HLEN per join. The hash also
+			// Without onJoin the JOIN script's refusal has the same outcome, so
+			// only a capped group with onJoin pays for this: one HLEN per join.
+			// The hash also
 			// holds stale entries, so HLEN never undercounts the live members:
 			// below the cap it proves there is room. Only when the stored
 			// entries reach the cap does COUNT_SCRIPT (an HGETALL that skips
 			// stale entries the way the JOIN script does) decide. Joins only,
 			// never messages.
 			const requestedRole = role;
-			if (Number.isFinite(maxMembers)) {
+			if (onJoin && Number.isFinite(maxMembers)) {
 				const stored = await withBreaker(b, () => redis.hlen(membersKey));
 				const live = Number(stored) < maxMembers
 					? Number(stored)
@@ -799,8 +801,8 @@ export function createGroup(client, name, options = {}) {
 			if (result[0] === 0) {
 				// The JOIN script's atomic check is the final word: a concurrent
 				// join can fill the group between the count above and this
-				// script. That race is the only case where onJoin ran for a join
-				// that ends full.
+				// script. That race and the per-instance member cap below are
+				// the only cases where onJoin ran for a join that ends full.
 				mRejected?.inc({ group: metricGroup });
 				if (onFull) onFull(ws, requestedRole);
 				return false;
@@ -818,7 +820,9 @@ export function createGroup(client, name, options = {}) {
 
 			// Per-instance cap on local member count. Treat saturation
 			// the same as a "group full" rejection - the caller already
-			// has graceful handling for that path.
+			// has graceful handling for that path. onJoin has already run
+			// here, which is the second case of onJoin for a join that ends
+			// full.
 			if (!localMembers.has(ws) && localMembers.size >= MAX_GROUPS_LOCAL_MEMBERS) {
 				mRejected?.inc({ group: metricGroup });
 				if (onFull) onFull(ws, requestedRole);
