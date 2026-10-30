@@ -74,7 +74,10 @@ it('a server deadline rolls back prior deletes and releases ownership for the ne
 		await budget.remove(`DELETE FROM ${tables[0]}`); await budget.query('SELECT pg_sleep(5)');
 	})).rejects.toThrow();
 	expect((await client.query(`SELECT id FROM ${tables[0]}`)).rows).toEqual([{id:1}]);
-	const result = await runCleanupPass(client,tables[0],async budget=> { await budget.remove(`DELETE FROM ${tables[0]}`); });
+	// The destroyed checkout's backend keeps the pass lock until the server
+	// has rolled its statement back, so the next pass may first find it held.
+	let result;
+	await expect.poll(async () => (result = await runCleanupPass(client,tables[0],async budget=> { await budget.remove(`DELETE FROM ${tables[0]}`); })).result, { timeout: 5000 }).not.toBe('contended');
 	expect(result).toEqual({result:'complete',rows:1});
 });
 

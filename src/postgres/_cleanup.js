@@ -3,6 +3,8 @@ import { clearTimer, monotonicNow, randomFloat, setTimer } from '../shared/runti
 const ROW_BUDGET = 1000;
 const PASS_MS = 1000;
 const BATCH_SIZE = 250;
+// Delay before a coalesced follow-up pass after a pass that could not run.
+const RETRY_MS = 100;
 const pendingCheckouts = new WeakSet();
 
 // Only retention work uses this transaction namespace. The table OID resolves
@@ -113,6 +115,13 @@ export function scheduleCleanup({ client, table, kind, interval, metrics, ready,
 		if (!trailing) { clearTimer(trailingTimer); trailingTimer = undefined; }
 		running = true;
 		const start = monotonicNow();
+		// With coalescing, a pass that may have left work behind queues one
+		// more: writes it did not see, a budget it exhausted, or a pass that
+		// could not run (another owner's pass may predate those writes, or a
+		// lock timeout rolled it back). The chain ends once a pass completes
+		// with no write arriving meanwhile, so the store converges after
+		// writes and contention stop even with the idle timer disabled.
+		let followUp = null;
 		try {
 			if (healthy && !healthy()) return;
 			await ready();
@@ -122,17 +131,20 @@ export function scheduleCleanup({ client, table, kind, interval, metrics, ready,
 			if (result.rows) removed?.inc({ store: kind }, result.rows);
 			if (result.detail !== undefined) committed?.(result.detail);
 			if (result.result !== 'waiting' && result.result !== 'stopped') success?.();
+			if (result.result === 'budget') followUp = 1;
+			else if (result.result === 'contended' || result.result === 'waiting') followUp = RETRY_MS;
 			return result;
 		} catch (error) {
 			runs?.inc({ store: kind, result: 'error' });
 			failure?.(error);
+			if (error?.code === '55P03') followUp = RETRY_MS;
 		} finally {
 			duration?.observe({ store: kind }, (monotonicNow() - start) / 1000);
 			running = false;
-			// A leading pass may queue one extra bounded pass. Writes during that
-			// trailing pass cannot extend the chain or the original caller's wait.
-			if (!stopped && !trailing && trailingRequested) {
-				trailingTimer = setTimer(() => { trailingTimer = undefined; return run(true); }, 1);
+			// Callers never wait for a queued pass, only for their own.
+			if (trailingRequested) followUp = 1;
+			if (!stopped && coalesce && followUp !== null && !trailingTimer) {
+				trailingTimer = setTimer(() => { trailingTimer = undefined; return run(true); }, followUp);
 				trailingTimer?.unref?.();
 			}
 			trailingRequested = false;

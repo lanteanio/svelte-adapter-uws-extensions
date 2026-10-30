@@ -41,9 +41,11 @@ is not a hard physical-storage cap or an exact expiry alarm. Replay publish-time
 trimming and logical read-expiry checks keep their existing behavior.
 
 Dead-letter writes use the same bounded maintenance as idle passes. Concurrent
-writes share local cleanup ownership. Writes arriving during a leading pass
-queue at most one trailing bounded pass, without extending the original write's
-wait or adding recurring timers. `destroy()` cancels a queued trailing pass.
+writes share local cleanup ownership. Writes arriving during a pass queue one
+more bounded pass after it, and so does a pass that exhausts its row budget
+(after 1 ms), finds another replica's pass running or times out on a lock
+(after 100 ms). A write waits only for its own pass, and the chain ends once a
+pass completes with no write arriving meanwhile. `destroy()` cancels a queued pass.
 TTL selection uses `failed_at`; size cleanup deletes the oldest ids of the
 tenant scope holding the most records (ties to the scope holding the oldest
 record) until `max` remain. The two policies alternate priority. `get`, `count`, `list` and `summary`
@@ -54,8 +56,8 @@ ignores an expired fence before it is deleted. The idle timer runs even when
 TTL is disabled so oversized queues and fence backlogs can drain after
 writes stop. An acknowledged INSERT keeps its returned id when cleanup fails,
 times out or loses ownership to another replica.
-With `cleanupInterval: 0`, residual record and fence backlog needs another
-write to trigger cleanup, including writes that arrive during the trailing pass.
+With `cleanupInterval: 0`, the queued passes still drain record backlog after
+writes stop; fences that expire later need another write.
 `max` is a retention target, not a strict post-write physical row count.
 
 Bounded transactions add round trips to isolated dead-letter captures. A local

@@ -80,21 +80,64 @@ describe('bounded PostgreSQL maintenance', () => {
 			expect(scheduled).toHaveLength(timers + 1);
 		} finally { finish(); cleanup.stop(); }
 	});
-	it('coalesces only one trailing pass and stop cancels a queued pass', async () => {
+	it('queues one pass per pass that saw writes, ends when writes stop, and stop cancels it', async () => {
 		vi.useFakeTimers();
-		const { client } = checkout(); let cleanup;
-		const work = vi.fn(async () => { await cleanup.run(); });
+		const { client } = checkout(); let cleanup; let writes = 3;
+		// Each of the first passes sees one write arrive while it runs, the last
+		// write landing during a queued pass.
+		const work = vi.fn(async () => { if (writes-- > 0) await cleanup.run(); });
 		cleanup = scheduleCleanup({ client, table: 'cache', kind: 'dead-letter', interval: 0, coalesce: true, ready: async () => {}, work });
 		try {
 			await cleanup.run();
 			expect(work).toHaveBeenCalledTimes(1);
 			await vi.advanceTimersByTimeAsync(1);
 			expect(work).toHaveBeenCalledTimes(2);
+			await vi.advanceTimersByTimeAsync(1);
+			await vi.advanceTimersByTimeAsync(1);
+			expect(work).toHaveBeenCalledTimes(4);
 			expect(vi.getTimerCount()).toBe(0);
-			await cleanup.run();
-			expect(work).toHaveBeenCalledTimes(3);
+			writes = 1; await cleanup.run();
+			expect(work).toHaveBeenCalledTimes(5);
 			cleanup.stop(); await vi.advanceTimersByTimeAsync(1000);
-			expect(work).toHaveBeenCalledTimes(3);
+			expect(work).toHaveBeenCalledTimes(5);
+		} finally { cleanup.stop(); }
+	});
+	it('follows a coalesced pass that exhausted its budget, met another owner or timed out on a lock', async () => {
+		vi.useFakeTimers();
+		for (const [outcome, delay] of [['budget', 1], ['contended', 100], ['lock timeout', 100]]) {
+			const { client, tx } = checkout({ acquired: outcome !== 'contended', remove: 250 });
+			let passes = 0;
+			const work = vi.fn(async budget => {
+				passes++;
+				if (passes > 1) return;
+				if (outcome === 'budget') while (budget.available) await budget.remove('DELETE');
+				if (outcome === 'lock timeout') throw Object.assign(new Error('canceling statement due to lock timeout'), { code: '55P03' });
+			});
+			const failure = vi.fn();
+			const cleanup = scheduleCleanup({ client, table: 'cache', kind: 'dead-letter', interval: 0, coalesce: true, ready: async () => {}, work, failure });
+			try {
+				await cleanup.run();
+				if (outcome === 'contended') tx.query.mockImplementation(async ({ text }) => ({ rows: text.includes('advisory') ? [{ acquired: true }] : [], rowCount: 0 }));
+				const before = client.connect.mock.calls.length;
+				await vi.advanceTimersByTimeAsync(delay - 1);
+				expect(client.connect, outcome).toHaveBeenCalledTimes(before);
+				await vi.advanceTimersByTimeAsync(1);
+				expect(client.connect, outcome).toHaveBeenCalledTimes(before + 1);
+				// The follow-up completed with nothing left, so the chain ends.
+				await vi.advanceTimersByTimeAsync(1000);
+				expect(client.connect, outcome).toHaveBeenCalledTimes(before + 1);
+				expect(vi.getTimerCount(), outcome).toBe(0);
+			} finally { cleanup.stop(); }
+		}
+	});
+	it('does not follow a pass of a store that does not coalesce', async () => {
+		vi.useFakeTimers();
+		const { client } = checkout();
+		const cleanup = scheduleCleanup({ client, table: 'cache', kind: 'idempotency', interval: 0, ready: async () => {}, work: async budget => { while (budget.available) await budget.remove('DELETE'); } });
+		try {
+			await cleanup.run();
+			await vi.advanceTimersByTimeAsync(1000);
+			expect(client.connect).toHaveBeenCalledTimes(1);
 		} finally { cleanup.stop(); }
 	});
 	it('the public idempotency store retains live entries while draining expired rows over multiple bounded ticks', async () => {

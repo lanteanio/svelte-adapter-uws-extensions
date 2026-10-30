@@ -287,8 +287,10 @@ describe('fair-share PostgreSQL dead-letter eviction', () => {
 			expect(ids.every(id => /^\d+$/.test(id))).toBe(true);
 			expect(breaker.state).toBe('healthy');
 			await dlq.add(tenantRecord('@t/t0/x', 300));
+			// Passes that saw later writes, ran out of budget or lost a lock queue
+			// another, so the store returns to max once the captures stop.
+			await expect.poll(() => dlq.count(), { timeout: 5000 }).toBeLessThanOrEqual(20);
 			expect(await scopeCounts()).toEqual(await actualCounts());
-			expect(await dlq.count()).toBeLessThanOrEqual(20);
 		} finally { breaker.destroy(); }
 	});
 
