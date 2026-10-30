@@ -136,22 +136,47 @@ been lost, and the client reloads the affected state (svelte-realtime puts it
 on its `degradation` store).
 
 - An instance asks its own clients when its subscriber missed messages: the
-  Redis connection dropped and the channel had to be restored, or activation
-  failed before it succeeded. The event goes out once the breaker is healthy
-  and the channel is back, without a `degraded` before it when the breaker
-  never opened.
+  Redis connection dropped and the channel had to be restored, activation
+  failed before it succeeded, or another instance reported dropped relays. The
+  event goes out once the breaker is healthy and the channel is back, without a
+  `degraded` before it when the breaker never opened.
 - An instance whose relays were dropped (refused by the open breaker, failed
-  in Redis before the breaker tripped, or shed by a full relay queue) cannot
-  reach the other instances' clients itself. When its breaker recovers it
-  relays one `recovered` envelope on `systemChannel`. Every instance with a
-  breaker answers it with a `recovered` event of its own once its own breaker
-  is healthy; an instance without one delivers the envelope unchanged.
+  in Redis, or shed by a full relay queue) cannot reach the other instances'
+  clients itself. It relays one `recovered` envelope on `systemChannel` when
+  its breaker recovers, or, when the breaker never opened, after the next
+  relay that succeeds. The envelope carries the request and a timestamp,
+  nothing about the sender's outage. An instance with a breaker answers it with
+  a `recovered` event of its own once its own breaker is healthy; an instance
+  without one delivers the envelope unchanged. A `recovered` envelope an
+  application relays itself, without `recovery.refetch`, is delivered as is.
 
 In an asymmetric partition, where one instance loses Redis and the others keep
-it, the clients on both sides are therefore asked to refetch. The envelope
-carries the request and a timestamp, nothing about the sender's outage. A
-degradation policy whose `recovery` envelope sets `refetch` keeps its value;
-otherwise `refetch: true` is added to it. Drops that never trip the breaker are
-reported at its next recovery. The bookkeeping is two flags per bus, set only on
-the failure paths. The sharded bus and the PostgreSQL notification bridge
-publish no `degraded` or `recovered` events.
+it, the clients on both sides are therefore asked to refetch.
+
+A `recovered` event that asks for a refetch waits one second, and the reports
+that arrive meanwhile merge into it. After an outage every instance saw, each
+instance relays a request; a client gets one refetch event, not one per
+instance. When the breaker's own `recovered` event asks for one, that event
+waits too; one that does not goes out at once, and a refetch event follows if
+requests arrive. A breaker that opens again during the wait drops the event,
+and its next recovery carries the request.
+
+Every `recovered` event goes through the degradation policy: its `recovery`
+fields and `recoveryJitterMs` apply, and an event outside a breaker transition
+passes the policy `{ from: 'healthy', to: 'healthy' }`. A policy whose
+`recovery` envelope sets `refetch` keeps its value; otherwise `refetch: true`
+is added to it. `pubsub_recovered_total` counts every `recovered` event,
+refetch-only ones included. The bookkeeping is two flags per bus, set on the
+failure paths; a successful relay flush checks one of them.
+
+The sharded bus does the same when it is given a `breaker`, on the fixed topic
+`__realtime` (the pub/sub bus's default `systemChannel`): it publishes
+`degraded` and `recovered` events for its breaker, without a degradation
+policy, and follows the shard channel of `__realtime` (`channelPrefix` plus
+`shardKey('__realtime')`), where the instances exchange their requests. The
+Redis user needs that channel; a refused subscription is reported once as
+`EXTENSIONS-ERR-SHARDED-HEALTH-CHANNEL` and retried. The sharded bus does not
+subscribe connections to `__realtime`: put them there from your `open` hook
+with `platform.subscribe(ws, '__realtime')`, or with the pub/sub bus's
+`hooks.open` when you run both. The PostgreSQL notification bridge publishes no
+`degraded` or `recovered` events.

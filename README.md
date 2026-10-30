@@ -3358,7 +3358,7 @@ Requires `svelte-adapter-uws >= 0.5.0-next.4`: the `topPublishers` field on the 
 | `pubsub_parse_errors_total` | counter | Malformed envelopes dropped on receive |
 | `pubsub_relay_batch_size` | histogram | Relay batch size per flush |
 | `pubsub_degraded_total` | counter | Auto-emitted `degraded` events |
-| `pubsub_recovered_total` | counter | Auto-emitted `recovered` events |
+| `pubsub_recovered_total` | counter | Auto-emitted `recovered` events, including the ones that only ask clients to refetch after lost delivery, so it can exceed `pubsub_degraded_total` |
 
 **Sharded pub/sub bus**
 
@@ -3853,7 +3853,7 @@ Both the topic name and the auto-emission are configurable:
 | `onDegraded` | - | Server-side handler invoked once on the healthy -> non-healthy transition |
 | `onRecovered` | - | Server-side handler invoked once on the non-healthy -> healthy transition |
 
-Auto-emission is local-only - Redis is what's degraded, so the event reaches local clients via the underlying platform without attempting a relay. Each instance reports its own breaker state to its own clients. If you need different semantics (cross-instance forwarding, custom payload, filtering by failure type), use `breaker.subscribe(handler)` to register your own listener and emit through whichever channel you prefer. Nothing lost during an outage is replayed. When messages may have been lost, on this instance or, through one relayed request, on others, a `recovered` event carries `recovery: { refetch: true }` so clients reload the affected state; see [Refetch after lost pub/sub delivery](docs/redis-outages.md#refetch-after-lost-pubsub-delivery).
+Auto-emission is local-only - Redis is what's degraded, so the event reaches local clients via the underlying platform without attempting a relay. Each instance reports its own breaker state to its own clients. If you need different semantics (cross-instance forwarding, custom payload, filtering by failure type), use `breaker.subscribe(handler)` to register your own listener and emit through whichever channel you prefer. Nothing lost during an outage is replayed. When messages may have been lost, on this instance or, through one relayed request, on others, a `recovered` event carries `recovery: { refetch: true }` so clients reload the affected state; the sharded bus does the same on `__realtime` when it has a breaker. See [Refetch after lost pub/sub delivery](docs/redis-outages.md#refetch-after-lost-pubsub-delivery).
 
 ---
 

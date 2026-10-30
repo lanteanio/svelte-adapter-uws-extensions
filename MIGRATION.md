@@ -1174,13 +1174,29 @@ directly, as earlier README examples did, skips it. Route those frames through
 On a pub/sub bus with a breaker, a `recovered` frame carries
 `recovery: { refetch: true }` when the instance's subscriber may have missed
 messages, and an instance whose relays were dropped publishes one
-`recovered` envelope on `systemChannel` to the other instances when its
-breaker recovers, so their clients get such a frame too. A client that treated
-every `recovered` frame as the end of its own instance's outage now also sees
-one without a `degraded` before it. During a rolling deploy an instance of the
-previous release delivers that envelope to its clients unchanged, even while
-its own breaker is open. A degradation policy whose `recovery` envelope sets
-`refetch` keeps its value.
+`recovered` envelope on `systemChannel` to the other instances, when its
+breaker recovers or after its next successful relay, so their clients get such
+a frame too. A client that treated every `recovered` frame as the end of its
+own instance's outage now also sees one without a `degraded` before it. A
+frame that asks for a refetch is published one second late, so requests from
+several instances merge into it; that includes a breaker `recovered` frame
+whose policy sets `refetch: true`. A degradation policy whose `recovery`
+envelope sets `refetch` keeps its value, and its `recovery` fields and
+`recoveryJitterMs` apply to every `recovered` frame. `pubsub_recovered_total`
+counts the refetch-only frames too, so it no longer pairs with
+`pubsub_degraded_total`.
+
+During a rolling deploy an instance of the previous release delivers that
+envelope to its clients unchanged, even while its own breaker is open, so they
+can read it as that instance's recovery. Instances that disagree on
+`systemChannel` also deliver it unchanged, or drop it as a `__` topic.
+
+A sharded bus given a `breaker` now publishes `degraded` / `recovered` on
+`__realtime` and subscribes that topic's shard channel after activation
+(`uws:sharded:__realtime` with the default prefix and shard key). Allow the
+Redis user that channel; a refusal is reported as
+`EXTENSIONS-ERR-SHARDED-HEALTH-CHANNEL`. Tests that count a sharded bus's
+platform publishes with a breaker see these events.
 
 ## 5. Test-only
 

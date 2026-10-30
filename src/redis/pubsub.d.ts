@@ -17,7 +17,10 @@ export interface PubSubBusOptions {
 	 * `recovery: { refetch: true }`: on this instance after its subscriber
 	 * missed messages (also without a preceding `degraded`), and on the
 	 * other instances after this one's relays were dropped, through one
-	 * `recovered` envelope it relays on this topic when its breaker recovers.
+	 * `recovered` envelope it relays on this topic when its breaker recovers
+	 * or after its next successful relay. Such an event waits one second so
+	 * the requests of several instances merge into it, and goes through the
+	 * `degradationPolicy` like every `recovered` event.
 	 *
 	 * @default '__realtime'
 	 */
