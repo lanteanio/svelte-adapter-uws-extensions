@@ -176,14 +176,15 @@ reading the value from an environment variable, `Number(process.env.X)` yields
 
 ### Factory options refuse values they cannot honor
 
-**Symptom.** A `TypeError` from the factory call, shaped
+**Symptom.** An `Error` from the factory call, shaped
 `<module>: <option> must be <what it accepts> - got <value> (<type>).`, for
 example `postgres jobs: autoMigrate must be true or false - got "false"
 (string).` Two more shapes cover the numeric bounds:
 `<module>: <option> must be no greater than 2147483647 milliseconds, because
 Node stores a timer delay in a signed 32-bit integer ...` and `<module>:
 <option> must be a whole number of milliseconds - got 1500.5. Redis refuses a
-fractional expiry ...`. Separately, a `console.warn` starting
+fractional expiry ...` (for the session, leader, lock, registry, presence,
+cursor and group lifetimes). Separately, a `console.warn` starting
 `[extensions] unknown <factory> option(s):` names keys the factory ignores.
 
 **Why.** Each refused value used to be accepted and then did something other
@@ -192,7 +193,10 @@ still migrated), a string or zero lease fell back to the default, an interval
 above 2147483647 ms made Node fire the timer every millisecond, and a
 fractional Redis lifetime failed every write that set it. The
 [changelog](CHANGELOG.md) lists every option. `undefined` and `null` are
-still "not set", and a falsy `breaker` or `metrics` is still none.
+"not set", and a falsy `breaker` or `metrics` is still none. Options the
+adapter's in-memory presence, cursor, groups and rate-limit plugins also read
+accept every value those plugins accept, so swapping one for its Redis
+counterpart never meets a new refusal.
 
 **Action.** Pass the type the message names. Convert environment values
 explicitly (`process.env.AUTO_MIGRATE !== 'false'`, `Number(process.env.TTL_MS)`),

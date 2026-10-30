@@ -905,7 +905,7 @@ export async function close(ws, { platform }) {
 | `maxTopicsPerConnection` | `100` | Maximum presence topics tracked per connection; excess joins are ignored. |
 | `topicThrottle` | `16` | Minimum diff batching interval in milliseconds; `0` flushes on the next timer turn. |
 | `clientUpdateFields` | unset | Field names a client may write through a wire `presence-update` frame. Unset, a client frame writes nothing. Set, only the listed names are taken, and the list is also the whole rule for direct `update()` calls in place of the reserved-name guard; every listed name is one clients can write, and prototype and `__`-prefixed names are always left out. A non-array value throws at construction. See [Field-level updates](#field-level-updates). |
-| `transient` | `[]` | Dynamic field names (set via `update()`) broadcast live but NEVER persisted to Redis and NEVER included in the `state` snapshot or heartbeat roster. A (re)joining or swept-then-readded client never inherits a stale value (e.g. a disconnected typer). Durable `update()` fields not listed here persist and ride the snapshot. Must be an array of strings. See [Field-level updates](#field-level-updates). |
+| `transient` | `[]` | Dynamic field names (set via `update()`) broadcast live but NEVER persisted to Redis and NEVER included in the `state` snapshot or heartbeat roster. A (re)joining or swept-then-readded client never inherits a stale value (e.g. a disconnected typer). Durable `update()` fields not listed here persist and ride the snapshot. See [Field-level updates](#field-level-updates). |
 | `keyspaceNotifications` | `false` | Subscribe to the server's `__keyevent@*__:del`. When a per-topic presence hash is removed (its last field's TTL lapsed - the instance-died scenario), this instance's local subscribers receive an empty `state` event. See [Keyspace cleanup mode](#keyspace-cleanup-mode). |
 | `binary` | `true` | Send presence frames as compact binary `0x03` frames to clients that negotiated `presence.protocol:1`, and the identical JSON frames to everyone else, as the adapter's presence plugin does. `false` forces JSON for every client. |
 | `consistencyAuditIntervalMs` | `5000` | Interval in ms (`0` up to 2147483647) for the per-instance consistency auditor, a slow unref'd background check that this instance's per-topic member-count map and local reverse index agree on their distinct-user cardinality. Never runs on the hot path. A desync logs and counts under `redis.presence.local-index-desync` (soft); only one that persists across two consecutive audits of the same bounded window escalates to a deferred process restart. Set `0` to disable entirely; a negative or non-number value throws. |
@@ -1335,8 +1335,8 @@ export async function message(ws, { data, platform }) {
 | Option | Default | Description |
 |---|---|---|
 | `points` | *required* | Tokens available per interval |
-| `interval` | *required* | Refill interval in ms; whole milliseconds with `refill: 'window'` and half milliseconds with `'sliding'`, because Redis receives it in an expiry |
-| `blockDuration` | `0` | Auto-ban duration in whole ms (0 = no ban) |
+| `interval` | *required* | Refill interval in ms |
+| `blockDuration` | `0` | Auto-ban duration in ms (0 = no ban) |
 | `keyBy` / `tenant` / `budget` | `'ip'` / adapter attribution / `'principal'` | Principal key, optional tenant resolver, and allowance scope (`'principal'` or `'tenant'`). Tenant mode requires an id and ignores `keyBy`; [scope and administration](docs/tenancy.md#one-allowance-per-tenant). |
 | `refill` | `'window'` | Refill algorithm: `'window'` (fixed-window counter), `'sliding'` (sliding-window-counter), or `'gcra'` (leaky-bucket / GCRA). See [Refill modes](#refill-modes). |
 | `localFloorOnStorageFailure` | `false` | Degraded mode for `consume()`: decide on an in-process token bucket while Redis is unreachable (or the breaker is open) instead of rejecting the promise. `true` reuses `points`/`interval`; `{ points?, interval? }` sets a tighter per-instance budget. The floor mirrors the selected `refill` mode. |
@@ -4263,7 +4263,7 @@ export const bucket = createLocalUpgradeBucket({ perMinute: 60, maxEntries: 1000
 | Option | Default | Description |
 |---|---|---|
 | `perMinute` | *required* | Upgrades permitted per IP per minute in the `normal` posture. Positive integer. |
-| `blockDuration` | `0` | Auto-ban duration in ms once a budget is spent. 0 = no ban. The Redis bucket needs whole milliseconds, because Redis receives it in an expiry. |
+| `blockDuration` | `0` | Auto-ban duration in ms once a budget is spent. 0 = no ban. |
 | `elevated` | inherits `normal` | `{ perMinute, blockDuration? }` for the `elevated` posture. |
 | `siege` | inherits `elevated` | `{ perMinute, blockDuration? }` for the `siege` posture. |
 | `breaker` | - | Fail-open circuit breaker wrapping the Redis call (`createUpgradeBucket` only). |
