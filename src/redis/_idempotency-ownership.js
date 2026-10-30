@@ -17,8 +17,10 @@ if ((not metadata[1] or not metadata[2]) and redis.call('EXISTS', key) ~= 0)
   or not expires or expires < 0 or expires > 9007199254740991 or expires ~= math.floor(expires) then
   return redis.error_reply('invalid idempotency ownership metadata')
 end
+-- HKEYS, not HLEN: HLEN still counts an owner field whose TTL has passed
+-- until the server reclaims it, which would keep an empty index alive.
 local function expireIndex()
-  if redis.call('HLEN', key) <= 2 then
+  if #redis.call('HKEYS', key) <= 2 then
     redis.call('DEL', key)
   elseif unarmed == 0 then
     redis.call('PEXPIREAT', key, string.format('%.0f', expires))

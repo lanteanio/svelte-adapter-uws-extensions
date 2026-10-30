@@ -256,5 +256,20 @@ describe('redis idempotency (integration)', () => {
 			expect(await store.purgeUser('t1', 'u-idx')).toBe(1);
 			expect((await store.acquire('idx-k')).acquired).toBe(true);
 		});
+
+		it('an expired owner field does not keep an otherwise empty index alive', async () => {
+			const store = createIdempotencyStore(client);
+			const slot = await store.acquire('idx-live', undefined, { user: 'u-live' });
+			const idxKey = client.key('idem:byuser:v2\0\0u-live');
+			await client.redis.hset(idxKey, '__idem_pending__:dead', 'a' + client.key('idem:idx-dead'));
+			await client.redis.hpexpire(idxKey, 100, 'FIELDS', 1, '__idem_pending__:dead');
+			// Past the field's TTL, but usually before the server's background
+			// expiry has reclaimed it, so HLEN would still count it.
+			await waitRedisMs(client, 150);
+
+			await slot.abort();
+
+			expect(await client.redis.exists(idxKey)).toBe(0);
+		});
 	});
 });
