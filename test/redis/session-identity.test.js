@@ -2,6 +2,7 @@ import { beforeEach, it, expect } from 'vitest';
 import { mockRedisClient } from '../helpers/mock-redis.js';
 import { sessionIdentityContract } from '../helpers/session-identity-contract.js';
 import { createDistributedSession } from '../../src/redis/session.js';
+import { createCircuitBreaker } from '../../src/shared/breaker.js';
 let client;
 beforeEach(() => { client = mockRedisClient('session-identity:'); });
 sessionIdentityContract(() => client);
@@ -46,4 +47,18 @@ it('renews the coverage in the background before a write has to wait for it', as
 	} finally {
 		client.redis.eval = evaluate;
 	}
+});
+
+it('reports a failed renewal to the breaker once and still writes', async () => {
+	const breaker = createCircuitBreaker({ failureThreshold: 5, resetTimeout: 30_000 });
+	const legacy = createDistributedSession(client, { breaker });
+	const evaluate = client.redis.eval;
+	client.redis.eval = async () => { throw new Error('READONLY'); };
+	try {
+		for (let i = 0; i < 5; i++) await legacy.set('k' + i, { v: i });
+	} finally {
+		client.redis.eval = evaluate;
+	}
+	expect(breaker.state).not.toBe('broken');
+	expect(await client.redis.get(client.key('sess:k4'))).not.toBeNull();
 });

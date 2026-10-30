@@ -92,6 +92,22 @@ function failScripts(redis) {
 	return restore;
 }
 
+// Delay every Lua script by `ms`, as on a slow link.
+function delayScripts(redis, ms) {
+	const real = typeof redis.sendCommand === 'function';
+	const original = real ? redis.sendCommand : redis.eval;
+	const wait = () => new Promise((resolve) => setTimeout(resolve, ms));
+	if (real) {
+		redis.sendCommand = function (command, ...rest) {
+			if (!/^eval/i.test(String(command?.name))) return original.call(this, command, ...rest);
+			return wait().then(() => original.call(this, command, ...rest));
+		};
+	} else {
+		redis.eval = async function (...args) { await wait(); return original.apply(this, args); };
+	}
+	return () => { if (real) redis.sendCommand = original; else redis.eval = original; };
+}
+
 // Every PEXPIRE key, the command that slides a session record.
 function recordExpiries(redis) {
 	const original = redis.pexpire;
@@ -534,12 +550,14 @@ export function sessionIdentityContract(getClient) {
 
 		it('renews the coverage when the key is lost under a running legacy writer', async () => {
 			const s = sessions();
-			const legacy = createDistributedSession(getClient(), {});
+			// The key is checked at most once per ttlMs / 8 (50 ms here).
+			const legacy = createDistributedSession(getClient(), { ttlMs: 400 });
 			expect(await s.purgeUser('ta', 'x')).toBe(0);
 			await legacy.set('warm', owner('tb', '1'));
 			await legacy.delete('warm');
 			// Evicted, or lost in a failover.
 			await getClient().redis.del(coverageKey());
+			await new Promise((resolve) => setTimeout(resolve, 60));
 			await legacy.set('old', owner('ta', '42'));
 			expect(await record('old')).not.toBeNull();
 			await expect(s.purgeUser('ta', '42')).rejects.toMatchObject({ legacyResidue: true });
@@ -547,10 +565,11 @@ export function sessionIdentityContract(getClient) {
 
 		it('renews the coverage after a flush and a clean rescan', async () => {
 			const s = sessions();
-			const legacy = createDistributedSession(getClient(), {});
+			const legacy = createDistributedSession(getClient(), { ttlMs: 400 });
 			await legacy.set('warm', owner('tb', '1'));
 			for (const key of await scanKeys(getClient().redis, getClient().key('*'))) await getClient().redis.del(key);
 			expect(await s.purgeUser('ta', 'x')).toBe(0);
+			await new Promise((resolve) => setTimeout(resolve, 60));
 			await legacy.set('old', owner('ta', '42'));
 			await expect(s.purgeUser('ta', '42')).rejects.toMatchObject({ legacyResidue: true });
 		});
@@ -611,37 +630,105 @@ export function sessionIdentityContract(getClient) {
 			}
 		});
 
-		it('does not send a legacy write with less than 1.25 ttlMs of coverage it cannot renew', async () => {
+		it('waits for a renewal before a legacy write with less than 1.25 ttlMs of coverage left', async () => {
 			const ttlMs = 400;
 			const legacy = createDistributedSession(getClient(), { ttlMs });
 			await legacy.set('warm', { v: 1 });
 			// Less than 1.25 * ttlMs of the 1.5 * ttlMs is left.
 			await new Promise((resolve) => setTimeout(resolve, 150));
-			const restore = failScripts(getClient().redis);
+			const restore = delayScripts(getClient().redis, 100);
+			const redis = getClient().redis;
+			const set = redis.set;
+			const left = [];
+			redis.set = async function (key, ...args) {
+				if (key === getClient().key('sess:late')) left.push(await redis.pttl(coverageKey()));
+				return set.call(this, key, ...args);
+			};
 			try {
-				await expect(legacy.set('late', { v: 1 })).rejects.toThrow('coverage unavailable');
+				await legacy.set('late', { v: 1 });
 			} finally {
+				redis.set = set;
 				restore();
 			}
-			expect(await record('late')).toBeNull();
+			expect(left[0]).toBeGreaterThan(1.25 * ttlMs);
 		});
 
-		it('rejects legacy writes while the coverage cannot be renewed, retrying after a pause', async () => {
+		it('writes while the coverage cannot be renewed and covers the writes once it can', async () => {
+			const s = sessions();
+			expect(await s.purgeUser('ta', 'x')).toBe(0);
 			const legacy = createDistributedSession(getClient(), { ttlMs: 400 });
 			const restore = failScripts(getClient().redis);
 			try {
-				await expect(legacy.set('a', { v: 1 })).rejects.toThrow('coverage unavailable');
+				await legacy.set('a', owner('ta', '42'));
 				const attempts = restore.attempts();
-				await expect(legacy.set('b', { v: 1 })).rejects.toThrow('coverage unavailable');
+				await legacy.set('b', owner('ta', '43'));
 				// The second write did not try again at once.
 				expect(restore.attempts()).toBe(attempts);
 			} finally {
 				restore();
 			}
-			expect(await record('a')).toBeNull();
-			await new Promise((resolve) => setTimeout(resolve, 120));
-			await legacy.set('c', { v: 1 });
-			expect(await record('c')).not.toBeNull();
+			expect(await record('a')).not.toBeNull();
+			expect(await record('b')).not.toBeNull();
+			// The retry runs on its own, without another write.
+			await new Promise((resolve) => setTimeout(resolve, 200));
+			expect(await getClient().redis.exists(coverageKey())).toBe(1);
+			await expect(s.purgeUser('ta', '42')).rejects.toMatchObject({ legacyResidue: true });
+		});
+
+		it('sends no more background renewals while they fail than the retry pause allows', async () => {
+			const ttlMs = 400;
+			const legacy = createDistributedSession(getClient(), { ttlMs });
+			await legacy.set('warm', { v: 1 });
+			// Between 1.25 and 1.375 * ttlMs of coverage is left.
+			await new Promise((resolve) => setTimeout(resolve, 70));
+			const restore = failScripts(getClient().redis);
+			try {
+				for (let i = 0; i < 20; i++) await legacy.set('k' + i, { v: i });
+				expect(restore.attempts()).toBeLessThanOrEqual(2);
+			} finally {
+				restore();
+			}
+		});
+
+		it('checks the coverage key at most one at a time and once per interval', async () => {
+			const legacy = createDistributedSession(getClient(), {});
+			await legacy.set('warm', { v: 0 });
+			const redis = getClient().redis;
+			const exists = redis.exists;
+			let checks = 0;
+			redis.exists = function (...args) { checks++; return exists.apply(this, args); };
+			try {
+				await Promise.all(Array.from({ length: 20 }, (_, i) => legacy.set('k' + i, { v: i })));
+				for (let i = 0; i < 20; i++) await legacy.touch('k' + i);
+			} finally {
+				redis.exists = exists;
+			}
+			expect(checks).toBeLessThanOrEqual(1);
+		});
+
+		it('drops the coverage estimate after several short suspends that add up', async () => {
+			const ttlMs = 400;
+			let offset = 0;
+			setRuntimeEnv({ clock: { monotonic: () => performance.now() - offset } });
+			try {
+				const s = sessions({ ttlMs });
+				const legacy = createDistributedSession(getClient(), { ttlMs });
+				expect(await s.purgeUser('ta', 'x')).toBe(0);
+				await legacy.set('warm', owner('tb', '1'));
+				await legacy.delete('warm');
+				// Three suspends of 90 ms each, under ttlMs / 4 apiece.
+				for (let i = 0; i < 3; i++) {
+					const started = performance.now();
+					await new Promise((resolve) => setTimeout(resolve, 90));
+					offset += performance.now() - started;
+					await legacy.set('w' + i, owner('tb', '1'));
+				}
+				await legacy.set('old', owner('ta', '42'));
+				const redis = getClient().redis;
+				expect(await redis.pttl(coverageKey())).toBeGreaterThan(await redis.pttl(getClient().key('sess:old')));
+			} finally {
+				resetRuntimeEnv();
+			}
 		});
 
 		it('does not read the coverage key of a nested legacy store as a legacy session', async () => {

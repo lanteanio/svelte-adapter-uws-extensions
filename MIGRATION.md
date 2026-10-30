@@ -693,28 +693,40 @@ on the server's clock: before a write or TTL slide (`set`, `create`, the
 close-time persist, `touch`, a refreshing `get` or load) it waits for a
 renewal when less than `1.25 * ttlMs` is left, so a write delayed by up to
 `ttlMs / 4` still lands inside the coverage, and it renews in the background,
-without waiting, when less than `1.375 * ttlMs` is left. That is at most one
-renewal per store instance per `ttlMs / 8`, shared by concurrent calls; every
-other operation is a plain command as before, plus one `EXISTS` of the key sent
-with it and not awaited. A qualified purge reports `legacyResidue` while the
-key exists. The key appears in every deployment that uses the Redis session
-store, with or without `forgetIdentity`, and `clear()` keeps it.
+without waiting, when less than `1.375 * ttlMs` is left. A renewal succeeds at
+most once per store instance per `ttlMs / 8`; one at a time is in flight,
+shared by concurrent calls, and after a failure the next is not sent for a
+second (`ttlMs / 4` when shorter). Every other operation is a plain command as
+before. On top of that, a legacy write or slide sends one `EXISTS` of the key,
+not awaited, at most one at a time and at most once per second (`ttlMs / 8`
+when shorter) per instance: a bounded rate per instance, whatever its session
+traffic. A qualified purge reports `legacyResidue` while the key exists. The
+key appears in every deployment that uses the Redis session store, with or
+without `forgetIdentity`, and `clear()` keeps it.
+
+A renewal that fails never fails the write: the session is written and a
+timer retries the renewal after the pause until one succeeds, which covers the
+sessions written meanwhile, since they expire within `ttlMs` of their write.
+While the key cannot be read, qualified purges fail and report the erasure
+incomplete. Only the failed renewal itself is reported to the circuit breaker.
+On a Redis Cluster the key lives on one slot: while its master is down,
+legacy writes go on and purges fail; once it is back, a purge in the pause
+before the next retry can miss the sessions written during the outage.
 
 Keep both keys under a memory policy that does not evict them: `noeviction`,
-or `volatile-ttl`, which evicts the soonest-expiring keys first. Reads do not
-refresh their access time, so an LRU or LFU policy evicts the coverage key
-early. A lost coverage key (eviction, a flush, a failover that lost the last
-renewal) is noticed by the `EXISTS` sent with the next legacy write, which
-renews it; a purge in the round trip between that write and the renewal can
-miss the session it wrote. The same holds for a session write still in flight
-from a request when a purge runs, as with any store: stop the writes for a
-user before erasing them.
-
-On a Redis Cluster the coverage key lives on one slot. While that slot's
-master is down, a legacy write that has to wait for a renewal (the first one
-of an instance, then any after `ttlMs / 8` without a successful background
-renewal) rejects; after a failed renewal, further such writes reject without
-contacting Redis for up to a second before the store tries again.
+or `volatile-ttl`, which evicts the soonest-expiring keys first, and the
+coverage key outlives every session it covers. Reads do not refresh a key's
+access time, so an LRU or LFU policy evicts the coverage key early. Once the
+key is lost (evicted, flushed, or dropped by a failover that lost the last
+renewal), purges miss every live legacy session until an instance without
+`forgetIdentity` writes or slides a session again: that call's `EXISTS` notices
+the loss and renews the key. An instance that stays idle keeps the gap open
+until its sessions expire. Eviction is the only way to lose the key in normal
+operation, which the memory policy above rules out; after a flush or a
+failover that lost writes, delete `sess:identity:v1:legacy` as well so the
+next purge scans again. A session write still in flight from a request when a
+purge runs can likewise land after it, as with any store: stop the writes for
+a user before erasing them.
 
 To end the window early once no instance without `forgetIdentity` runs and
 the remaining legacy sessions are gone or adopted, delete
