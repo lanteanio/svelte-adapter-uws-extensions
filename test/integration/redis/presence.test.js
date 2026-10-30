@@ -225,7 +225,7 @@ describeIntegration('redis presence (integration)', () => {
 			// Plant a second instance's field directly to simulate cross-instance.
 			await client.redis.hset(userHashKey('room', 'alice'), 'other-instance', String(Date.now()));
 
-			// A fresh tracker on a "third instance" joining alice sees HLEN > 0
+			// A fresh tracker on a "third instance" joining alice sees live fields
 			// and returns 0; presence.join should NOT broadcast a join diff
 			// for cross-instance idempotency.
 			const presence2 = makeTracker();
@@ -245,7 +245,7 @@ describeIntegration('redis presence (integration)', () => {
 			expect(await presence.count('does-not-exist')).toBe(0);
 		});
 
-		it('list and count work directly via HGETALL / HLEN on the per-topic hash', async () => {
+		it('list and count read the per-topic hash directly', async () => {
 			const presence = makeTracker();
 			await presence.join(mockWs({ id: 'alice', name: 'Alice' }), 'room', platform);
 			await presence.join(mockWs({ id: 'bob', name: 'Bob' }), 'room', platform);
@@ -259,7 +259,7 @@ describeIntegration('redis presence (integration)', () => {
 	});
 
 	describe('LEAVE_SCRIPT cross-instance behavior', () => {
-		it('user present on another instance suppresses the leave broadcast (HLEN > 0)', async () => {
+		it('user present on another instance suppresses the leave broadcast', async () => {
 			const presence = makeTracker();
 			const ws = mockWs({ id: 'alice', name: 'Alice' });
 			await presence.join(ws, 'room', platform);
@@ -272,7 +272,7 @@ describeIntegration('redis presence (integration)', () => {
 			await presence.leave(ws, platform);
 			presence.flushDiffs();
 
-			// LEAVE_SCRIPT saw HLEN=1 (other-instance still there) -> returned 0
+			// LEAVE_SCRIPT saw other-instance still there -> returned 0
 			// -> no leave broadcast.
 			expect(leaveDiffsFor(platform, 'alice')).toHaveLength(0);
 
@@ -280,6 +280,24 @@ describeIntegration('redis presence (integration)', () => {
 			// (we did not HDEL it).
 			expect(await client.redis.hexists(userHashKey('room', 'alice'), 'other-instance')).toBe(1);
 			expect(await client.redis.hexists(topicHashKey('room'), 'alice')).toBe(1);
+		});
+
+		it('an expired membership of another instance does not suppress the leave', async () => {
+			const presence = makeTracker();
+			const ws = mockWs({ id: 'alice', name: 'Alice' });
+			await presence.join(ws, 'room', platform);
+			await client.redis.hset(userHashKey('room', 'alice'), 'dead-instance', String(Date.now()));
+			await client.redis.hpexpire(userHashKey('room', 'alice'), 100, 'FIELDS', 1, 'dead-instance');
+			// Past the field's TTL, but usually before the server's background
+			// expiry has reclaimed it, so HLEN would still count it.
+			await waitRedisMs(client, 150);
+
+			platform.reset();
+			await presence.leave(ws, platform);
+			presence.flushDiffs();
+
+			expect(leaveDiffsFor(platform, 'alice')).toHaveLength(1);
+			expect(await client.redis.hexists(topicHashKey('room'), 'alice')).toBe(0);
 		});
 
 		it('the broadcast suppression scales to many cross-instance fields without scanning', async () => {

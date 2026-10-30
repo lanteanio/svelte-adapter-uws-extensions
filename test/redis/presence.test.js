@@ -456,6 +456,19 @@ describe('redis presence', () => {
 			expect(await presence.count('room')).toBe(2);
 		});
 
+		it('count does not include an expired field the server has not reclaimed yet', async () => {
+			await presence.join(mockWs({ id: '1', name: 'Alice' }), 'room', platform);
+			const topicKey = client.key('presence:topic:{room}');
+			await client.redis.hset(topicKey, 'ghost', JSON.stringify({ data: { id: 'ghost' }, ts: Date.now() }));
+			await client.redis.hpexpire(topicKey, 50, 'FIELDS', 1, 'ghost');
+			vi.useFakeTimers({ now: Date.now() + 1000, toFake: ['Date'] });
+			// HLEN on a real server keeps counting a field whose TTL has passed
+			// until the background expiry cycle removes it.
+			client.redis.hlen = async () => 2;
+			expect(await presence.count('room')).toBe(1);
+			expect((await presence.list('room')).map((u) => u.id)).toEqual(['1']);
+		});
+
 		it('returns empty list / zero count for unknown topics', async () => {
 			expect(await presence.list('nope')).toEqual([]);
 			expect(await presence.count('nope')).toBe(0);

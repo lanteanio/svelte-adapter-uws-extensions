@@ -1131,10 +1131,14 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 				if (script.includes('PRESENCE_UPDATE')) {
 					return evalPresenceUpdate(args);
 				}
-				// Presence LEAVE (Design G: HDEL + HLEN check, no scan)
-				if (script.includes('HDEL') && script.includes('HLEN')
-					&& !script.includes('HPEXPIRE') && !script.includes('hdel')) {
+				// Presence LEAVE (HDEL, then count the live memberships left)
+				if (script.includes('PRESENCE_LEAVE')) {
 					return evalPresenceLeaveG(args, numKeys);
+				}
+				// Presence COUNT (live fields of the per-topic hash)
+				if (script.includes('PRESENCE_COUNT')) {
+					pruneExpiredFields(args[0]);
+					return hashes.get(args[0])?.size ?? 0;
 				}
 				// Presence join script (hset + expire, no dedup scan) - legacy
 				if (script.includes('hset') && script.includes('expire') && !script.includes('hdel') && !script.includes('suffix')) {
@@ -1857,7 +1861,7 @@ export function mockRedisClient(keyPrefix = '', options = {}) {
 		}
 
 		// Presence LEAVE (Design G) - HDEL my instanceId from per-user hash,
-		// HLEN check, conditional HDEL from per-topic hash if zero remaining.
+		// live-membership check, conditional HDEL from per-topic hash if none remain.
 		function evalPresenceLeaveG(args, numKeys = 2) {
 			const userHashKey = args[0];
 			const topicHashKey = args[1];

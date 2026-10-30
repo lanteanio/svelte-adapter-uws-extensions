@@ -25,13 +25,13 @@
  *   - `{prefix}presence:pending:{topic}` - hash, field=userKey, private identity generations
  *       and committed-identity fence. Per-user expiry, excluded from public roster reads.
  *   - `{prefix}presence:user:{topic}:{userKey}` - hash, field=instanceId, value=membership token
- *       One entry per instance presenting or reserving this user. HLEN determines
- *       final-membership removal; first public identity commit determines JOIN.
+ *       One entry per instance presenting or reserving this user. Its live
+ *       fields determine final-membership removal; first public identity commit determines JOIN.
  *
  * Per-field TTLs via HPEXPIRE replace the previous timestamp-filter scan in
  * the Lua leave script: stale entries from a crashed instance auto-expire
  * field-by-field via Redis itself rather than via application-side filters.
- * Mass-disconnect is now O(N) Redis-blocked work (one HDEL+HLEN per leave)
+ * Mass-disconnect is now O(N) Redis-blocked work (one HDEL+HKEYS of the user's own hash per leave)
  * rather than O(N x M_topic) (one HGETALL+linear-suffix-scan per leave).
  *
  *   - Channel `{prefix}presence:events:{topic}` - cross-instance pub/sub.
@@ -68,7 +68,7 @@ import { WsClosedError } from '../shared/errors.js';
 import { isFramableTopic } from '../shared/frame-topic.js';
 import { addWsSubscription, removeWsSubscription, OBSERVER_LANE, markSideEffectHooks } from '../shared/ws-subscriptions.js';
 import { createPresenceWireCodec } from 'svelte-adapter-uws/plugins/presence';
-import { JOIN_SCRIPT, FINALIZE_JOIN_SCRIPT, ROLLBACK_JOIN_SCRIPT, RESTORE_IDENTITY_SCRIPT, LEAVE_SCRIPT, UPDATE_SCRIPT, INTERNAL_EVENTS } from './presence/lua.js';
+import { JOIN_SCRIPT, FINALIZE_JOIN_SCRIPT, ROLLBACK_JOIN_SCRIPT, RESTORE_IDENTITY_SCRIPT, LEAVE_SCRIPT, UPDATE_SCRIPT, COUNT_SCRIPT, INTERNAL_EVENTS } from './presence/lua.js';
 import { makeKeys } from './presence/keys.js';
 import { deepEqual, parseEntries, setLocalData, makePublicData } from './presence/data.js';
 import { createLocalIndex } from './presence/local-index.js';
@@ -1501,11 +1501,11 @@ export function createPresence(client, options = {}) {
 		},
 
 		async count(topic) {
-			// HLEN on the per-topic hash. Per-field auto-expiry means HLEN
-			// reflects the live count without needing a dedup or timestamp
-			// scan; one userKey per live user is the storage invariant.
+			// The live fields of the per-topic hash, counted on the server; one
+			// userKey per live user is the storage invariant. Not HLEN: it
+			// also counts expired fields Redis has not reclaimed yet.
 			await ensureRedis74();
-			return withBreaker(b, () => redis.hlen(topicHashKey(topic)));
+			return Number(await withBreaker(b, () => evalCached(redis, COUNT_SCRIPT, 1, topicHashKey(topic))));
 		},
 
 		metrics() {

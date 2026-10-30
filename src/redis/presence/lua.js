@@ -51,7 +51,7 @@ local userKey, topicKey, pendingKey = KEYS[1], KEYS[2], KEYS[3]
 local instance, user, token = ARGV[1], ARGV[2], ARGV[6]
 local ts, ttl = tonumber(ARGV[4]), tonumber(ARGV[5])
 if not ts or not ttl then return redis.error_reply('PRESENCE_JOIN: newTs/ttlMs must be numeric') end
-local first = redis.call('HLEN', userKey) == 0
+local first = #redis.call('HKEYS', userKey) == 0
 redis.call('HSET', userKey, instance, token or ts)
 redis.call('HPEXPIRE', userKey, ttl, 'FIELDS', 1, instance)
 local raw = redis.call('HGET', topicKey, user)
@@ -131,7 +131,7 @@ export const ROLLBACK_JOIN_SCRIPT = `
 local userKey, topicKey, pendingKey = KEYS[1], KEYS[2], KEYS[3]
 local instance, user, token = ARGV[1], ARGV[2], ARGV[3]
 if ARGV[4] == '1' and redis.call('HGET', userKey, instance) == token then redis.call('HDEL', userKey, instance) end
-if redis.call('HLEN', userKey) == 0 then
+if #redis.call('HKEYS', userKey) == 0 then
   local removed = redis.call('HGET', topicKey, user)
   redis.call('HDEL', topicKey, user)
   redis.call('HDEL', pendingKey, user)
@@ -180,7 +180,7 @@ return {raw, ARGV[8]}
 /**
  * Lua script for atomic LEAVE. Removes this instance's field from the
  * per-user hash and broadcasts only when no other instance still has the
- * user (HLEN == 0 after our HDEL).
+ * user (no live field left after our HDEL).
  *
  * KEYS[1] = userHashKey  (presence:user:{topic}:{userKey})
  * KEYS[2] = topicHashKey (presence:topic:{topic})
@@ -200,18 +200,22 @@ return {raw, ARGV[8]}
  * Publishing from the script means peers learn of the leave as soon as Redis
  * runs it, even when the leaving instance stops before reading the reply.
  *
- * The O(1) HLEN check replaces the previous O(M_topic) suffix-scan loop.
- * Mass-disconnect of N users is now O(N) Redis-blocked Lua time rather
- * than O(N x M_topic).
+ * The remaining memberships are counted with HKEYS, not HLEN: HLEN also
+ * counts fields whose TTL has passed until Redis reclaims them in the
+ * background, so a crashed instance's expired field would suppress the leave.
+ * HKEYS skips them and costs O(instances presenting this user), so
+ * mass-disconnect of N users stays O(N) Redis-blocked Lua time rather than
+ * O(N x M_topic). The join and rollback scripts count the same way.
  */
 export const LEAVE_SCRIPT = `
+-- PRESENCE_LEAVE
 local userKey = KEYS[1]
 local topicKey = KEYS[2]
 local instanceId = ARGV[1]
 local userKeyStr = ARGV[2]
 
 redis.call('HDEL', userKey, instanceId)
-if redis.call('HLEN', userKey) == 0 then
+if #redis.call('HKEYS', userKey) == 0 then
   local removed = redis.call('HDEL', topicKey, userKeyStr)
   if KEYS[3] then redis.call('HDEL', KEYS[3], userKeyStr) end
   if removed == 1 and ARGV[4] and ARGV[4] ~= '' then redis.call('PUBLISH', ARGV[3], ARGV[4]) end
@@ -265,6 +269,17 @@ parsed.ts = newTs
 redis.call('HSET', topicKey, userKey, cjson.encode(parsed))
 redis.call('HPEXPIRE', topicKey, ttlMs, 'FIELDS', 1, userKey)
 return 1
+`;
+
+/**
+ * Count the live users on a topic. HLEN would also count fields whose TTL has
+ * passed until Redis reclaims them in the background; HKEYS skips them. Only
+ * the count leaves the server.
+ * KEYS[1] = topicHashKey (presence:topic:{topic})
+ */
+export const COUNT_SCRIPT = `
+-- PRESENCE_COUNT
+return #redis.call('HKEYS', KEYS[1])
 `;
 
 /**

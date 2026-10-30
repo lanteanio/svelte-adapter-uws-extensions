@@ -31,7 +31,7 @@ export function makeKeys(client) {
 	}
 
 	// Per-user hash for a topic: one field per instance currently presenting this
-	// user. HLEN decides when the final membership leaves.
+	// user. Its live fields decide when the final membership leaves.
 	function userHashKey(topic, userKey) {
 		return client.key('presence:user:{' + topic + '}:' + userKey);
 	}
