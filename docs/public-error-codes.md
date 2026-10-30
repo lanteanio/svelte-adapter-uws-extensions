@@ -21,7 +21,7 @@ Branch on an error's `code` when deciding how to handle a recoverable failure. M
 | `TASK_FENCE_LOST` | PostgreSQL task execution | Another worker owns the task and its canonical outcome was not available before the deadline. |
 | `IDEMPOTENCY_RESULT_TOO_LARGE` | Redis and PostgreSQL idempotency | The encoded result exceeds the configured byte cap. |
 | `IDEMPOTENCY_LEASE_LOST` | Redis and PostgreSQL idempotency | The pending slot is no longer owned by this call. |
-| `ERASURE_INDEX_INCOMPLETE` | Redis sessions with `forgetUserId` | `set`, `create` or `touch` stored or extended nothing because `forgetUserId` threw or returned a non-string, or the erasure index write failed; or `purgeUser` could not erase every indexed session. `err.cause` holds the underlying error; retry after repairing it. |
+| `ERASURE_INDEX_INCOMPLETE` | Redis sessions with `forgetUserId` or `forgetIdentity` | `set`, `create` or `touch` stored or extended nothing because `forgetUserId` threw or returned a non-string, `forgetIdentity` threw or returned a malformed identity, or the erasure index write failed; a qualified `set` or `create` also rejects, with its record deleted, when an erasure of its identity ran while it was writing; or `purgeUser` could not erase every indexed session. `err.cause` holds the underlying error; retry after repairing it. |
 | `WS_CLOSED` | Presence and cursor operations | The socket closed during the operation; the operation rolled back. |
 | `SUBSCRIBE_DENIED` | Presence and cursor operations | The platform refused access to the underlying topic. |
 | `WEBHOOK_CIRCUIT_OPEN` | Redis webhook controls | Delivery was refused while the target's breaker was open. |
@@ -39,7 +39,7 @@ Branch on an error's `code` when deciding how to handle a recoverable failure. M
 | `TASK_WORKER_ADMISSION_EXPIRED` | PostgreSQL task workers | The supplied reservation was released before execution. |
 | `TASK_WORKER_RESERVATION_IN_USE` | PostgreSQL task workers | The supplied reservation already has an executing task. |
 | `OPERATION_ABORTED` | PostgreSQL task worker fallback | An abort without a supplied reason cancelled the work; supplied abort reasons remain unchanged. |
-| `ERASURE_INCOMPLETE` | Composed forget store | One or more stores failed. Inspect failures and partialCounts, repair the cause and retry. |
+| `ERASURE_INCOMPLETE` | Composed forget store; tenant-qualified session, registry and task `purgeUser` | One or more stores failed. Inspect failures and partialCounts, repair the cause and retry. A qualified store sets `legacyResidue: true` when records written without an identity may still hold the user, and `removed` to the count it committed; see [tenant-qualified erasure identity](tenant-erasure-identity.md). |
 | `REDIS_CONNECTION_CLOSED` | Managed Redis subscribers | The owned connection ended and cannot complete the queued operation. Native driver errors retain their own codes. |
 | `REDIS_CLUSTER_PUBLISHER_UNAVAILABLE` | Redis pub/sub relay | No ready master can publish this relay batch. |
 | `BUS_DEACTIVATED` | Redis pub/sub, sharded bus and publish-rate aggregator lifecycle | Deactivation interrupted activation or a pending shard follow. |

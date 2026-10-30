@@ -461,6 +461,28 @@ guarantee. Existing task rows have null `user_id`: backfill from trusted
 application identity if they must participate in user erasure. The package
 cannot infer that identity from arbitrary historical input.
 
+### Tasks schema version 4: identity stamp and per-tenant dispatch
+
+Only for tables migrated outside the package, with `autoMigrate: false`. With
+the default `autoMigrate: true` version 4 is applied on first use.
+
+**Symptom.** `column "identity_version" does not exist` from task `run` and
+`enqueue`, and `postgres.tasks.sweep.failed` from the dispatch sweep, on every
+call.
+
+**Why.** Every task insert writes the identity stamp (`identity_version`,
+`tenant_id`), and the dispatch claim reads the new
+`idx_svti_tasks_pending_scope` index to serve tenants fairly instead of in one
+global creation-order queue.
+
+**Action.** Run `migrate(client, { store: 'tasks' })` before deploying. Version 4
+adds two nullable columns, a check that an unstamped row has no tenant,
+`idx_svti_tasks_identity` and `idx_svti_tasks_pending_scope`, and drops
+`idx_svti_tasks_pending_created`. Existing rows stay unstamped. Stop runners of
+the earlier release first: their task purge deletes by raw user id, including
+rows stamped for other tenants. To use `forgetIdentity`, follow the
+[tenant-qualified erasure rollout](docs/tenant-erasure-identity.md#rollout).
+
 ### Other PostgreSQL stores and readiness
 
 Replay adds a user identity and sequence epoch; idempotency adds erasure identity
@@ -631,6 +653,24 @@ a reserved token now makes `purgeUser` reject before deleting any sessions. With
 writers paused, reconcile those tokens and affected index hashes against trusted
 application records; the upgrade does not reconstruct missing ownership mappings
 or automatically delete colliding data. See [session token rules](./docs/session-tokens.md).
+
+### Redis sessions reserve the `identity:` token prefix
+
+All token operations also reject tokens beginning with `identity:`, with or
+without an erasure extractor; that namespace holds the tenant-qualified erasure
+index. Server-minted tokens are unaffected. Stop issuing such tokens before
+upgrading.
+
+### `createForgetStore` requires an explicit tenant
+
+**Symptom.** `forget-store: tenant id is required - pass null for the
+untenanted scope` from `purgeUser(undefined, userId)`.
+
+**Why.** An omitted tenant was read as the untenanted scope, so a qualified
+store erased only the `null`-tenant identity and reported success.
+svelte-realtime's `live.forget` already passes `null` or a tenant id.
+
+**Action.** Pass `null` for the untenanted scope in direct calls.
 
 ### Presence join and cursor attach reject when the socket closes mid-call
 
