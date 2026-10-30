@@ -191,6 +191,13 @@ it('requires PostgreSQL dead letters, erasure tombstones and scope counts togeth
 	}
 });
 
+it('requires PostgreSQL task rows and their enqueue receipts together', () => {
+	expect(() => validateConfig({ schemaVersion: 1, postgres: { stores: { tasks: 'svti_tasks', 'task-receipts': 'svti_tasks_receipts' } } })).not.toThrow();
+	for (const stores of [{ tasks: 'svti_tasks' }, { 'task-receipts': 'svti_tasks_receipts' }]) {
+		expect(() => validateConfig({ schemaVersion: 1, postgres: { stores } })).toThrow('incomplete_restore_group');
+	}
+});
+
 it('requires PostgreSQL alarm rows, retained generation authority and executions together', () => {
 	const all = { alarms: 'svti_alarms', 'alarm-generations': 'svti_alarms_generations', 'alarm-executions': 'svti_alarms_executions' };
 	expect(() => validateConfig({ schemaVersion: 1, postgres: { stores: all } })).not.toThrow();

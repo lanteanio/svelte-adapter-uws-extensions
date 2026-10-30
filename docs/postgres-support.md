@@ -266,7 +266,7 @@ server for every store.
 | Replay | Adds event `user_id`, unique identity and retention indexes, sequence `epoch` with default 0 (the store writes a random value per seq space), and sequence `last_used_at`. | First store operation or `ready()`. | Await `store.ready()`. |
 | Idempotency | Adds `user_id`, `tenant_id`, `owner_token` and tenant/user index. | Starts at construction. | Await `store.ready()`. |
 | Jobs | Adds nullable trace columns, nonnegative attempts and consistent claim timestamps. | First store operation or `ready()`. | Await `queue.ready()`. |
-| Tasks | Adds nullable trace columns, `user_id` and user index. | Starts at construction. | Await `runner.ready()` before producers and handlers. |
+| Tasks | Adds nullable trace columns, `user_id` and user index, the identity stamp, and the `<table>_receipts` table for `enqueueOnce()` receipts. | Starts at construction. | Await `runner.ready()` before producers and handlers. |
 | Dead letter | New PostgreSQL store in this release series. | First store operation or `ready()`. | Await `store.ready()`. |
 | Alarms | New PostgreSQL store in this release series. | Starts at construction. | Await `store.ready()` before scheduling. |
 
@@ -342,7 +342,7 @@ start stores with `autoMigrate: false`. Readiness requires these privileges:
 | --- | --- |
 | Replay events `svti_replay` and counters `svti_replay_seq` | SELECT, INSERT, UPDATE, DELETE |
 | Jobs `svti_jobs` | SELECT, INSERT, UPDATE, DELETE |
-| Tasks `svti_tasks` | SELECT, INSERT, UPDATE, DELETE |
+| Tasks `svti_tasks` and enqueue receipts `svti_tasks_receipts` | SELECT, INSERT, UPDATE, DELETE |
 | Idempotency `svti_idempotency` | SELECT, INSERT, UPDATE, DELETE |
 | Dead letters `svti_dead_letter`, erasure fences `svti_dead_letter_purges` and scope counts `svti_dead_letter_scopes` | SELECT, INSERT, UPDATE, DELETE |
 | Alarm schedules `svti_alarms` | SELECT, INSERT, UPDATE, DELETE |

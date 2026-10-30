@@ -150,6 +150,34 @@
 			"restoreGroup": "postgres-tasks"
 		},
 		{
+			"id": "task-receipts",
+			"table": "svti_tasks_receipts",
+			"columns": {
+				"scope": "text",
+				"svti_tasks_id": "uuid",
+				"input": "text",
+				"identity_version": "integer",
+				"tenant_id": "text",
+				"user_id": "text",
+				"created_at": "bigint",
+				"dedup_expires_at": "bigint"
+			},
+			"indexColumns": [
+				[
+					"scope"
+				],
+				[
+					"dedup_expires_at"
+				],
+				[
+					"identity_version",
+					"tenant_id",
+					"user_id"
+				]
+			],
+			"restoreGroup": "postgres-tasks"
+		},
+		{
 			"id": "dead-letter",
 			"table": "svti_dead_letter",
 			"columns": {

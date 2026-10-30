@@ -84,7 +84,8 @@ implementation.
 Save a private JSON scope file describing the stores actually deployed. Omit a
 backend that is not used. PostgreSQL names may be schema-qualified; all components
 must be lowercase SQL identifiers. Replay requires both event and sequence tables;
-dead letters require `dead-letter`, `dead-letter-erasure` and `dead-letter-tenants` together; alarms
+dead letters require `dead-letter`, `dead-letter-erasure` and `dead-letter-tenants` together; tasks
+require `tasks` and `task-receipts` together; alarms
 require the `alarms`, `alarm-generations` and `alarm-executions` tables together.
 Redis keyPrefix is the client prefix. The optional prefixes map replaces each
 family's store-level prefix, including empty strings.
@@ -99,6 +100,7 @@ family's store-level prefix, including empty strings.
       "replay": "public.svti_replay",
       "replay-sequence": "public.svti_replay_seq",
       "tasks": "public.svti_tasks",
+      "task-receipts": "public.svti_tasks_receipts",
       "idempotency": "public.svti_idempotency"
     }
   },

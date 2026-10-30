@@ -63,7 +63,8 @@
 		{
 			"subpath": "postgres/tasks",
 			"tables": [
-				"svti_tasks"
+				"svti_tasks",
+				"svti_tasks_receipts"
 			],
 			"initialization": "construction",
 			"ready": true,
@@ -76,9 +77,10 @@
 				"CHECK status IN ('pending','running','committed','failed')",
 				"CHECK attempts >= 0",
 				"version 3: idx_svti_tasks_pending_created(created_at) WHERE status = 'pending'",
-				"version 4: identity_version INTEGER, tenant_id TEXT, CHECK (identity_version IS NULL AND tenant_id IS NULL) OR (identity_version IS NOT NULL AND identity_version = 1), idx_svti_tasks_identity(identity_version, tenant_id, user_id), idx_svti_tasks_pending_scope(identity_version, name, tenant_id, created_at) WHERE status = 'pending'; drops idx_svti_tasks_pending_created"
+				"version 4: identity_version INTEGER, tenant_id TEXT, CHECK (identity_version IS NULL AND tenant_id IS NULL) OR (identity_version IS NOT NULL AND identity_version = 1), idx_svti_tasks_identity(identity_version, tenant_id, user_id), idx_svti_tasks_pending_scope(identity_version, name, tenant_id, created_at) WHERE status = 'pending'; drops idx_svti_tasks_pending_created",
+				"version 5: svti_tasks_receipts(scope TEXT PRIMARY KEY, svti_tasks_id UUID, input TEXT, identity_version INTEGER, tenant_id TEXT, user_id TEXT, created_at BIGINT, dedup_expires_at BIGINT), CHECK (identity_version IS NULL AND tenant_id IS NULL) OR (identity_version IS NOT NULL AND identity_version = 1), CHECK dedup_expires_at > created_at, idx_svti_tasks_rcpt_expiry(dedup_expires_at), idx_svti_tasks_rcpt_owner(identity_version, tenant_id, user_id)"
 			],
-			"rollbackLimit": "Retain nullable columns; old terminal rows and column-only readers are rehearsed. Drain handlers and preserve fence/receipt data. An earlier release fails automatic migration against the version 4 ledger; one with autoMigrate false keeps running, but writes rows without an identity stamp, claims without tenant fairness and erases by raw user id across tenants, so stop earlier runners before enabling forgetIdentity."
+			"rollbackLimit": "Retain nullable columns; old terminal rows and column-only readers are rehearsed. Drain handlers and preserve fence/receipt data. An earlier release fails automatic migration against the version 4 ledger; one with autoMigrate false keeps running, but writes rows without an identity stamp, claims without tenant fairness and erases by raw user id across tenants, so stop earlier runners before enabling forgetIdentity. An earlier release fails automatic migration against the version 5 ledger and neither reads nor erases enqueue receipts, so its purgeUser leaves them in place; keep the receipts table through a rollback so receipts already returned stay recoverable until they expire."
 		},
 		{
 			"subpath": "postgres/dead-letter",
@@ -134,10 +136,12 @@
 			1,
 			2,
 			3,
-			4
+			4,
+			5
 		],
 		"version3Stores": ["postgres/replay", "postgres/tasks", "postgres/dead-letter", "postgres/alarm-store"],
 		"version4Stores": ["postgres/tasks", "postgres/dead-letter", "postgres/alarm-store"],
+		"version5Stores": ["postgres/tasks"],
 		"checksum": "sha256",
 		"restoreWithStores": true
 	}

@@ -115,7 +115,33 @@ export function schemaFor({ store, table = defaults[store] } = {}) {
 			indexSql(table, scope),
 			`DROP INDEX CONCURRENTLY IF EXISTS ${pending.name}`
 		]);
-		schema.checkpoints[4] = schema.tables;
+		schema.checkpoints[4] = schema.tables.map(relation => ({ ...relation, columns: [...relation.columns], indexes: [...relation.indexes], checks: [...relation.checks] }));
+		// Durable enqueue receipts: one mapping per JSON-encoded
+		// [tenantId, name, idempotencyKey] scope, holding the task id, the exact
+		// validated input bytes, the erasure owner stamp and database-time
+		// epoch-millisecond creation and expiry. No foreign key: task cleanup
+		// must not remove a live mapping.
+		const receipts = {
+			name: `${table}_receipts`,
+			columns: [text('scope', true), ['svti_tasks_id', 'uuid', true], text('input', true), ['identity_version', 'integer', false], text('tenant_id'), text('user_id'), ['created_at', 'bigint', true], ['dedup_expires_at', 'bigint', true]],
+			primary: ['scope'],
+			indexes: [index('rcpt_expiry', ['dedup_expires_at']), index('rcpt_owner', ['identity_version', 'tenant_id', 'user_id'])],
+			checks: [
+				check('rcpt_owner', '(identity_version IS NULL AND tenant_id IS NULL) OR (identity_version IS NOT NULL AND identity_version = 1)'),
+				check('rcpt_expiry', 'dedup_expires_at > created_at')
+			],
+			additions: [],
+			privileges: ['SELECT', 'INSERT', 'UPDATE', 'DELETE']
+		};
+		schema.tables.push(receipts);
+		const mapping = [`CREATE TABLE IF NOT EXISTS ${receipts.name} (${receipts.columns.map(columnSql).join(', ')}, PRIMARY KEY (scope))`];
+		for (const entry of receipts.checks) {
+			mapping.push(`DO $migration$ BEGIN ALTER TABLE ${receipts.name} ADD CONSTRAINT ${entry.name} CHECK (${entry.expression}) NOT VALID; EXCEPTION WHEN duplicate_object THEN NULL; END $migration$`);
+			mapping.push(`ALTER TABLE ${receipts.name} VALIDATE CONSTRAINT ${entry.name}`);
+		}
+		for (const entry of receipts.indexes) mapping.push(indexSql(receipts.name, entry));
+		versions.push(mapping);
+		schema.checkpoints[5] = schema.tables;
 	}
 	if (store === 'alarm-store') {
 		const authority = { name: `${table}_generations`, columns: [text('topic', true), ['reserved', 'bigint', true, '0'], ['committed', 'bigint', true, '0']], primary: ['topic'], indexes: [], checks: [check('authority', 'reserved >= 0 AND committed >= 0 AND reserved >= committed')], privileges: ['SELECT', 'INSERT', 'UPDATE'] };
