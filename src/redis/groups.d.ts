@@ -6,7 +6,11 @@ import type { CircuitBreaker } from '../shared/breaker.js';
 export type GroupRole = 'member' | 'admin' | 'viewer';
 
 export interface RedisGroupOptions {
-	/** Maximum members allowed. @default Infinity */
+	/**
+	 * Maximum members allowed. When full, `join()` returns `false` and
+	 * `onFull` fires. Pass `Infinity` to disable the cap.
+	 * @default 1_000_000
+	 */
 	maxMembers?: number;
 	/** Initial group metadata. */
 	meta?: Record<string, any>;
@@ -40,6 +44,9 @@ export interface RedisGroupOptions {
 export interface RedisGroup {
 	/** The group name. */
 	readonly name: string;
+
+	/** The resolved member cap, including the default when none was passed. */
+	readonly maxMembers: number;
 
 	/** Get group metadata from Redis. */
 	getMeta(): Promise<Record<string, any>>;

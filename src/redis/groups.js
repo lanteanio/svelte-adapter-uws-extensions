@@ -148,7 +148,7 @@ return liveCount
 
 /**
  * @typedef {Object} RedisGroupOptions
- * @property {number} [maxMembers=Infinity] - Maximum members allowed
+ * @property {number} [maxMembers=1_000_000] - Maximum members allowed; `Infinity` disables the cap
  * @property {Record<string, any>} [meta] - Initial group metadata
  * @property {number} [memberTtl=120] - Member entry TTL in seconds. Entries from crashed instances expire after this.
  * @property {number} [maxEnvelopeBytes=1048576] - Reject inbound bus envelopes larger than this many bytes BEFORE `JSON.parse` runs, and refuse to publish outbound events past the same bound (every peer would drop them on receipt). Defends against bus-side DoS in shared-Redis deployments.
@@ -208,7 +208,9 @@ export function createGroup(client, name, options = {}) {
 		throw new Error('redis group: name must be a non-empty string');
 	}
 
-	const maxMembers = options.maxMembers ?? Infinity;
+	// The in-memory groups plugin's default, so a group holds the same cap
+	// whichever implementation backs it.
+	const maxMembers = options.maxMembers ?? 1_000_000;
 	const memberTtl = options.memberTtl ?? 120;
 	if (typeof memberTtl !== 'number' || !Number.isFinite(memberTtl) || memberTtl < 1) {
 		throw new Error('redis group: memberTtl must be a positive number (seconds)');
@@ -680,6 +682,7 @@ export function createGroup(client, name, options = {}) {
 	/** @type {RedisGroup} */
 	const group = {
 		get name() { return name; },
+		get maxMembers() { return maxMembers; },
 
 		async getMeta() {
 			if (b) b.guard();
