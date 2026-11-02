@@ -12,6 +12,7 @@
 
 import type { RedisClient } from '../redis/index.js';
 import type { PgClient } from '../postgres/index.js';
+import type { Platform } from 'svelte-adapter-uws';
 
 export {
 	esc,
@@ -68,7 +69,7 @@ export function mockRedisClient(
 
 // - Mock Platform ------------------------------------------------------------
 
-export interface MockPlatform {
+interface MockPlatformState {
 	/** All `publish()` calls recorded as `{ topic, event, data, options }`. */
 	published: Array<{ topic: string; event: string; data: any; options?: any }>;
 	/** Batched publishes with their call-level compression option. */
@@ -155,19 +156,15 @@ export interface MockPlatform {
 	reset(): void;
 }
 
+/** Adapter members plus the mock's recorders and configurable defaults. */
+export interface MockPlatform extends Omit<Platform, keyof MockPlatformState>, MockPlatformState {}
+
 /**
  * Create an in-memory Platform mock that records all publish/send calls.
  */
 export function mockPlatform(): MockPlatform;
 
-/**
- * The complete set of public Platform members that `bus.wrap()` and the
- * mock are expected to expose. Single source of truth for parity tests.
- *
- * When the adapter adds a new member: append it here, mirror it in
- * `mockPlatform()`, and add the pass-through to both `bus.wrap()`
- * implementations. Drift on any of those fails the parity test.
- */
+/** The adapter's canonical member inventory, shared by the mock and wrapper drift gates. */
 export const PLATFORM_KEYS: ReadonlyArray<string>;
 
 // - Mock WebSocket -----------------------------------------------------------

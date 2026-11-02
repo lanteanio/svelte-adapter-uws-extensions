@@ -1,28 +1,8 @@
-/**
- * The complete set of public Platform members that `bus.wrap()` and the
- * mock are expected to expose. Single source of truth: parity tests
- * iterate this list to assert the wrap surface matches the adapter's
- * Platform interface. When the adapter adds a new member, append it
- * here AND mirror it in `mockPlatform()` below AND in the wrap
- * implementations in `redis/pubsub.js` / `redis/sharded-pubsub.js`.
- *
- * Drift on any of those three sites fails the parity test at CI time.
- */
+import { PLATFORM_MEMBERS } from 'svelte-adapter-uws/platform-contract';
 import { trackedSubscribe, trackedUnsubscribe } from 'svelte-adapter-uws/subscriptions';
 
-export const PLATFORM_KEYS = Object.freeze([
-	'publish', 'publishBatched', 'batch',
-	'send', 'sendTo', 'sendCoalesced',
-	'request',
-	'connections', 'requestId', 'traceContext', 'trace',
-	'pressure', 'protection', 'onPressure', 'onPublishRate',
-	'subscribers', 'forEachSubscriber', 'subscribe', 'unsubscribe', 'checkSubscribe',
-	'authorizeWireSubscribe',
-	'topic', 'topicEpoch',
-	'maxPayloadLength', 'bufferedAmount',
-	'closedWsAborts',
-	'now', 'monotonic', 'random', 'hlc'
-]);
+/** The adapter owns the inventory; new members require explicit mock and wrapper support. */
+export const PLATFORM_KEYS = PLATFORM_MEMBERS;
 
 /**
  * Create a mock platform that records publish/send calls.
@@ -31,6 +11,9 @@ export const PLATFORM_KEYS = Object.freeze([
 export function mockPlatform() {
 	const pressureSubscribers = new Set();
 	const publishRateSubscribers = new Set();
+	const grants = new WeakMap();
+	const epochs = new Map();
+	const gameSequences = new Map();
 	const p = {
 		published: [],
 		publishedBatches: [],
@@ -45,6 +28,8 @@ export function mockPlatform() {
 		// how a test drives the fail-closed paths.
 		checkSubscribeDenial: null,
 		wireSubscribeAuthorized: false,
+		assertions: new Map(),
+		metrics: null,
 		connections: 0,
 		requestId: '',
 		traceContext: null,
@@ -100,11 +85,21 @@ export function mockPlatform() {
 		// platform.pressure stub. Default snapshot mirrors a healthy worker.
 		// Tests drive transitions via _setPressure(snapshot).
 		pressure: {
+			sampledAt: null,
 			active: false,
+			value: 0,
 			subscriberRatio: 0,
 			publishRate: 0,
 			memoryMB: 0,
-			reason: 'NONE'
+			reason: 'NONE',
+			psi: null,
+			cpuThrottle: null,
+			maxBufferedBytes: 0,
+			backpressuredConnections: 0,
+			droppedFrames: 0,
+			droppedBytes: 0,
+			egress: { deliveries: 0, bytes: 0, refusedTopic: 0, refusedTenant: 0 },
+			topPublishers: []
 		},
 		// Mirrors the adapter's resolved protection posture default. A plain
 		// reassignable field (not a getter) - tests set p.protection directly
@@ -129,6 +124,56 @@ export function mockPlatform() {
 			for (const cb of publishRateSubscribers) {
 				try { cb(events); } catch { /* swallow */ }
 			}
+		},
+		adviseReconnect() { return 0; },
+		diagnostic() { return null; },
+		isWarmupRequest() { return false; },
+		metricsSnapshot() { return Promise.resolve(null); },
+		introspect() {
+			const pressure = p.pressure;
+			return {
+				connections: p.connections, closedWsAborts: p.closedWsAborts,
+				protection: p.protection, maxPayloadLength: p.maxPayloadLength,
+				versions: { adapter: null, protocolRevision: null, realtime: null, extensions: null },
+				pressure: {
+					sampledAt: pressure.sampledAt ?? null, active: pressure.active,
+					reason: pressure.reason, value: pressure.value ?? 0,
+					subscriberRatio: pressure.subscriberRatio, publishRate: pressure.publishRate,
+					memoryMB: pressure.memoryMB, maxBufferedBytes: pressure.maxBufferedBytes ?? 0,
+					backpressuredConnections: pressure.backpressuredConnections ?? 0,
+					droppedFrames: pressure.droppedFrames ?? 0, droppedBytes: pressure.droppedBytes ?? 0,
+					egress: {
+						deliveries: pressure.egress?.deliveries ?? 0, bytes: pressure.egress?.bytes ?? 0,
+						refusedTopic: pressure.egress?.refusedTopic ?? 0, refusedTenant: pressure.egress?.refusedTenant ?? 0
+					}
+				},
+				assertions: Object.fromEntries(p.assertions), diagnostics: { retained: 0, recent: [] }
+			};
+		},
+		grantPublish(ws, topic) {
+			try { ws.getUserData(); } catch { p.closedWsAborts++; return false; }
+			grants.set(ws, topic);
+			return true;
+		},
+		revokePublish(ws) {
+			try { ws.getUserData(); } catch { return false; }
+			return grants.delete(ws);
+		},
+		publishGrant(ws) {
+			try { ws.getUserData(); } catch { return null; }
+			return grants.get(ws) ?? null;
+		},
+		publishGame(senderWs, topic, event, data, id) {
+			const seq = (gameSequences.get(topic) ?? 0) + 1;
+			gameSequences.set(topic, seq);
+			let delivered = 0;
+			p.forEachSubscriber(topic, ws => {
+				if (ws !== senderWs) {
+					p.sent.push({ ws, topic, event, data, options: { seq }, id });
+					delivered++;
+				}
+			});
+			return { seq, delivered };
 		},
 		bufferedAmount(_ws) {
 			return 0;
@@ -176,6 +221,32 @@ export function mockPlatform() {
 				});
 			}
 		},
+		// Binary methods record their logical JSON fallback; no native encoder runs here.
+		publishWire(topic, event, data, wire, options) {
+			const { compress, ...otherOptions } = options ?? {};
+			return p.publish(topic, event, data, { ...otherOptions, compress: compress === true });
+		},
+		publishWireBatch(topic, event, entries, wire, options) {
+			let delivered = false;
+			for (const entry of entries) {
+				const local = { ...options };
+				if (entry.seq !== undefined) local.seq = entry.seq;
+				if (entry.excludeWs != null) local.excludeWs = entry.excludeWs;
+				delivered = p.publishWire(topic, event, entry.data, wire, local) || delivered;
+			}
+			return delivered;
+		},
+		sendWire(ws, topic, event, data, wire, options) {
+			const { compress, ...otherOptions } = options ?? {};
+			return p.send(ws, topic, event, data, { ...otherOptions, compress: compress === true });
+		},
+		sendWireBatch(ws, topic, event, entries, wire, options) {
+			let result = 1;
+			for (const entry of entries) result = p.sendWire(ws, topic, event, entry.data, wire, options);
+			return result;
+		},
+		registerWireCodec() {},
+		requestTopic() { return Promise.resolve([]); },
 		send(ws, topic, event, data, options) {
 			p.sent.push({ ws, topic, event, data, options });
 			return 1;
@@ -249,8 +320,15 @@ export function mockPlatform() {
 		// Mirrors the adapter's platform.topicEpoch. The mock returns the
 		// baseline 0 for every topic; a test that drives the per-topic epoch
 		// reassigns p.topicEpoch (e.g. to read a replay tracker's cache).
-		topicEpoch(_topic) {
-			return 0;
+		topicEpoch(topic) {
+			return epochs.get(topic) ?? 0;
+		},
+		bumpTopicEpoch(topic) {
+			const previous = p.topicEpoch(topic);
+			const drawn = p.random.u32();
+			const next = drawn === previous ? (drawn + 1) >>> 0 : drawn;
+			epochs.set(topic, next);
+			return next;
 		},
 		reset() {
 			p.published.length = 0;

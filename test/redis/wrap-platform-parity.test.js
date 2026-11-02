@@ -5,23 +5,7 @@ import { createPubSubBus } from '../../src/redis/pubsub.js';
 import { createShardedBus } from '../../src/redis/sharded-pubsub.js';
 import { FORWARDED, PROVIDED_ANYWAY, wrapMismatches } from '../helpers/wrap-surface.js';
 
-/**
- * Parity contract: every member listed in `PLATFORM_KEYS` (the canonical
- * set of public Platform members the adapter exposes) MUST be present on:
- *
- *   1. `mockPlatform()` itself - otherwise the mock has drifted and
- *      tests using it would silently see `undefined`.
- *   2. The object returned by `bus.wrap(platform)` for every bus that
- *      claims to return a Platform-shaped wrapper.
- *
- * When the adapter adds a new Platform member, append it to
- * `PLATFORM_KEYS` in `testing/mock-platform.js` and these tests fail
- * loudly until the mock and both wraps are updated. That's the
- * defense against the gap that broke `live.upload` chunk discovery
- * in the wild (`maxPayloadLength` / `bufferedAmount` were silently
- * missing from the bus wrap for ~5 prerelease versions because the
- * wrap was an explicit-list with no drift detection).
- */
+/** New adapter members fail here until the mock and both wrappers provide them. */
 describe('Platform parity: bus wraps expose every adapter Platform member', () => {
 	it('mockPlatform() exposes every member in PLATFORM_KEYS', () => {
 		const platform = mockPlatform();
@@ -463,7 +447,7 @@ describe('wrapMismatches: the check the bunserve-wrap rung applies to a real pla
 
 	it('compares a fallback member the platform does have, and a getter of another kind', () => {
 		expect(wrapMismatches({ publish: 'function', hlc: 'function', pressure: 'object' }, { publish: 'function', hlc: 'undefined', pressure: 'throws' }))
-			.toEqual(['pressure: platform object, wrap throws', 'hlc: platform function, wrap undefined']);
+			.toEqual(['hlc: platform function, wrap undefined', 'pressure: platform object, wrap throws']);
 	});
 });
 

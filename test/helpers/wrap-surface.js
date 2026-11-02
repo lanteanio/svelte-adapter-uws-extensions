@@ -16,8 +16,8 @@ export const PROVIDED_ANYWAY = Object.freeze({
 	traceContext: 'reads null'
 });
 
-/** What the wraps forward: the PLATFORM_KEYS floor and the version-gated members outside it. */
-export const FORWARDED = Object.freeze([...PLATFORM_KEYS, 'requestTopic', 'publishWire', 'sendWire', 'registerWireCodec']);
+/** Every member of the installed adapter contract participates in the drift gate. */
+export const FORWARDED = PLATFORM_KEYS;
 
 /**
  * The forwarded members whose kind differs between a platform and its wrap,
