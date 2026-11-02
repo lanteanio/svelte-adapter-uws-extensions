@@ -81,6 +81,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Redis dead-letter erasure compares inferred delivery starts at the purge marker's whole-millisecond precision, so fractional timing cannot let an in-flight capture escape its tombstone.
 - Redis session raw methods enforce the lifecycle token limit of 4096 UTF-16 code units before backend or erasure-index work. Erasure validates indexed tokens before constructing record keys and preserves structured failure counts and tenant fences.
 - PostgreSQL dead-letter summaries retain prototype-named topics as ordinary own buckets, matching Redis. Registry attributes preserve every own scalar key through registration, hydration and cohort delivery, including prototype-named keys.
 - Relay-only coalesced publishes return their admission result, validate names, and reject values without a JSON form. Trace-size fallback serializes the application value once. Cursor and presence errors share the adapter's registered brands for cross-copy `instanceof` checks; buses forward the process id and suppress explicitly stamped incoming process echoes while retaining Redis sibling delivery.

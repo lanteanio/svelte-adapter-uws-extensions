@@ -376,6 +376,26 @@ describe('redis dead-letter forget tombstone (right-to-erasure completeness)', (
 		expect(await s.count()).toBe(1);
 	});
 
+	it('treats the whole purge millisecond as in flight when inferring a delivery start', async () => {
+		let monotonic = 100;
+		setRuntimeEnv({ clock: {
+			now: () => clockMs,
+			wallEpoch: () => clockMs,
+			monotonic: () => monotonic
+		} });
+		const store = createDeadLetter(client, { forgetUserId: byAuthor });
+		await store.purgeUser(null, 'u1');
+		clockMs += 1;
+		monotonic += 0.75;
+		// The estimated start is 0.25 ms into the purge's integer timestamp.
+		expect(await store.add(drec({ startedAt: 100 }))).toBeNull();
+		expect(await store.count()).toBe(0);
+		clockMs += 1;
+		// The next server millisecond is genuinely later and remains usable.
+		expect(await store.add(drec({ startedAt: 100 }))).not.toBeNull();
+		expect(await store.count()).toBe(1);
+	});
+
 	it('is skew-immune: a long delivery whose monotonic start precedes the purge is still dropped via the server clock', async () => {
 		const s = createDeadLetter(client, { forgetUserId: byAuthor });
 		const startedAt = monotonicNow();

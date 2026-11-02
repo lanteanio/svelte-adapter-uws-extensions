@@ -375,7 +375,10 @@ export function createDeadLetter(client, options = {}) {
 							typeof rec.startedAt === 'number' && Number.isFinite(rec.startedAt)
 								? Math.max(0, monotonicNow() - rec.startedAt)
 								: 0;
-						const serverStart = serverNow - elapsed;
+						// Both server timestamps have millisecond precision. Compare
+						// the inferred start in that same precision, conservatively
+						// treating the purge's entire millisecond as in flight.
+						const serverStart = Math.floor(serverNow - elapsed);
 						if (Number.isFinite(purgeTime) && purgeTime >= serverStart) {
 							return null;
 						}
