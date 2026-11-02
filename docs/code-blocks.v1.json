@@ -1705,10 +1705,10 @@
 		},
 		{
 			"document": "README.md",
-			"fingerprint": "a536093bb6f52b8c9410527bb3b41f51a6d6cd3d7f86eece696352b0053f5ca8",
+			"fingerprint": "26e5b22e3d1ca3a67c309a8090d7dd915d5fbc5ab97304c1b7f92857da751ff1",
 			"occurrence": 1,
 			"language": "bash",
-			"line": 4640,
+			"line": 4638,
 			"section": "svelte-adapter-uws-extensions > Testing",
 			"classification": "command",
 			"channel": "manual-command"

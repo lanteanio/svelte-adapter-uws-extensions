@@ -89,6 +89,8 @@ describe('trusted release workflow', () => {
 			['prepublishOnly', 'true'],
 			['prepublishOnly', 'npm run check'],
 			['test:integration:pgbouncer', 'vitest run --config vitest.config.integration.postgres.js'],
+			['test:integration:ntp', 'vitest run test/redis/ntp-source.test.js'],
+			['verify:ntp', 'npm run verify:unit'],
 			['verify:pr', 'npm run verify:sim'],
 			['test', 'vitest run test/env.test.js'],
 			['verify:dependencies', 'npm audit --audit-level=high'],

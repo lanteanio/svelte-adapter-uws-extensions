@@ -2612,7 +2612,7 @@ const clock = createClusterClock(redis, {
 });
 ```
 
-Off by default. One SNTP read per sampling round joins the median, so a lone wrong source - a stepped local clock, a drifting Redis host - is outvoted. A failed NTP read drops the source from the median until it reads again (stale offsets never keep voting) and surfaces via `onError`. Built on `node:dgram`: no new dependency. When two sources disagree by `driftThresholdMs` (default 100 ms) or more, `onDrift` fires with a structured `{ driftMs, sources }` event and the `platform_clock_drift_ms` gauge moves.
+Off by default. One SNTP read per sampling round joins the median, so a lone wrong source - a stepped local clock, a drifting Redis host - is outvoted. A failed NTP read drops the source from the median until it reads again (stale offsets never keep voting) and surfaces via `onError`. Built on `node:dgram`: no new dependency. Replies must come from the configured resolved IPv4 peer, echo the outstanding request timestamp and report synchronized NTPv3/v4 server time (LI 0..2, stratum 1..15). Unrelated datagrams do not extend the deadline. Injected transports must echo the request timestamp and own their peer and timeout handling. When two sources disagree by `driftThresholdMs` (default 100 ms) or more, `onDrift` fires with a structured `{ driftMs, sources }` event and the `platform_clock_drift_ms` gauge moves.
 
 #### Admission trip
 
@@ -4631,15 +4631,13 @@ size limits and the explicit system-topic allowlist.
 For seeded cross-instance faults, import `runRedisSim` or `runPgSim` from
 `svelte-adapter-uws-extensions/sim`. The simulation backend controls delivery
 loss, duplication, corruption and delay without a live server. Use it for
-repeatable protocol tests, then run the real-backend lanes before deploying;
-simulation is not evidence for Redis or Postgres command behavior. See the
-[simulation declarations](./src/sim.d.ts) for scenario and result shapes.
+repeatable protocol tests, then run the real-backend lanes before deploying; simulation is not evidence for Redis or Postgres command behavior. See the [simulation declarations](./src/sim.d.ts) for scenario and result shapes.
 
 This repo runs tests in two layers; the integration layer additionally mirrors the Redis suites against a real Redis Cluster. All stay green; you can run each independently.
 
 ```bash
 npm test                                  # mock layer (no services needed)
-npm run test:integration                  # integration layer (real Redis 7 + Postgres 16 in Docker)
+npm run test:integration                  # loopback UDP plus real storage backends in Docker
 npm run test:integration:cluster-mirror   # the same Redis suites against a real 3-master Redis Cluster
 ```
 
@@ -4651,22 +4649,24 @@ The mocks live at `testing/mock-redis.js` and `testing/mock-pg.js` and are expor
 
 ### Integration layer (`test/integration/`)
 
-Exercises the same modules against real services in `docker compose`. Picks up cases the mocks can only approximate: Lua atomicity inside Redis EVAL, Postgres LISTEN/NOTIFY cross-connection delivery, real TTL/EXPIRE behaviour, partial-index plans on the job queue.
+Exercises the same modules against real services in `docker compose`, plus NTP against ephemeral loopback UDP responders. Picks up cases the mocks can only approximate: Lua atomicity inside Redis EVAL, Postgres LISTEN/NOTIFY cross-connection delivery, real TTL/EXPIRE behaviour, partial-index plans on the job queue.
 
-Each command is **one backend running one suite**. The Redis-backed plugins (`redis/**`) and the Postgres-backed plugins (`postgres/**`) are independent - neither suite opens the other's connection - so they have separate commands and start only the container they need:
+Each storage command runs one backend suite. The Redis-backed plugins (`redis/**`) and the Postgres-backed plugins (`postgres/**`) are independent - neither suite opens the other's connection - so they have separate commands and start only the container they need; NTP uses no container:
 
 | Command | Suite | Backend |
 | --- | --- | --- |
+| `npm run test:integration:ntp` | `ntp-source.test.js` | loopback UDP |
 | `npm run test:integration:redis` | `redis/**` | standalone Redis |
 | `npm run test:integration:postgres` | `postgres/**` | standalone Postgres |
+| `npm run test:integration:pgbouncer` | `pgbouncer/**` | Postgres through PgBouncer |
 | `npm run test:integration:valkey` | `redis/**` | standalone Valkey |
 | `npm run test:integration:cluster` | `redis-cluster/**` | Redis Cluster (native) |
 | `npm run test:integration:cluster-mirror` | `redis/**` | Redis Cluster |
 | `npm run test:integration:valkey-cluster` | `redis-cluster/**` | Valkey Cluster (native) |
 | `npm run test:integration:valkey-cluster-mirror` | `redis/**` | Valkey Cluster |
-| `npm run test:integration` | umbrella - runs `:redis` then `:postgres` | both |
+| `npm run test:integration` | umbrella - runs every integration tier | loopback UDP and all storage backends |
 
-The Redis-backed plugins are tested across `{Redis, Valkey} x {solo, cluster}` for backend parity; the Postgres plugins have no alternative backend to test against, so `test:integration:postgres` is simply their single command (no solo/variant split). All commands share the compose stack at [`test/integration/docker-compose.yml`](https://github.com/lanteanio/svelte-adapter-uws-extensions/blob/dev/test/integration/docker-compose.yml) (Redis on `56379`, Postgres on `55432` - non-default host ports so they do not clash with a locally running server). Each per-backend `global-setup-*.js` runs `docker compose up -d --wait <service>` (just the one it needs) before the suite, exports `INTEGRATION_REDIS_URL` / `INTEGRATION_POSTGRES_URL`, and tears the stack down with `docker compose down -v` afterwards.
+The Redis-backed plugins are tested across `{Redis, Valkey} x {solo, cluster}` for backend parity; Postgres also runs through PgBouncer. Storage commands use the appropriate Compose stack under [`test/integration/`](https://github.com/lanteanio/svelte-adapter-uws-extensions/tree/dev/test/integration), starting only the services needed for that tier (standalone Redis on `56379`, Postgres on `55432` by default). Each storage tier's `global-setup-*.js` starts its stack, exports its connection variables, and tears the stack down with `docker compose down -v` afterwards. The NTP suite binds and closes its own loopback sockets without contacting public servers.
 
 The host ports and compose project name are env-var overridable for running multiple stacks side-by-side on the same machine. The Redis and Postgres tiers use `INTEGRATION_COMPOSE_PROJECT` as given; the Valkey, Redis Cluster, Valkey Cluster and PgBouncer stacks append `-valkey`, `-cluster`, `-valkey-cluster` and `-pgbouncer`, so one exported value never names two compose projects:
 

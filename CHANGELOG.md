@@ -40,6 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A timer interval above 2147483647 ms, which Node runs every millisecond: clock-skew and cluster-clock `intervalMs`, NTP `timeoutMs`, presence `consistencyAuditIntervalMs`, cursor `snapshotIntervalMs` (half the ceiling, its roster timer waits twice as long) and `ttl` in milliseconds, group `memberTtl` in milliseconds, registry `heartbeat` and `requestTimeoutMs`, publish-rate `publishInterval`, topic-broadcast `heartbeat` and `requestTimeoutMs`, leader `renewMs`, lock `heartbeatMs` and `retryDelayMs` (with its 25% jitter), circuit-breaker `resetTimeout`, task-runner `recoveryInterval`, `dispatchInterval` and `awaitPollInterval`, and CRDT `persistLeaseMs`, leader `leaseMs` and lock `defaultTtlMs` where a third of them paces a timer.
   - A fractional lifetime Redis receives as an expiry, which failed every write that set it: session `ttlMs`, leader `leaseMs`, lock `defaultTtlMs` and registry `ttl` must be whole; cursor `ttl` whole seconds; presence `ttl` and group `memberTtl` whole milliseconds.
 
+### Security
+
+- Validate the optional NTP clock source's peer, request correlation and synchronization fields; ignore unrelated UDP replies until the original deadline.
+
 ### Added
 
 - Redis cursor `maxMovers` defaults to 64 combined local and peer movers per topic per tick. Deferred movers retain arrival order and their latest positions; `stats().moversDeferred` counts their deferred ticks.

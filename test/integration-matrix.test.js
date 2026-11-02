@@ -21,7 +21,7 @@ function covered(roots) {
 
 describe('integration tier coverage', () => {
 	it('finds every backend tier', () => {
-		expect(tiers).toEqual(['cluster', 'cluster-mirror', 'pgbouncer', 'postgres', 'redis', 'valkey', 'valkey-cluster', 'valkey-cluster-mirror']);
+		expect(tiers).toEqual(['cluster', 'cluster-mirror', 'ntp', 'pgbouncer', 'postgres', 'redis', 'valkey', 'valkey-cluster', 'valkey-cluster-mirror']);
 		for (const tier of tiers) {
 			expect(scripts['test:integration:' + tier]).toBe('vitest run --config vitest.config.integration.' + tier + '.js');
 		}

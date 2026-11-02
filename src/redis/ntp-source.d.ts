@@ -6,7 +6,12 @@
  * simulations never open a real socket.
  */
 
-/** Injectable wire: send one request datagram, resolve with the first reply. */
+/**
+ * Injectable wire: send one request datagram and resolve with a reply from the
+ * configured peer. A canned reply must copy request bytes 40..47 into its
+ * originate timestamp (bytes 24..31). Implementations own their timeout/error
+ * cleanup; the default transport uses one connected IPv4 UDP socket per read.
+ */
 export interface NtpTransport {
 	request(packet: Buffer, host: string, port: number, timeoutMs: number): Promise<Buffer>;
 }
@@ -24,9 +29,11 @@ export interface NtpSourceOptions {
 
 export interface NtpSource {
 	/**
-	 * One SNTP round trip; resolves with the server clock as epoch
-	 * milliseconds. Rejects on timeout, a malformed reply, or a kiss-of-death
-	 * (stratum 0) reply.
+	 * One unicast SNTP round trip; resolves with synchronized NTPv3/v4 server
+	 * time as epoch milliseconds. Only mode-4 replies with a matching originate
+	 * timestamp, LI 0..2 and stratum 1..15 are accepted. The default transport
+	 * ignores unrelated peers/requests until its original deadline. Rejects on
+	 * timeout, malformed/unsynchronized replies or request-correlation failure.
 	 */
 	read(): Promise<number>;
 }

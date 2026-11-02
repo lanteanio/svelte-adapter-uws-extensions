@@ -4,7 +4,7 @@
  * Speaks just enough of the SNTPv4 wire (RFC 4330) to ask one server for its
  * transmit timestamp: a 48-byte mode-3 client request, one mode-4 reply, the
  * transmit timestamp field converted from the NTP era (seconds since 1900 +
- * 32-bit binary fraction) to epoch milliseconds. No poll loop, no filtering,
+ * 32-bit binary fraction) to epoch milliseconds. No poll loop, no sample filter,
  * no server selection - the cluster clock owns cadence and median-fusion; this
  * module owns exactly one read.
  *
@@ -21,7 +21,7 @@
  */
 
 import dgram from 'node:dgram';
-import { setTimer, clearTimer } from '../shared/runtime.js';
+import { setTimer, clearTimer, wallEpoch, randomBytes } from '../shared/runtime.js';
 import { defineOptions, option, timerCeiling } from '../shared/options.js';
 
 /** Seconds between the NTP era (1900-01-01) and the Unix epoch (1970-01-01). */
@@ -29,13 +29,49 @@ const NTP_UNIX_OFFSET_SECONDS = 2_208_988_800;
 
 const DEFAULT_PORT = 123;
 const DEFAULT_TIMEOUT_MS = 2_000;
+const FRACTION_NONCE_BITS = 22;
+const FRACTION_NONCE_SIZE = 2 ** FRACTION_NONCE_BITS;
+const FRACTION_NONCE_MASK = FRACTION_NONCE_SIZE - 1;
+const outstandingTransmits = new Set();
+
+/** A real millisecond-resolution timestamp with unpredictable insignificant bits. */
+function clientPacket() {
+	const epochMs = wallEpoch();
+	if (!Number.isFinite(epochMs)) throw new Error('ntp: local clock is not finite');
+	const seconds = Math.floor(epochMs / 1000);
+	const significant = Math.floor((epochMs - seconds * 1000) * 1.024) * FRACTION_NONCE_SIZE;
+	let nonce = Buffer.from(randomBytes(4)).readUInt32BE(0) & FRACTION_NONCE_MASK;
+	const transmit = Buffer.alloc(8);
+	transmit.writeUInt32BE((seconds + NTP_UNIX_OFFSET_SECONDS) >>> 0, 0);
+	const zeroBucket = transmit.readUInt32BE(0) === 0 && significant === 0;
+	// RFC 5905 section 6 recommends randomizing non-significant fraction bits.
+	// Ten significant bits retain the runtime clock's millisecond resolution.
+	// Probe a bounded number of slots if simultaneous reads collide, including
+	// under a deterministic simulation RNG. A pending read never shares its token.
+	const attempts = Math.min(outstandingTransmits.size + 1, FRACTION_NONCE_SIZE);
+	for (let attempt = 0; attempt < attempts; attempt++) {
+		if (zeroBucket && nonce === 0) nonce = 1;
+		transmit.writeUInt32BE(significant + nonce, 4);
+		const key = transmit.toString('hex');
+		if (key !== '0000000000000000' && !outstandingTransmits.has(key)) {
+			outstandingTransmits.add(key);
+			const packet = Buffer.alloc(48);
+			packet[0] = 0x23; // LI=0, VN=4, mode=3 (client).
+			transmit.copy(packet, 40);
+			return { packet, transmit, key };
+		}
+		nonce = (nonce + 1) & FRACTION_NONCE_MASK;
+	}
+	throw new Error('ntp: no unique transmit timestamp available');
+}
 
 /**
  * @typedef {Object} NtpTransport
  * @property {(packet: Buffer, host: string, port: number, timeoutMs: number) => Promise<Buffer>} request -
- *   Send one request datagram and resolve with the first reply datagram (or
- *   reject on error/timeout). The default transport opens a fresh UDP socket
- *   per read and closes it when settled.
+ *   Send one request datagram and resolve with a reply from that peer (or
+ *   reject on error/timeout). Reply bytes 24..31 must echo request bytes 40..47.
+ *   The default transport opens a fresh connected IPv4 UDP socket per read and
+ *   closes it when settled; a custom transport owns its peer/timeout cleanup.
  */
 
 /**
@@ -48,9 +84,9 @@ const DEFAULT_TIMEOUT_MS = 2_000;
 
 /**
  * @typedef {Object} NtpSource
- * @property {() => Promise<number>} read - One SNTP round trip; resolves with
- *   the server clock as epoch milliseconds. Rejects on timeout, a malformed
- *   reply, or a kiss-of-death (stratum 0) reply.
+ * @property {() => Promise<number>} read - One unicast SNTP round trip; resolves
+ *   with synchronized NTPv3/v4 server time as epoch milliseconds. Rejects on
+ *   timeout, invalid synchronization/header fields or request correlation.
  */
 
 /** One-socket-per-read UDP transport with a seam-armed timeout. */
@@ -60,7 +96,8 @@ function createDgramTransport() {
 			return new Promise((resolve, reject) => {
 				const socket = dgram.createSocket('udp4');
 				let timer = null;
-				let settled = false;
+				let settled = false, peer;
+				const transmit = Buffer.from(packet.subarray(40, 48));
 				const settle = (fn, arg) => {
 					if (settled) return;
 					settled = true;
@@ -69,9 +106,24 @@ function createDgramTransport() {
 					fn(arg);
 				};
 				timer = setTimer(() => settle(reject, new Error(`ntp: no reply from ${host}:${port} within ${timeoutMs}ms`)), timeoutMs);
-				socket.once('error', (err) => settle(reject, err));
-				socket.once('message', (msg) => settle(resolve, msg));
-				socket.send(packet, port, host, (err) => { if (err) settle(reject, err); });
+				socket.on('error', (err) => settle(reject, err));
+				socket.on('message', (msg, rinfo) => {
+					if (settled || !peer || rinfo.address !== peer.address || rinfo.port !== peer.port) return;
+					if (msg.length < 48 || !msg.subarray(24, 32).equals(transmit)) return;
+					settle(resolve, msg);
+				});
+				try {
+					// Connected UDP fixes the resolved destination for this request and
+					// filters other peers in the kernel; retain the explicit tuple check.
+					socket.connect(port, host, (err) => {
+						if (settled) return;
+						if (err) { settle(reject, err); return; }
+						try {
+							peer = socket.remoteAddress();
+							socket.send(packet, (error) => { if (error) settle(reject, error); });
+						} catch (error) { settle(reject, error); }
+					});
+				} catch (error) { settle(reject, error); }
 			});
 		}
 	};
@@ -82,19 +134,24 @@ function createDgramTransport() {
  * @param {Buffer} reply
  * @returns {number}
  */
-function parseTransmitEpochMs(reply) {
+function parseTransmitEpochMs(reply, transmit) {
 	if (!Buffer.isBuffer(reply) || reply.length < 48) {
 		throw new Error('ntp: reply shorter than the 48-byte SNTP header');
 	}
+	const version = (reply[0] >>> 3) & 0x07;
+	if (version !== 3 && version !== 4) throw new Error(`ntp: unsupported reply version ${version}`);
 	const mode = reply[0] & 0x07;
-	if (mode !== 4 && mode !== 5) {
-		throw new Error(`ntp: unexpected reply mode ${mode} (want 4 server / 5 broadcast)`);
+	if (mode !== 4) {
+		throw new Error(`ntp: unexpected reply mode ${mode} (want 4 server)`);
 	}
+	if ((reply[0] >>> 6) === 3) throw new Error('ntp: server leap indicator is unsynchronized');
 	const stratum = reply[1];
 	if (stratum === 0) {
 		// RFC 4330: stratum 0 is a kiss-of-death packet - the server refuses.
 		throw new Error('ntp: kiss-of-death reply (stratum 0) - server refused');
 	}
+	if (stratum > 15) throw new Error(`ntp: unsynchronized or reserved stratum ${stratum}`);
+	if (!reply.subarray(24, 32).equals(transmit)) throw new Error('ntp: reply originate timestamp does not match the request');
 	const seconds = reply.readUInt32BE(40);
 	const fraction = reply.readUInt32BE(44);
 	if (seconds === 0) {
@@ -149,12 +206,11 @@ export function createNtpSource(options = {}) {
 
 	return {
 		async read() {
-			// LI=0, VN=4, Mode=3 (client). Everything else zero: an SNTP client
-			// request needs no reference/origin timestamps for a transmit read.
-			const packet = Buffer.alloc(48);
-			packet[0] = 0x23;
-			const reply = await transport.request(packet, host, port, timeoutMs);
-			return parseTransmitEpochMs(reply);
+			const { packet, transmit, key } = clientPacket();
+			try {
+				const reply = await transport.request(packet, host, port, timeoutMs);
+				return parseTransmitEpochMs(reply, transmit);
+			} finally { outstandingTransmits.delete(key); }
 		}
 	};
 }

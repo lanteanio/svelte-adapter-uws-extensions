@@ -8,7 +8,7 @@ accepts changes and there is no promised response time.
 ## Clone to a working demonstration
 
 Install Node 22 or newer, Git, and Docker with Compose v2. Start Docker before
-running a backend lane. A fresh clone needs one dependency installation:
+running a storage backend lane. The NTP lane uses loopback UDP. A fresh clone needs one dependency installation:
 
 ```sh
 git clone --branch dev --single-branch https://github.com/lanteanio/svelte-adapter-uws-extensions.git
@@ -44,6 +44,7 @@ its corresponding real-backend lane before review.
 |---|---|
 | Prose, issue forms, contribution guide | `npm run verify:docs`; execute changed examples or commands. |
 | Pure utilities, Prometheus, breaker or admission policy | `npm run verify:unit`; focused tests for every affected caller. |
+| NTP clock source or UDP reply validation | `npm run verify:unit` and `npm run verify:ntp` against loopback UDP responders. |
 | Redis commands, scripts, expiry, pub/sub or reconnect | `npm run verify:unit`, `npm run verify:redis`, `npm run verify:valkey`, `npm run verify:cluster`, `npm run verify:valkey-cluster`. |
 | Redis keys, hash tags, routing or a shared multi-slot helper | Both cluster lanes above plus the standalone Redis and Valkey lanes. Each cluster lane includes its dedicated tests and the standalone suite mirrored onto a cluster. |
 | Postgres SQL, transactions, notifications, tasks or jobs | `npm run verify:unit`, `npm run verify:postgres` and `npm run verify:pgbouncer`. |
@@ -55,8 +56,8 @@ its corresponding real-backend lane before review.
 | CI or verification tooling | `npm run verify:docs`, run the changed lane, and check failure as well as success behavior. |
 
 `npm run verify:pr` combines the fast, unit and smoke lanes. It does not cover the
-backend tiers. `npm run test:integration` runs every backend tier in sequence:
-standalone Redis, Postgres, Postgres behind PgBouncer, standalone Valkey, Redis
+integration tiers. `npm run test:integration` runs every tier in sequence:
+loopback NTP, standalone Redis, Postgres, Postgres behind PgBouncer, standalone Valkey, Redis
 Cluster and Valkey Cluster, each cluster both natively and with the standalone
 suite mirrored onto it. `npm run verify:full` is `verify:pr` plus that whole
 matrix, and the release workflow runs the same matrix through `verify:release`.
@@ -84,13 +85,14 @@ Hosted jobs: `dependencies`, `external-links`, `backend`, `verify`, `publish`, `
 | `npm run verify:dependencies` | `check:lockfile` | Hosted |
 | `npm run verify:docs` | `check:documentation`, `check:links`, `check:format`, `check:contributor-map` | Local |
 | `npm run verify:fast` | `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `check:publish` | Hosted |
-| `npm run verify:full` | `verify:pr`, `preflight`, `verify:fast`, `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `check:publish`, `verify:unit`, `test`, `smoke`, `test:integration`, `test:integration:redis`, `test:integration:postgres`, `test:integration:pgbouncer`, `test:integration:valkey`, `test:integration:cluster`, `test:integration:cluster-mirror`, `test:integration:valkey-cluster`, `test:integration:valkey-cluster-mirror` | Local |
+| `npm run verify:full` | `verify:pr`, `preflight`, `verify:fast`, `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `check:publish`, `verify:unit`, `test`, `smoke`, `test:integration`, `test:integration:ntp`, `test:integration:redis`, `test:integration:postgres`, `test:integration:pgbouncer`, `test:integration:valkey`, `test:integration:cluster`, `test:integration:cluster-mirror`, `test:integration:valkey-cluster`, `test:integration:valkey-cluster-mirror` | Local |
 | `npm run verify:leak` | `test:leak`, `test:leak:cluster` | Local |
+| `npm run verify:ntp` | `test:integration:ntp` | Hosted |
 | `npm run verify:pgbouncer` | `test:integration:pgbouncer` | Hosted |
 | `npm run verify:postgres` | `test:integration:postgres` | Hosted |
 | `npm run verify:pr` | `preflight`, `verify:fast`, `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `check:publish`, `verify:unit`, `test`, `smoke` | Hosted |
 | `npm run verify:redis` | `test:integration:redis` | Hosted |
-| `npm run verify:release` | `verify:dependencies`, `check:lockfile`, `verify:pr`, `preflight`, `verify:fast`, `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `check:publish`, `verify:unit`, `test`, `smoke`, `test:integration`, `test:integration:redis`, `test:integration:postgres`, `test:integration:pgbouncer`, `test:integration:valkey`, `test:integration:cluster`, `test:integration:cluster-mirror`, `test:integration:valkey-cluster`, `test:integration:valkey-cluster-mirror` | Hosted |
+| `npm run verify:release` | `verify:dependencies`, `check:lockfile`, `verify:pr`, `preflight`, `verify:fast`, `check`, `check:documentation`, `check:links`, `check:format`, `check:contributor-map`, `check:publish`, `verify:unit`, `test`, `smoke`, `test:integration`, `test:integration:ntp`, `test:integration:redis`, `test:integration:postgres`, `test:integration:pgbouncer`, `test:integration:valkey`, `test:integration:cluster`, `test:integration:cluster-mirror`, `test:integration:valkey-cluster`, `test:integration:valkey-cluster-mirror` | Hosted |
 | `npm run verify:unit` | `test` | Hosted |
 | `npm run verify:valkey` | `test:integration:valkey` | Hosted |
 | `npm run verify:valkey-cluster` | `test:integration:valkey-cluster`, `test:integration:valkey-cluster-mirror` | Hosted |
