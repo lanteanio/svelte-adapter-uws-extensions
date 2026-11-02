@@ -158,7 +158,7 @@ const EXPECTED_SCRIPTS = {
 	"check:documentation": "node scripts/check-documentation-contract.js",
 	"preflight": "svelte-adapter-uws-preflight",
 	"check:lockfile": "node scripts/check-lockfile.js",
-	"verify:dependencies": "npm run check:lockfile && npm ls --all && npm audit",
+	"verify:dependencies": "npm run check:lockfile && npm ls --all && node scripts/check-dependency-audit.js",
 	"prepublishOnly": "node scripts/check-compatibility.js --release && npm run check",
 	"verify:release": "npm run verify:dependencies && npm run verify:pr && npm run test:integration",
 	"check:publish": "publint && attw --pack . --profile esm-only",

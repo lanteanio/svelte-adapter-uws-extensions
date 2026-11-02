@@ -91,6 +91,7 @@ describe('trusted release workflow', () => {
 			['test:integration:pgbouncer', 'vitest run --config vitest.config.integration.postgres.js'],
 			['verify:pr', 'npm run verify:sim'],
 			['test', 'vitest run test/env.test.js'],
+			['verify:dependencies', 'npm audit --audit-level=high'],
 			['verify:release', 'npm test']
 		];
 		for (const [name, body] of weakenings) {

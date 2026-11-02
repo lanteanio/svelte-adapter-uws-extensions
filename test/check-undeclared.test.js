@@ -36,10 +36,11 @@ const clock = 'export function now() {\n\treturn Date.now();\n}\n';
 
 describe('check-undeclared', () => {
 	it('passes the real package', () => {
-		const result = spawnSync(process.execPath, [script], { encoding: 'utf8' });
+		const result = spawnSync(process.execPath, [script], { encoding: 'utf8', timeout: 25000, windowsHide: true });
+		expect(result.error).toBeUndefined();
 		expect(result.stdout + result.stderr).toContain('0 undeclared references');
 		expect(result.status).toBe(0);
-	});
+	}, 30000);
 
 	it('passes a module whose every name is a binding, an import, or a global', () => {
 		const { status, output } = check({

@@ -81,6 +81,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Dependency verification retains complete audit reports and checks an exact, expiring development-tool policy against the live registry.
 - Redis pub/sub receivers reject unknown health events and malformed control envelopes before local delivery.
 - Redis dead-letter erasure compares inferred delivery starts at the purge marker's whole-millisecond precision, so fractional timing cannot let an in-flight capture escape its tombstone.
 - Redis session raw methods enforce the lifecycle token limit of 4096 UTF-16 code units before backend or erasure-index work. Erasure validates indexed tokens before constructing record keys and preserves structured failure counts and tenant fences.

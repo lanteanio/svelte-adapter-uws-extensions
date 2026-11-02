@@ -253,7 +253,7 @@
 		"check:documentation": "node scripts/check-documentation-contract.js",
 		"preflight": "svelte-adapter-uws-preflight",
 		"check:lockfile": "node scripts/check-lockfile.js",
-		"verify:dependencies": "npm run check:lockfile && npm ls --all && npm audit",
+		"verify:dependencies": "npm run check:lockfile && npm ls --all && node scripts/check-dependency-audit.js",
 		"prepublishOnly": "node scripts/check-compatibility.js --release && npm run check",
 		"verify:release": "npm run verify:dependencies && npm run verify:pr && npm run test:integration",
 		"check:publish": "publint && attw --pack . --profile esm-only",
@@ -275,20 +275,21 @@
 	},
 	"devDependencies": {
 		"@arethetypeswrong/cli": "^0.18.5",
+		"@sveltejs/kit": "3.0.1",
 		"acorn": "^8.16.0",
-		"markdown-it": "15.0.2",
+		"markdown-it": "15.0.3",
 		"parse5": "8.0.0",
 		"publint": "^0.3.22",
 		"semver": "7.7.4",
 		"svelte-adapter-uws": "0.6.0-next.96",
-		"typescript": "5.9.3",
+		"typescript": "6.0.3",
 		"vitest": "^4.0.18",
 		"ws": "^8.0.0",
 		"yaml": "2.9.0",
 		"yjs": "^13.6.31"
 	},
 	"overrides": {
-		"cookie": "^0.7.0"
+		"cookie@<0.7.0": "^0.7.0"
 	},
 	"keywords": [
 		"svelte",
