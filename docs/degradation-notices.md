@@ -14,7 +14,7 @@ Both `mitigation` and `recovery` accept these optional fields:
 | `messageParams` | A plain interpolation object with at most 64 entries. Keys follow `messageKey` syntax and bounds. Values are strings, finite numbers, booleans, or null; each string is at most 1024 UTF-8 bytes and the serialized object is at most 4096 UTF-8 bytes. |
 | `bannerCopy` | The source-English fallback: well-formed plain text containing a non-ignorable letter or number, at most 2048 UTF-8 bytes, without control/format characters or line breaks. ZWNJ/ZWJ joiners may accompany text. |
 
-On the server, one invalid field rejects the whole envelope: a static envelope makes `createDegradationPolicy` throw, and an invalid envelope returned by a dynamic policy makes that transition throw, so the bus emits the bare `degraded` or `recovered` event without a `mitigation` or `recovery` envelope. The realtime client checks the same bounds on receipt and drops each invalid `bannerCopy`, `messageKey`, or `messageParams` field on its own, keeping the envelope's other fields. Render resolved notices as text, never as HTML.
+On the server, one invalid field rejects the whole envelope: a static envelope makes `createDegradationPolicy` throw, and an invalid envelope returned by a dynamic policy makes that transition throw, so the bus emits the bare `degraded` or `recovered` event without a `mitigation` or `recovery` envelope. On receipt, the realtime client validates notice metadata and drops each field it rejects, keeping the envelope's other fields. Render resolved notices as text, never as HTML.
 
 ## Resolve the display language
 
