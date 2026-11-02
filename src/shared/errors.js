@@ -1,3 +1,20 @@
+import { types as utilTypes } from 'node:util';
+
+const WS_CLOSED_BRAND = Symbol.for('lantean.error.ws-closed.v1');
+const SUBSCRIBE_DENIED_BRAND = Symbol.for('lantean.error.subscribe-denied.v1');
+
+/**
+ * @param {Function} self
+ * @param {Function} base
+ * @param {symbol} brand
+ * @param {unknown} value
+ */
+function brandedInstance(self, base, brand, value) {
+	if (self !== base) return Function.prototype[Symbol.hasInstance].call(self, value);
+	if (value === null || typeof value !== 'object' || /** @type {any} */ (value)[brand] !== true) return false;
+	return typeof Error.isError === 'function' ? Error.isError(value) : utilTypes.isNativeError(value);
+}
+
 /**
  * Thrown when a connection to an external service (Redis, Postgres) fails.
  */
@@ -117,8 +134,14 @@ export class WsClosedError extends Error {
 		super(`${operation}: websocket closed during async gap (topic="${topic}"); rolled back`);
 		this.name = 'WsClosedError';
 		this.code = 'WS_CLOSED';
+		Object.defineProperty(this, WS_CLOSED_BRAND, { value: true });
 		this.operation = operation;
 		this.topic = topic;
+	}
+
+	/** @param {unknown} value */
+	static [Symbol.hasInstance](value) {
+		return brandedInstance(this, WsClosedError, WS_CLOSED_BRAND, value);
 	}
 }
 
@@ -156,9 +179,15 @@ export class SubscribeDeniedError extends Error {
 		super(`${operation}: subscribe denied for topic="${topic}" (${reason})`);
 		this.name = 'SubscribeDeniedError';
 		this.code = 'SUBSCRIBE_DENIED';
+		Object.defineProperty(this, SUBSCRIBE_DENIED_BRAND, { value: true });
 		this.operation = operation;
 		this.topic = topic;
 		this.reason = reason;
+	}
+
+	/** @param {unknown} value */
+	static [Symbol.hasInstance](value) {
+		return brandedInstance(this, SubscribeDeniedError, SUBSCRIBE_DENIED_BRAND, value);
 	}
 }
 

@@ -163,6 +163,7 @@ export interface CursorEntry {
  * 'WS_CLOSED'` for cross-feature handling.
  */
 export class WsClosedError extends Error {
+	static [Symbol.hasInstance](value: unknown): boolean;
 	name: 'WsClosedError';
 	code: 'WS_CLOSED';
 	operation: string;
@@ -176,6 +177,7 @@ export class WsClosedError extends Error {
  * and surface `err.reason` to the caller.
  */
 export class SubscribeDeniedError extends Error {
+	static [Symbol.hasInstance](value: unknown): boolean;
 	name: 'SubscribeDeniedError';
 	code: 'SUBSCRIBE_DENIED';
 	operation: string;

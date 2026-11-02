@@ -1,6 +1,7 @@
 import { operationError } from '../shared/errors.js';
 import { registerClusterHealth, redisConnectionState } from '../shared/cluster-dashboard.js';
 import { collapseByCoalesceKey } from '../shared/_coalesce-batch.js';
+import { prepareCoalescedEnvelope, stringifyRelayEnvelope } from '../shared/coalesced-envelope.js';
 import { guardBreaker } from '../shared/breaker-admission.js';
 /**
  * Sharded Redis pub/sub bus for svelte-adapter-uws.
@@ -362,10 +363,10 @@ export function createShardedBus(client, options = {}) {
 					attributes: { maxEnvelopeBytes: validator.maxBytes }
 				});
 			}
-			return;
+			return false;
 		}
 		envelopeOversized = false;
-		relayQueue.push(msg, topics.length, channel, topics);
+		return relayQueue.push(msg, topics.length, channel, topics);
 	}
 
 	// Relay one envelope on its shard channel from inside a producer operation,
@@ -375,27 +376,25 @@ export function createShardedBus(client, options = {}) {
 	// every peer; the message goes without them instead. An envelope over the
 	// cap on its own is reported and dropped by scheduleRelay.
 	let traceOmissionReported = false;
-	function relayTraced(channel, env, topics, traceContext) {
+	function relayTraced(channel, env, topics, traceContext, dataJson) {
 		if (traceContext === null) {
-			scheduleRelay(channel, JSON.stringify(env), topics);
-			return;
+			return scheduleRelay(channel, stringifyRelayEnvelope(env, dataJson), topics);
 		}
 		injectTraceContext(env, traceContext);
-		const traced = JSON.stringify(env);
+		const traced = stringifyRelayEnvelope(env, dataJson);
 		if (validator.acceptRaw(traced)) {
-			scheduleRelay(channel, traced, topics);
-			return;
+			return scheduleRelay(channel, traced, topics);
 		}
 		delete env.traceparent;
 		delete env.tracestate;
-		const plain = JSON.stringify(env);
+		const plain = stringifyRelayEnvelope(env, dataJson);
 		if (!traceOmissionReported && validator.acceptRaw(plain)) {
 			traceOmissionReported = true;
 			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.SHARDED_TRACE_OMITTED, {
 				attributes: { maxEnvelopeBytes: validator.maxBytes }
 			});
 		}
-		scheduleRelay(channel, plain, topics);
+		return scheduleRelay(channel, plain, topics);
 	}
 
 	// Local delivery of one envelope relayed by another instance. The untraced
@@ -660,7 +659,7 @@ export function createShardedBus(client, options = {}) {
 				}
 				// One echo check per envelope; batched envelopes carry
 				// one instanceId for the whole batch.
-				if (parsed.instanceId === instanceId) {
+				if (parsed.instanceId === instanceId || (typeof parsed.processId === 'string' && parsed.processId === activePlatform?.processId)) {
 					mEchoSuppressed?.inc();
 					return;
 				}
@@ -1650,8 +1649,10 @@ export function createShardedBus(client, options = {}) {
 					catch (err) { relayQueue.withdraw(admitted, prepared.length / 4); throw err; }
 				});
 			};
-			const relayCoalescedTraced = (topic, event, data, coalesceKey) => traced((traceContext) =>
-				relayTraced(channelFor(topic), { instanceId, coalesced: true, topic, event, data, coalesceKey }, [topic], traceContext));
+			const relayCoalescedTraced = (topic, event, data, coalesceKey) => {
+				const prepared = prepareCoalescedEnvelope(instanceId, topic, event, data, coalesceKey);
+				return traced((traceContext) => relayTraced(channelFor(topic), prepared.env, [topic], traceContext, prepared.json));
+			};
 			const publishWireTraced = (topic, event, data, wire, opts) => {
 				if (!(wire && wire.shared === true && (!opts || opts.relay !== false))) {
 					return platform.publishWire(topic, event, data, wire, opts);
@@ -1727,6 +1728,7 @@ export function createShardedBus(client, options = {}) {
 			// batch, publishBatched and topicEpoch read the platform's member (and
 			// topicEpoch its replay tracker) when called.
 			const wrapped = {
+				get processId() { return platform.processId; },
 				publish(topic, event, data, opts) {
 					if (opts && opts.relay === false) return platform.publish(topic, event, data, opts);
 					// The bus is this publish's fan-out to every other worker and
@@ -1745,8 +1747,8 @@ export function createShardedBus(client, options = {}) {
 				// each re-coalesces onto its own subscribers. Echo-suppressed by
 				// instanceId.
 				relayCoalesced(topic, event, data, coalesceKey) {
-					const channel = channelFor(topic);
-					scheduleRelay(channel, JSON.stringify({ instanceId, coalesced: true, topic, event, data, coalesceKey }), [topic]);
+					const prepared = prepareCoalescedEnvelope(instanceId, topic, event, data, coalesceKey);
+					return scheduleRelay(channelFor(topic), stringifyRelayEnvelope(prepared.env, prepared.json), [topic]);
 				},
 				sendCoalesced: typeof platform.sendCoalesced === 'function' ? platform.sendCoalesced.bind(platform) : undefined,
 				request: typeof platform.request === 'function' ? platform.request.bind(platform) : undefined,

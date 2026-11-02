@@ -60,6 +60,9 @@ import { createCursor } from 'svelte-adapter-uws-extensions/redis/cursor';
 import { createRateLimit } from 'svelte-adapter-uws-extensions/redis/ratelimit';
 import { createPresence } from 'svelte-adapter-uws-extensions/redis/presence';
 import { createPgClient } from 'svelte-adapter-uws-extensions/postgres';
+import { createPubSubBus } from 'svelte-adapter-uws-extensions/redis/pubsub';
+import { createShardedBus } from 'svelte-adapter-uws-extensions/redis/sharded-pubsub';
+import type { Platform } from 'svelte-adapter-uws';
 import { mockPlatform } from 'svelte-adapter-uws-extensions/testing';
 import { createMetrics, wireBreakerMetrics } from 'svelte-adapter-uws-extensions/prometheus';
 import { createCircuitBreaker } from 'svelte-adapter-uws-extensions/breaker';
@@ -83,6 +86,16 @@ platform.publishBatched([], { compress: 'true' });
 // @ts-expect-error Coalescing keys must be strings.
 platform.publishBatched([{ topic: 'room', event: 'changed', coalesceKey: 1 }]);
 declare const redis: RedisClient;
+declare const nativePlatform: Platform;
+for (const bus of [createPubSubBus(redis), createShardedBus(redis)]) {
+  const wrapped = bus.wrap(nativePlatform);
+  const admitted: boolean = wrapped.relayCoalesced('room', 'changed', { n: 1 }, null);
+  const processId: string | undefined = wrapped.processId;
+  // @ts-expect-error Coalescing keys must be strings or null.
+  wrapped.relayCoalesced('room', 'changed', null, 1);
+  // @ts-expect-error The process identity is read-only.
+  wrapped.processId = 'replacement';
+}
 createRateLimit(redis, { points: 3, interval: 1000, budget: 'tenant' });
 createRateLimit(redis, { points: 3, interval: 1000, budget: 'principal' });
 // @ts-expect-error A global budget is not a declared scope.

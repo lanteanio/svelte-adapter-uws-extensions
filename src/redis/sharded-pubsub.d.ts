@@ -93,7 +93,10 @@ export interface ShardedBus {
 	 * delivering locally, and throws RangeError (code RELAY_QUEUE_FULL) without
 	 * delivering anything when the queue cannot admit them all.
 	 */
-	wrap(platform: Platform): Platform;
+	wrap(platform: Platform): Platform & {
+		readonly processId?: string;
+		relayCoalesced(topic: string, event: string, data?: unknown, coalesceKey?: string | null): boolean;
+	};
 
 	/**
 	 * Open the subscriber connection. Runs `INFO server` and throws

@@ -181,6 +181,7 @@ export interface PresenceMetricsSnapshot {
  * operation in this package.
  */
 export class WsClosedError extends Error {
+	static [Symbol.hasInstance](value: unknown): boolean;
 	name: 'WsClosedError';
 	code: 'WS_CLOSED';
 	operation: string;

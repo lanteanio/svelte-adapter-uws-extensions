@@ -1,6 +1,7 @@
 import { operationError } from '../shared/errors.js';
 import { registerClusterHealth, redisConnectionState } from '../shared/cluster-dashboard.js';
 import { collapseByCoalesceKey } from '../shared/_coalesce-batch.js';
+import { prepareCoalescedEnvelope, stringifyRelayEnvelope } from '../shared/coalesced-envelope.js';
 /**
  * Redis pub/sub bus for svelte-adapter-uws.
  *
@@ -311,11 +312,11 @@ export function createPubSubBus(client, options = {}) {
 					attributes: { maxEnvelopeBytes: validator.maxBytes }
 				});
 			}
-			return;
+			return false;
 		}
 		envelopeOversized = false;
 		assert(count >= 1, 'pubsub.relay-batch.count-positive', { count });
-		relayQueue.push(msg, count);
+		return relayQueue.push(msg, count);
 	}
 
 	// Relay one envelope from inside a producer operation, carrying its trace
@@ -325,27 +326,25 @@ export function createPubSubBus(client, options = {}) {
 	// goes without them instead. An envelope over the cap on its own is
 	// reported and dropped by scheduleRelay.
 	let traceOmissionReported = false;
-	function relayTraced(env, count, traceContext) {
+	function relayTraced(env, count, traceContext, dataJson) {
 		if (traceContext === null) {
-			scheduleRelay(JSON.stringify(env), count);
-			return;
+			return scheduleRelay(stringifyRelayEnvelope(env, dataJson), count);
 		}
 		injectTraceContext(env, traceContext);
-		const traced = JSON.stringify(env);
+		const traced = stringifyRelayEnvelope(env, dataJson);
 		if (validator.acceptRaw(traced)) {
-			scheduleRelay(traced, count);
-			return;
+			return scheduleRelay(traced, count);
 		}
 		delete env.traceparent;
 		delete env.tracestate;
-		const plain = JSON.stringify(env);
+		const plain = stringifyRelayEnvelope(env, dataJson);
 		if (!traceOmissionReported && validator.acceptRaw(plain)) {
 			traceOmissionReported = true;
 			emitRegisteredFailure(EXTENSIONS_ERROR_IDS.PUBSUB_TRACE_OMITTED, {
 				attributes: { maxEnvelopeBytes: validator.maxBytes }
 			});
 		}
-		scheduleRelay(plain, count);
+		return scheduleRelay(plain, count);
 	}
 
 	// Only a bus with a breaker publishes degraded / recovered, so only there
@@ -658,7 +657,7 @@ export function createPubSubBus(client, options = {}) {
 			// Skip messages from this instance (echo suppression).
 			// One check per envelope; batched envelopes carry one
 			// instanceId for the whole batch.
-			if (parsed.instanceId === instanceId) {
+			if (parsed.instanceId === instanceId || (typeof parsed.processId === 'string' && parsed.processId === activePlatform?.processId)) {
 				mEchoSuppressed?.inc();
 				return;
 			}
@@ -884,8 +883,10 @@ export function createPubSubBus(client, options = {}) {
 					catch (err) { relayQueue.withdraw(admitted, 1); throw err; }
 				});
 			};
-			const relayCoalescedTraced = (topic, event, data, coalesceKey) => traced((traceContext) =>
-				relayTraced({ instanceId, coalesced: true, topic, event, data, coalesceKey }, 1, traceContext));
+			const relayCoalescedTraced = (topic, event, data, coalesceKey) => {
+				const prepared = prepareCoalescedEnvelope(instanceId, topic, event, data, coalesceKey);
+				return traced((traceContext) => relayTraced(prepared.env, 1, traceContext, prepared.json));
+			};
 			const publishWireTraced = (topic, event, data, wire, options) => {
 				if (!(wire && wire.shared === true && (!options || options.relay !== false))) {
 					return platform.publishWire(topic, event, data, wire, options);
@@ -958,6 +959,7 @@ export function createPubSubBus(client, options = {}) {
 			// batch, publishBatched and topicEpoch read the platform's member (and
 			// topicEpoch its replay tracker) when called.
 			const wrapped = {
+				get processId() { return platform.processId; },
 				publish(topic, event, data, options) {
 					if (options && options.relay === false) return platform.publish(topic, event, data, options);
 					// The bus is this publish's fan-out to every other worker and
@@ -995,7 +997,8 @@ export function createPubSubBus(client, options = {}) {
 				// subscribers. Echo-suppressed by instanceId, so the publishing
 				// instance never double-delivers.
 				relayCoalesced(topic, event, data, coalesceKey) {
-					scheduleRelay(JSON.stringify({ instanceId, coalesced: true, topic, event, data, coalesceKey }), 1);
+					const prepared = prepareCoalescedEnvelope(instanceId, topic, event, data, coalesceKey);
+					return scheduleRelay(stringifyRelayEnvelope(prepared.env, prepared.json), 1);
 				},
 				sendCoalesced: typeof platform.sendCoalesced === 'function' ? platform.sendCoalesced.bind(platform) : undefined,
 				request: typeof platform.request === 'function' ? platform.request.bind(platform) : undefined,
