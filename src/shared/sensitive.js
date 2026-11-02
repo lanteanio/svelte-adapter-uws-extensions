@@ -178,7 +178,9 @@ export function stripInternal(obj, ancestors, depth, budget, dropKey) {
  * embed in log lines and error messages. Substitutes the userinfo password
  * with `***` and any `password=` / `pass=` / `pwd=` query-string value
  * with `***`. Other URL bytes (scheme, user, host, port, path, fragment,
- * non-password query params) pass through unchanged. Defensive against
+ * non-password query params) pass through unchanged where boundaries are
+ * unambiguous. Query passwords can consume trailing free text because drivers
+ * accept whitespace inside them. Defensive against
  * non-string input so callers can pipe through arbitrary error context
  * without a type guard.
  *
@@ -188,182 +190,114 @@ export function stripInternal(obj, ancestors, depth, budget, dropKey) {
  * - **Passwords containing `@`** (`redis://user:p@ssword@host`). A naive
  *   first-`@` regex stops too early and leaks the tail of the password.
  *   The scan walks to the LAST `@` in the authority region.
- * - **IPv6 hosts** (`redis://:secret@[::1]:6379`). Bracket characters
- *   suspend authority-terminator detection so `/`, `:`, `@` inside `[...]`
- *   are not mistaken for authority boundaries.
+ * - **IPv6 hosts** (`redis://:secret@[::1]:6379`). Host brackets are
+ *   preserved, while raw brackets in userinfo remain credential bytes.
  * - **Query-string passwords** (`postgres://host/db?password=hunter2`).
  *   pg accepts `password` as a connection parameter; redaction is
  *   case-insensitive and matches `password` / `pass` / `pwd`.
  * - **Every URL in the string, not just the first.** Callers pass whole
  *   error messages and whole stack traces, which routinely carry the DSN
  *   more than once; redacting only the first occurrence leaks the rest.
- *   Each URL is bounded at the next whitespace byte so free text after it is
- *   neither scanned nor rewritten - the query-value match would otherwise
- *   run past a newline and swallow the remaining stack frames.
+ *   Whitespace ends ordinary URL text, but remains a credential byte until
+ *   an authority `@` or a query parameter/fragment boundary. JSON containers
+ *   are decoded per string so unrelated fields and formatting are retained.
  *
  * @param {unknown} url
  * @returns {string}
  */
 export function redactConnectionUrl(url) {
 	if (typeof url !== 'string' || url.length === 0) return String(url);
-	if (url.indexOf('://') === -1) return url;
-
-	let out = '';
-	let cursor = 0;
-	let from = 0;
-	// The first whitespace at or after the last lookup. Every later URL in the
-	// same whitespace-free run shares it, so the scan stays linear in the
-	// input rather than rescanning the run once per URL.
-	let ws = -1;
-	for (;;) {
-		const at = url.indexOf('://', from);
-		if (at === -1) break;
-		// Where this URL stops: the first whitespace, or the start of the NEXT
-		// URL's scheme, whichever comes first. Both bounds are load-bearing.
-		// Without the whitespace bound the query-value match runs past a
-		// newline and swallows the rest of a stack trace. Without the
-		// next-scheme bound, two DSNs with no whitespace between them (a
-		// compact JSON config line is the ordinary carrier) become ONE token:
-		// only one authority is found, and the scan resumes past both, so
-		// every later credential in that run is re-emitted verbatim.
-		if (ws < at + 3) ws = whitespaceAt(url, at + 3);
-		const nextScheme = url.indexOf('://', at + 3);
-		const end = nextScheme === -1 ? ws : Math.min(ws, schemeStart(url, nextScheme));
-		out += url.slice(cursor, at) + redactUrlRegion(url.slice(at, end));
-		cursor = end;
-		from = end;
+	// Decode valid JSON strings before looking for schemes, including schemes
+	// whose slashes are escaped. Preserve all other fields and formatting.
+	if (/^\s*[\[{\"]/.test(url)) {
+		try {
+			JSON.parse(url);
+			return url.replace(/"(?:[^"\\]|\\.)*"/g, token => {
+				const value = JSON.parse(token);
+				const safe = redactConnectionUrl(value);
+				return safe === value ? token : JSON.stringify(safe);
+			});
+		} catch { /* free text: use conservative credential boundaries */ }
 	}
-	return out + url.slice(cursor);
-}
 
-/**
- * Index of the first whitespace byte at or after `from`, else `s.length`.
- *
- * Whitespace is the ONLY generic terminator. Quotes, backticks and angle
- * brackets look like sensible delimiters and are not safe ones here: `'` and
- * the other RFC 3986 sub-delims (`!$&'()*+,;=`) are legal unescaped in a
- * userinfo password, so treating one as a terminator cuts the token before
- * the authority `@` and the whole credential is re-emitted. `]` is likewise
- * not a terminator - it closes an IPv6 host.
- *
- * @param {string} s
- * @param {number} from
- * @returns {number}
- */
-function whitespaceAt(s, from) {
-	for (let i = from; i < s.length; i++) {
-		const c = s.charCodeAt(i);
-		if (c === 32 || c === 9 || c === 10 || c === 13 || c === 12 || c === 11) return i;
+	// WHATWG parsing removes these controls even inside schemes and keys.
+	// Keep an offset map only when needed, so the output retains original
+	// non-credential text rather than normalizing a whole diagnostic.
+	let scan = url;
+	let offsets = null;
+	if (/[\t\n\r]/.test(url)) {
+		offsets = [];
+		const chars = [];
+		for (let i = 0; i < url.length; i++) {
+			const code = url.charCodeAt(i);
+			if (code === 9 || code === 10 || code === 13) continue;
+			chars.push(url[i]);
+			offsets.push(i);
+		}
+		scan = chars.join('');
 	}
-	return s.length;
-}
+	if (!scan.includes('://')) return url;
 
-/**
- * Walk back from a `://` over the scheme characters (ALPHA / DIGIT / `+`
- * `-` `.`) to where that URL actually begins, so the PRECEDING url can be
- * cut there rather than swallowing it.
- *
- * @param {string} s
- * @param {number} colonIdx - index of the `://`
- * @returns {number}
- */
-function schemeStart(s, colonIdx) {
-	let i = colonIdx;
-	while (i > 0) {
-		const c = s.charCodeAt(i - 1);
-		const isSchemeChar =
-			(c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
-			(c >= 48 && c <= 57) || c === 43 || c === 45 || c === 46;
-		if (!isSchemeChar) break;
-		i--;
+	// Collect ranges on the original scan before removing anything. A query
+	// password can contain another apparent URL, whose own password must also
+	// be found even when its scheme falls inside the first redacted range.
+	const boundaries = [];
+	for (let i = 0; i < scan.length; i++) {
+		if (scan[i] === '&' || scan[i] === '#') boundaries.push(i);
 	}
-	return i;
-}
-
-/**
- * Redact ONE url token. `url` begins at its `://`.
- *
- * @param {string} url
- * @returns {string}
- */
-function redactUrlRegion(url) {
-	const protoEnd = 0;
-	const userinfoStart = protoEnd + 3;
-
-	// Scan the authority region (from `://` to the first unbracketed
-	// `/`, `?`, `#`, or end-of-string). Track the LAST `@` in the
-	// region so a password containing `@` is redacted in full. Skip
-	// bytes inside `[...]` so IPv6 host colons / `@` are not parsed
-	// as userinfo terminators.
-	let atIdx = -1;
-	let authorityEnd = url.length;
-	let inBracket = false;
-	for (let i = userinfoStart; i < url.length; i++) {
-		const c = url.charCodeAt(i);
-		if (c === 91 /* [ */) inBracket = true;
-		else if (c === 93 /* ] */) inBracket = false;
-		else if (!inBracket) {
-			if (c === 64 /* @ */) atIdx = i;
-			else if (c === 47 /* / */ || c === 63 /* ? */ || c === 35 /* # */) {
-				authorityEnd = i;
-				break;
+	boundaries.push(scan.length);
+	let boundary = 0;
+	const ranges = [];
+	function hide(start, end) {
+		if (start >= end) return;
+		const previous = ranges[ranges.length - 1];
+		if (previous && start <= previous[1]) previous[1] = Math.max(previous[1], end);
+		else ranges.push([start, end]);
+	}
+	let active = false, query = false, fragment = false, pendingQuery = false, field = -1;
+	for (let i = 0; i < scan.length; i++) {
+		while (boundaries[boundary] <= i) boundary++;
+		const char = scan[i];
+		if (char === ':' && scan[i + 1] === '/' && scan[i + 2] === '/') {
+			active = true;
+			// A scheme inside a query value cannot end the enclosing query.
+			// Its own first ? can also introduce an embedded URL's query.
+			pendingQuery = true;
+			fragment = false;
+			field = -1;
+			let colon = -1, at = -1;
+			for (let j = i + 3; j < scan.length; j++) {
+				const part = scan[j];
+				if (part === '/' || part === '?' || part === '#') break;
+				if (part === ':' && colon === -1) colon = j;
+				if (part === '@') at = j;
 			}
+			if (colon !== -1 && at > colon + 1) hide(colon + 1, at);
+			continue;
+		}
+		if (!active) continue;
+		if (char === '#') { fragment = true; query = false; pendingQuery = false; field = -1; }
+		else if (char === '?' && (!query || pendingQuery) && !fragment) { query = true; pendingQuery = false; field = i + 1; }
+		else if (char === '&' && query) field = i + 1;
+		else if (char === '=' && field !== -1) {
+			if (isPasswordParameter(scan.slice(field, i))) hide(i + 1, boundaries[boundary]);
+			field = -1;
 		}
 	}
-
-	let result = url;
-
-	if (atIdx !== -1) {
-		// Find the first `:` between userinfo-start and the authority `@`.
-		// That opens the password segment. (Subsequent `:` chars inside
-		// the password are part of the password and stay.)
-		let colonIdx = -1;
-		for (let i = userinfoStart; i < atIdx; i++) {
-			if (url.charCodeAt(i) === 58 /* : */) { colonIdx = i; break; }
-		}
-		// Only redact a non-empty password segment. `user:@host` (empty
-		// password) and `user@host` (no password) pass through untouched.
-		if (colonIdx !== -1 && atIdx > colonIdx + 1) {
-			result = result.slice(0, colonIdx + 1) + '***' + result.slice(atIdx);
-		}
+	let result = '', cursor = 0;
+	for (const [start, end] of ranges) {
+		const originalStart = offsets ? offsets[start] : start;
+		const originalEnd = offsets ? (offsets[end] ?? url.length) : end;
+		result += url.slice(cursor, originalStart) + '***';
+		cursor = originalEnd;
 	}
+	return result + url.slice(cursor);
+}
 
-	// Query-string password redaction. Match `(^|&)pass(word)?=` and `&pwd=`
-	// case-insensitively, replacing the value up to the next `&` or end of
-	// the query region with `***`. The query region is between the first
-	// `?` after the authority and the first `#` after that `?` (or end of
-	// string). A `?` that appears AFTER `#` is part of the fragment and
-	// not a query separator. Indices are located on the POST-redaction
-	// string: userinfo redaction above changes the string length whenever
-	// the password is not exactly 3 chars, so an offset captured from the
-	// original url would silently miss the real `?` and leak the query
-	// password.
-	const redactedAuthorityEnd = authorityEnd - (url.length - result.length);
-	const hashStart = result.indexOf('#', Math.max(redactedAuthorityEnd, 0));
-	const queryHorizon = hashStart === -1 ? result.length : hashStart;
-	const queryStart = result.indexOf('?', Math.max(redactedAuthorityEnd, 0));
-	if (queryStart !== -1 && queryStart < queryHorizon) {
-		const queryEnd = queryHorizon;
-		const query = result.slice(queryStart + 1, queryEnd);
-		// The value runs to the next `&` - or to the first character that
-		// cannot appear in a query at all. RFC 3986 query = pchar / "/" / "?",
-		// so `"` backtick `< > \ { } | ^ [ ]` are all invalid there, while the
-		// sub-delims `'()!,;=$*+` ARE valid and must stay inside the match.
-		// The userinfo scan above cannot use the same set (sub-delims are
-		// legal in a password), which is why the two positions differ. Without
-		// this, a value with no trailing `&` ran to the whitespace bound and
-		// ate the rest of the line - `?password=x","user":"bob"` collapsed to
-		// `?password=***`, destroying real data to hide a credential.
-		const newQuery = query.replace(
-			/(^|&)(pass(?:word)?|pwd)=[^&"`<>\\{}|^[\]\s]+/gi,
-			'$1$2=***'
-		);
-		if (newQuery !== query) {
-			result = result.slice(0, queryStart + 1) + newQuery + result.slice(queryEnd);
-		}
-	}
-
-	return result;
+/** @param {string} key */
+function isPasswordParameter(key) {
+	try { return /^(?:password|pass|pwd)$/i.test(decodeURIComponent(key.replace(/\+/g, ' '))); }
+	catch { return false; }
 }
 
 /**

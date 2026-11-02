@@ -64,7 +64,8 @@ export const STRIP_MAX_NODES: number;
  * embed in log lines and error messages. Substitutes the userinfo
  * password with `***` and any `password=` / `pass=` / `pwd=` query-string
  * value with `***`. Other URL bytes (scheme, user, host, port, path,
- * fragment, non-password query params) pass through unchanged. Defensive
+ * fragment, non-password query params) pass through unchanged where their
+ * boundaries are unambiguous. Defensive
  * against non-string input so callers can pipe through arbitrary error
  * context without a type guard.
  *
@@ -73,16 +74,20 @@ export const STRIP_MAX_NODES: number;
  *
  * - **Passwords containing `@`** (`redis://user:p@ssword@host`). Walks
  *   to the last `@` in the authority region.
- * - **IPv6 hosts** (`redis://:secret@[::1]:6379`). Suspends
- *   authority-terminator detection inside `[...]`.
+ * - **IPv6 hosts** (`redis://:secret@[::1]:6379`). Keeps host brackets
+ *   without treating brackets inside a password as host syntax.
  * - **Query-string passwords** (`postgres://host/db?password=hunter2`).
- *   Case-insensitive match on `password` / `pass` / `pwd` keys.
+ *   Case-insensitive match on decoded `password` / `pass` / `pwd` keys;
+ *   raw punctuation remains part of the value through the next `&`.
  * - **Every URL in the string.** Whole messages and whole stack traces are
- *   valid input and routinely carry the DSN more than once. Each URL runs
- *   to the next whitespace byte, so free text after it is left alone -
+ *   valid input and routinely carry the DSN more than once. Whitespace
+ *   terminates ordinary URL text, but remains part of a credential -
  *   punctuation such as a closing quote is NOT a terminator, because the
  *   sub-delims `!$&'()*+,;=` are legal unescaped in a userinfo password and
  *   stopping at one would leave the credential unredacted.
+ *   Valid JSON containers retain their string boundaries and other fields.
+ *   Query passwords without a parameter or fragment boundary can consume
+ *   trailing free text, including line breaks, to prevent suffix disclosure.
  *
  * @example
  * redactConnectionUrl('redis://:s3cret@redis.internal:6379');
