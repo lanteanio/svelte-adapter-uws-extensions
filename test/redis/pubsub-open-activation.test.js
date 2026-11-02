@@ -24,7 +24,7 @@ try {
 const describeUWS = uWS ? describe : describe.skip;
 
 const EVENT = 'redis.pubsub.subscribe.failed';
-const REMOTE = JSON.stringify({ instanceId: 'other-instance', topic: '__realtime', event: 'remote', data: 1 });
+const REMOTE = JSON.stringify({ instanceId: 'other-instance', topic: '__realtime', event: 'degraded', data: { at: 1, mitigation: { messageKey: 'activation.probe' } } });
 
 /** @type {Array<() => unknown>} */
 const cleanups = [];
@@ -47,7 +47,7 @@ async function until(check, ms = 3000) {
 }
 
 /** The remote frames a connection received. */
-const remoteFrames = (c) => c.messages.filter((m) => m.topic === '__realtime' && m.event === 'remote');
+const remoteFrames = (c) => c.messages.filter((m) => m.topic === '__realtime' && m.event === 'degraded' && m.data?.mitigation?.messageKey === 'activation.probe');
 
 /** The failure lines printed so far. */
 function reports() {
@@ -154,7 +154,7 @@ describe('pub/sub bus open hook when activation fails', () => {
 			refuse.on = false;
 			await vi.advanceTimersByTimeAsync(1000);
 			await client.redis.publish('uws:pubsub', REMOTE);
-			expect(platform.published.filter((p) => p.event === 'remote')).toHaveLength(1);
+			expect(platform.published.filter((p) => p.topic === '__realtime' && p.event === 'degraded' && p.data?.mitigation?.messageKey === 'activation.probe')).toHaveLength(1);
 			expect(lines).toHaveLength(1);
 		} finally {
 			vi.useRealTimers();

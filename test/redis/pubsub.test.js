@@ -1544,14 +1544,14 @@ describe('redis pubsub bus', () => {
 			expect(frames(a.platform)[0].data.recovery).toEqual(decided);
 		});
 
-		it('passes an application recovered event relayed on systemChannel through untouched', async () => {
+		it('passes a valid recovered event without a refetch hint through untouched', async () => {
 			const a = await instance();
 			const b = await instance();
-			a.wrapped.publish('__realtime', 'recovered', { custom: 'x' });
+			a.wrapped.publish('__realtime', 'recovered', { at: 1, recovery: { custom: 'x' } });
 			await tick();
 			await hold();
 			expect(frames(b.platform)).toHaveLength(1);
-			expect(frames(b.platform)[0].data).toEqual({ custom: 'x' });
+			expect(frames(b.platform)[0].data).toEqual({ at: 1, recovery: { custom: 'x' } });
 		});
 
 		it('delivers a peer request unchanged on a bus without a breaker', async () => {

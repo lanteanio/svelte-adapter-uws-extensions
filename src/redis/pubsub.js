@@ -18,6 +18,7 @@ import { randomBytes, now, monotonicNow, setTimer, clearTimer } from '../shared/
 import { fallbackRandom, fallbackHlc } from '../shared/platform-fallback.js';
 import { createRelayQueue } from './_relay-queue.js';
 import { createBusValidator } from '../shared/bus-validate.js';
+import { isHealthEvent } from '../shared/health-envelope.js';
 import { createRelayMetrics } from './_relay-metrics.js';
 import { firstCommandError, isCluster } from '../shared/cluster.js';
 import {
@@ -361,6 +362,11 @@ export function createPubSubBus(client, options = {}) {
 		});
 	}
 
+	function acceptInboundEnvelope(topic, event, data) {
+		return validator.acceptEnvelope(topic, event)
+			&& (!(topic === '__realtime' || topic === systemChannel) || isHealthEvent(event, data));
+	}
+
 	// Local delivery of one envelope relayed by another instance. The untraced
 	// receive path calls it directly; on a Platform with a tracing provider it
 	// runs inside a consumer operation parented on the producer's context.
@@ -371,7 +377,7 @@ export function createPubSubBus(client, options = {}) {
 		// precede the batch/single branches - a plain publish would
 		// broadcast and defeat the per-key coalesce.
 		if (parsed.coalesced === true) {
-			if (!validator.acceptEnvelope(parsed.topic, parsed.event)) {
+			if (!acceptInboundEnvelope(parsed.topic, parsed.event, parsed.data)) {
 				mParseErrors?.inc();
 				return;
 			}
@@ -402,7 +408,7 @@ export function createPubSubBus(client, options = {}) {
 		// pure-subscriber instance that never registered it) - still a
 		// correct delivery. Precedes the batch/single branches.
 		if (parsed.wire === true) {
-			if (typeof parsed.capability !== 'string' || !validator.acceptEnvelope(parsed.topic, parsed.event)) {
+			if (typeof parsed.capability !== 'string' || !acceptInboundEnvelope(parsed.topic, parsed.event, parsed.data)) {
 				mParseErrors?.inc();
 				return;
 			}
@@ -420,7 +426,7 @@ export function createPubSubBus(client, options = {}) {
 			const local = [];
 			for (let i = 0; i < parsed.batch.length; i++) {
 				const m = parsed.batch[i];
-				if (!m || !validator.acceptEnvelope(m.topic, m.event)) {
+				if (!m || !acceptInboundEnvelope(m.topic, m.event, m.data)) {
 					mParseErrors?.inc();
 					continue;
 				}
@@ -443,7 +449,7 @@ export function createPubSubBus(client, options = {}) {
 				}
 			}
 		} else {
-			if (!validator.acceptEnvelope(parsed.topic, parsed.event)) {
+			if (!acceptInboundEnvelope(parsed.topic, parsed.event, parsed.data)) {
 				mParseErrors?.inc();
 				return;
 			}
@@ -659,6 +665,10 @@ export function createPubSubBus(client, options = {}) {
 			// instanceId for the whole batch.
 			if (parsed.instanceId === instanceId || (typeof parsed.processId === 'string' && parsed.processId === activePlatform?.processId)) {
 				mEchoSuppressed?.inc();
+				return;
+			}
+			if ((parsed.topic === '__realtime' || parsed.topic === systemChannel) && !isHealthEvent(parsed.event, parsed.data)) {
+				mParseErrors?.inc();
 				return;
 			}
 			// A peer's refetch request is not forwarded as it came on a bus with

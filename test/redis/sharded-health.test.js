@@ -131,7 +131,7 @@ describe('sharded bus health events and refetch hints', () => {
 
 	it('leaves an envelope on __realtime without a refetch request alone', async () => {
 		const a = await instance();
-		await client.redis.spublish(HEALTH_CHANNEL, JSON.stringify({ instanceId: 'peer', topic: '__realtime', event: 'recovered', data: { custom: 'x' } }));
+		await client.redis.spublish(HEALTH_CHANNEL, JSON.stringify({ instanceId: 'peer', topic: '__realtime', event: 'recovered', data: { at: 1, recovery: { custom: 'x' } } }));
 		await hold();
 		expect(frames(a.platform)).toHaveLength(0);
 	});

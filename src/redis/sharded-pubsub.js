@@ -32,6 +32,7 @@ import { fallbackRandom, fallbackHlc } from '../shared/platform-fallback.js';
 import { parseRedisVersion } from '../shared/redis-version.js';
 import { MAX_SHARDED_BUS_TOPICS } from '../shared/caps.js';
 import { createBusValidator } from '../shared/bus-validate.js';
+import { isHealthEvent } from '../shared/health-envelope.js';
 import { createRelayMetrics } from './_relay-metrics.js';
 import { createRelayQueue } from './_relay-queue.js';
 import { execMultiSlot, firstCommandError, isCluster, keySlot } from '../shared/cluster.js';
@@ -397,6 +398,11 @@ export function createShardedBus(client, options = {}) {
 		return scheduleRelay(channel, plain, topics);
 	}
 
+	function acceptInboundEnvelope(topic, event, data) {
+		return validator.acceptEnvelope(topic, event)
+			&& (!(topic === HEALTH_TOPIC) || isHealthEvent(event, data));
+	}
+
 	// Local delivery of one envelope relayed by another instance. The untraced
 	// receive path calls it directly; on a Platform with a tracing provider it
 	// runs inside a consumer operation parented on the producer's context.
@@ -406,7 +412,7 @@ export function createShardedBus(client, options = {}) {
 		// Precedes the batch/single branches so a coalesced frame is never
 		// broadcast.
 		if (parsed.coalesced === true) {
-			if (!validator.acceptEnvelope(parsed.topic, parsed.event) || String(shardKey(parsed.topic)) !== receivedShard) {
+			if (!acceptInboundEnvelope(parsed.topic, parsed.event, parsed.data) || String(shardKey(parsed.topic)) !== receivedShard) {
 				mParseErrors?.inc();
 				return;
 			}
@@ -433,7 +439,7 @@ export function createShardedBus(client, options = {}) {
 		// codec is not registered here (a pure-subscriber instance) - still a
 		// correct delivery. Precedes the batch/single branches.
 		if (parsed.wire === true) {
-			if (typeof parsed.capability !== 'string' || !validator.acceptEnvelope(parsed.topic, parsed.event) || String(shardKey(parsed.topic)) !== receivedShard) {
+			if (typeof parsed.capability !== 'string' || !acceptInboundEnvelope(parsed.topic, parsed.event, parsed.data) || String(shardKey(parsed.topic)) !== receivedShard) {
 				mParseErrors?.inc();
 				return;
 			}
@@ -451,7 +457,7 @@ export function createShardedBus(client, options = {}) {
 			const local = [];
 			for (let i = 0; i < parsed.batch.length; i++) {
 				const m = parsed.batch[i];
-				if (!m || !validator.acceptEnvelope(m.topic, m.event) || String(shardKey(m.topic)) !== receivedShard) {
+				if (!m || !acceptInboundEnvelope(m.topic, m.event, m.data) || String(shardKey(m.topic)) !== receivedShard) {
 					mParseErrors?.inc();
 					continue;
 				}
@@ -474,7 +480,7 @@ export function createShardedBus(client, options = {}) {
 				}
 			}
 		} else {
-			if (!validator.acceptEnvelope(parsed.topic, parsed.event) || String(shardKey(parsed.topic)) !== receivedShard) {
+			if (!acceptInboundEnvelope(parsed.topic, parsed.event, parsed.data) || String(shardKey(parsed.topic)) !== receivedShard) {
 				mParseErrors?.inc();
 				return;
 			}
@@ -664,6 +670,10 @@ export function createShardedBus(client, options = {}) {
 					return;
 				}
 				if (!activePlatform) return;
+				if (parsed.topic === HEALTH_TOPIC && !isHealthEvent(parsed.event, parsed.data)) {
+					mParseErrors?.inc();
+					return;
+				}
 				// A peer's refetch request: requests from several peers merge into
 				// one frame, published once this instance's breaker is healthy.
 				if (ch === hintShard && parsed.topic === HEALTH_TOPIC && isRefetchRequest(parsed)) {
