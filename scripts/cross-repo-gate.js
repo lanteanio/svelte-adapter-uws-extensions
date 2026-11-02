@@ -26,7 +26,11 @@
  *   contracts native WebSocket delivery through the packed realtime message
  *            hook and extensions bus preserves local and remote values/order.
  *
- * Those five are the cross-head proof: they run against the tarballs. The rest
+ *   delivery-contracts native Redis/PostgreSQL revocation with stream/derived
+ *            authorization. Requires explicit loopback INTEGRATION_REDIS_URL
+ *            and INTEGRATION_POSTGRES_URL for isolated test services.
+ *
+ * These are the cross-head proof: they run against the tarballs. The rest
  * re-run each repo's own suite IN ITS OWN TREE, where the sibling heads come
  * from that tree's node_modules (the registry), NOT from the packed heads:
  *
@@ -597,6 +601,25 @@ function parseTscErrors(text) {
 	return out;
 }
 
+function rungDeliveryContracts() {
+	for (const key of ['INTEGRATION_REDIS_URL', 'INTEGRATION_POSTGRES_URL']) {
+		if (!process.env[key]) {
+			record('delivery-contracts', FAIL, key + ' must explicitly name an isolated loopback test service');
+			return false;
+		}
+	}
+	for (const name of ['cross-repo-delivery.mjs', 'cross-repo-delivery-worker.mjs']) {
+		writeFileSync(join(state.consumer, name), readFileSync(join(HERE, 'scripts', 'fixtures', name)));
+	}
+	const r = run(process.execPath, [join(state.consumer, 'cross-repo-delivery.mjs')], state.consumer, { env: { REQUIRE_UWS: '1' }, timeout: 120000 });
+	if (r.code !== 0 || !r.stdout.includes('Packed delivery contract passed:')) {
+		record('delivery-contracts', FAIL, 'packed native backend delivery authorization failed', r.stdout + '\n' + r.stderr);
+		return false;
+	}
+	record('delivery-contracts', PASS, 'real Redis/PG cross-process revocation; native raw, realtime stream and opaque derived deliveries');
+	return true;
+}
+
 function rungContracts() {
 	const fixture = join(state.consumer, 'cross-repo-runtime.mjs');
 	writeFileSync(fixture, readFileSync(join(HERE, 'scripts', 'fixtures', 'cross-repo-runtime.mjs')));
@@ -755,6 +778,7 @@ const RUNGS = [
 	{ name: 'peers', quick: true, needs: ['install'], run: rungPeers },
 	{ name: 'types', quick: true, needs: ['install'], run: rungTypes },
 	{ name: 'contracts', quick: true, needs: ['install'], run: rungContracts },
+	{ name: 'delivery-contracts', quick: false, needs: ['install'], run: rungDeliveryContracts },
 	{ name: 'check', quick: false, needs: [], run: () => rungPerRepo('check', 'check', 'own check passes') },
 	{ name: 'unit', quick: false, needs: [], run: () => rungPerRepo('unit', 'test', 'own unit suite passes') },
 	{ name: 'realtime-e2e', quick: false, needs: [], run: rungRealtimeE2E },
