@@ -463,7 +463,7 @@ export function createRedisIo({
 	 * HDEL; a refused REMOVE publish still reaches the breaker but does not
 	 * undo the erasure (other instances age the entry out).
 	 */
-	async function removeKeysBatch(topics, key) {
+	async function removeKeysBatch(topics, key, notifyLocal = false) {
 		const commands = [];
 		for (const t of topics) {
 			commands.push(['hdel', hashKey(t), key]);
@@ -484,6 +484,7 @@ export function createRedisIo({
 		else b?.success();
 		for (let i = 0; i < results.length; i += 2) {
 			if (results[i] && results[i][0]) return false;
+			if (notifyLocal && activePlatform) queueRemove(topics[i / 2], key, activePlatform);
 		}
 		return true;
 	}

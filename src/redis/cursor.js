@@ -92,6 +92,7 @@ const JSON_OPTIONS = Object.freeze({ relay: false, compress: false, seq: false }
  *   times per-mover rate. Default 16 (60Hz) suits typical small-to-medium
  *   rooms; raise to 33 (30Hz) for high-density rooms where wire bytes matter.
  *   0 disables the tick; per-cursor `throttle` then governs broadcast rate.
+ * @property {number} [maxMovers=64] - Most local and peer movers delivered per topic per tick. Infinity removes the bound; topicThrottle: 0 bypasses it.
  * @property {number} [snapshotIntervalMs=100] - How often to flush coalesced
  *   cursor positions to Redis HSET. The wire/relay path runs on the per-flush
  *   cadence (above) and does not wait for HSET; this timer only governs the
@@ -147,7 +148,7 @@ const JSON_OPTIONS = Object.freeze({ relay: false, compress: false, seq: false }
  * @property {(topic: string) => Promise<CursorEntry[]>} list
  * @property {() => Promise<void>} clear
  * @property {() => void} destroy - Stop the Redis subscriber
- * @property {() => { flushes: number, driftMeanMs: number, driftMaxMs: number, dirtyTopicsCurrent: number, activeTopicsTotal: number, jitterDropped: number, viewportsReported: number, perSubscriberFlushes: number, bpSkips: number, culledEntriesDropped: number }} stats - Scheduler health snapshot
+ * @property {() => { flushes: number, driftMeanMs: number, driftMaxMs: number, dirtyTopicsCurrent: number, activeTopicsTotal: number, jitterDropped: number, viewportsReported: number, perSubscriberFlushes: number, bpSkips: number, culledEntriesDropped: number, moversDeferred: number }} stats - Scheduler health snapshot
  */
 
 const validateOptions = defineOptions({
@@ -162,6 +163,7 @@ const validateOptions = defineOptions({
 	maxTopicLength: option.known,
 	throttle: option.known,
 	topicThrottle: option.known,
+	maxMovers: option.known,
 	select: option.known,
 	position: option.known,
 	minMove: option.known,
@@ -193,6 +195,7 @@ export function createCursor(client, options = {}) {
 		maxTopicLength,
 		throttleMs,
 		topicThrottleMs,
+		maxMovers,
 		snapshotIntervalMs,
 		select,
 		cursorTtl,
@@ -418,7 +421,12 @@ export function createCursor(client, options = {}) {
 	const roster = createRoster({
 		topics, instanceId, cursorTtl, snapshotIntervalMs, inputDropped,
 		revalidate: (topicList) => redisIo.validateRoster(topicList),
-		removeMissing: (topic, key, platform) => queueRemove(topic, key, platform)
+		removeMissing: (topic, key, platform) => {
+			const pending = topicFlush.get(topic);
+			pending?.order.delete(pending.inboundDirty.get(key));
+			pending?.inboundDirty.delete(key);
+			queueRemove(topic, key, platform);
+		}
 	});
 
 	function onPeerMessage(parsed, platform) {
@@ -445,6 +453,9 @@ export function createCursor(client, options = {}) {
 				} else inputDropped('invalid_envelope', 'relay_receive');
 			}
 		} else if (parsed.event === EVENTS.REMOVE && parsed.payload && typeof parsed.payload.key === 'string') {
+			const pending = topicFlush.get(parsed.topic);
+			pending?.order.delete(pending.inboundDirty.get(parsed.payload.key));
+			pending?.inboundDirty.delete(parsed.payload.key);
 			// Peer-relayed cursor removes are coalesced through the
 			// same tick buffer the local close path uses. Without
 			// this, a mass-disconnect on one instance produces an
@@ -534,6 +545,7 @@ export function createCursor(client, options = {}) {
 		bpEnabled,
 		bpMaxBufferedBytes,
 		topicThrottleMs,
+		maxMovers,
 		position,
 		viewportCell,
 		viewportPadding,
@@ -1028,13 +1040,16 @@ export function createCursor(client, options = {}) {
 						if (topicMap.size === 0) {
 							topics.delete(topic);
 							activeTopics.delete(topic);
-							topicFlush.delete(topic);
-							dirtyTopics.delete(topic);
+							if (!hasLocalInterest(topic)) {
+								topicFlush.delete(topic);
+								dirtyTopics.delete(topic);
+							}
 							dropTopicPending(topic);
 							stopCleanupTimer();
 						}
 						const flushState = topicFlush.get(topic);
 						if (flushState) {
+							flushState.order.delete(flushState.dirty.get(state.key));
 							flushState.dirty.delete(state.key);
 						}
 					} else {
@@ -1093,13 +1108,16 @@ export function createCursor(client, options = {}) {
 						if (topicMap.size === 0) {
 							topics.delete(t);
 							activeTopics.delete(t);
-							topicFlush.delete(t);
-							dirtyTopics.delete(t);
+							if (!hasLocalInterest(t)) {
+								topicFlush.delete(t);
+								dirtyTopics.delete(t);
+							}
 							dropTopicPending(t);
 						}
 					}
 					const flushState = topicFlush.get(t);
 					if (flushState) {
+						flushState.order.delete(flushState.dirty.get(state.key));
 						flushState.dirty.delete(state.key);
 					}
 					dropKeyPending(t, state.key);
@@ -1233,43 +1251,66 @@ export function createCursor(client, options = {}) {
 		 */
 		async purgeUser(tenantId, userId) {
 			if (typeof userId !== 'string' || userId.length === 0) return 0;
+			const selected = new Map();
+			const states = new Map();
+			for (const state of wsState.values()) states.set(state.key, state);
+			const matches = user => typeof user === 'string' ? user === userId :
+				!!(user && typeof user === 'object' && (user.id === userId || user.userId === userId));
+			const selectField = (topic, field) => {
+				let fields = selected.get(topic);
+				if (!fields) selected.set(topic, fields = new Set());
+				if (fields.has(field)) return;
+				fields.add(field);
+				// Erasure covers queued delivery as well as pending persistence.
+				// Drop both origins before any I/O can let the next tick run.
+				const pending = topicFlush.get(topic);
+				if (pending) {
+					pending.order.delete(pending.dirty.get(field));
+					pending.order.delete(pending.inboundDirty.get(field));
+					pending.dirty.delete(field);
+					pending.inboundDirty.delete(field);
+				}
+				dropKeyPending(topic, field);
+				const entries = topics.get(topic);
+				const entry = entries?.get(field);
+				if (entry?.timer) clearTimer(entry.timer);
+				if (entry?.settleTimer) clearTimer(entry.settleTimer);
+				entries?.delete(field);
+				if (entries?.size === 0) { topics.delete(topic); activeTopics.delete(topic); }
+				states.get(field)?.topics.delete(topic);
+				roster.record(topic, EVENTS.REMOVE, { key: field });
+			};
+			// A mover waiting for its first tick may have no Redis field yet.
+			roster.visitKnown((topic, field, user) => {
+				if (topicInTenant(tenantId, topic) && matches(user)) selectField(topic, field);
+			});
+			for (const [topic, entries] of topics) {
+				if (!topicInTenant(tenantId, topic)) continue;
+				for (const [field, entry] of entries) if (matches(entry.user)) selectField(topic, field);
+			}
 			const prefix = client.key('cursor:{');
 			let keys;
 			try { keys = await scanKeys(redis, hashKey('*')); } catch { inputDropped('scan_failed', 'erase'); return 0; }
-			let n = 0;
 			for (const fullKey of keys) {
 				if (!fullKey.startsWith(prefix) || !fullKey.endsWith('}')) continue;
 				const topic = fullKey.slice(prefix.length, fullKey.length - 1);
 				if (!topicInTenant(tenantId, topic)) continue;
 				let all;
 				try { all = await redis.hgetall(fullKey); } catch { inputDropped('read_failed', 'erase'); continue; }
-				if (!all) continue;
-				for (const field of Object.keys(all)) {
+				for (const [field, raw] of Object.entries(all || {})) {
 					let parsed;
-					try { parsed = JSON.parse(all[field]); } catch { inputDropped('corrupt_entry', 'erase'); continue; }
+					try { parsed = JSON.parse(raw); } catch { inputDropped('corrupt_entry', 'erase'); continue; }
 					if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) { inputDropped('corrupt_entry', 'erase'); continue; }
-					const u = parsed && parsed.user;
-					const matches = typeof u === 'string'
-						? u === userId
-						: !!(u && typeof u === 'object' && (u.id === userId || u.userId === userId));
-					if (!matches) continue;
-					// Drop any pending snapshot + local entry first so a flush cannot
-					// resurrect the cursor, then HDEL + broadcast REMOVE cluster-wide.
-					dropKeyPending(topic, field);
-					const tm = topics.get(topic);
-					if (tm) {
-						const e = tm.get(field);
-						if (e) {
-							if (e.timer) clearTimer(e.timer);
-							if (e.settleTimer) clearTimer(e.settleTimer);
-							tm.delete(field);
-						}
-					}
-					if (await removeKeysBatch([topic], field)) n++;
-					else inputDropped('delete_failed', 'erase');
+					if (matches(parsed.user)) selectField(topic, field);
 				}
 			}
-			return n;
+			let removed = 0;
+			for (const [topic, fields] of selected) for (const field of fields) {
+				if (await removeKeysBatch([topic], field, true)) removed++;
+				else inputDropped('delete_failed', 'erase');
+			}
+			stopCleanupTimer();
+			return removed;
 		},
 
 		async clear() {
@@ -1355,7 +1396,7 @@ export function createCursor(client, options = {}) {
 		 * are not counted in drift stats - they fire on the call thread,
 		 * not via the scheduler.
 		 *
-		 * @returns {{ flushes: number, driftMeanMs: number, driftMaxMs: number, dirtyTopicsCurrent: number, activeTopicsTotal: number, jitterDropped: number, viewportsReported: number, perSubscriberFlushes: number, bpSkips: number, culledEntriesDropped: number }}
+		 * @returns {{ flushes: number, driftMeanMs: number, driftMaxMs: number, dirtyTopicsCurrent: number, activeTopicsTotal: number, jitterDropped: number, viewportsReported: number, perSubscriberFlushes: number, bpSkips: number, culledEntriesDropped: number, moversDeferred: number }}
 		 */
 		stats() {
 			return { ...statsSnapshot(), activeTopicsTotal: topics.size };

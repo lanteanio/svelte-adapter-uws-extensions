@@ -365,7 +365,7 @@ describe('redis cursor viewport culling and backpressure', () => {
 
 		it('the indexed path above the crossover matches the same brute-force test', () => {
 			vi.useFakeTimers();
-			const c = createCursor(client, { throttle: 0, topicThrottle: 16, snapshotIntervalMs: 0, viewport: { enabled: true }, select: (ud) => ({ id: ud.id }) });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 16, maxMovers: Infinity, snapshotIntervalMs: 0, viewport: { enabled: true }, select: (ud) => ({ id: ud.id }) });
 			const platform = walkPlatform();
 			const { viewer, expected } = gridScenario(c, platform, 600); // > 512 -> indexed
 			vi.advanceTimersByTime(16);
@@ -376,7 +376,7 @@ describe('redis cursor viewport culling and backpressure', () => {
 
 		it('delivers the full set for a degenerate wide viewport (deliver-all clamp)', () => {
 			vi.useFakeTimers();
-			const c = createCursor(client, { throttle: 0, topicThrottle: 16, snapshotIntervalMs: 0, viewport: { enabled: true }, select: (ud) => ({ id: ud.id }) });
+			const c = createCursor(client, { throttle: 0, topicThrottle: 16, maxMovers: Infinity, snapshotIntervalMs: 0, viewport: { enabled: true }, select: (ud) => ({ id: ud.id }) });
 			const platform = walkPlatform();
 			const viewer = mockWs({ id: 'V' });
 			platform.addSubscriber(viewer, CURSOR);

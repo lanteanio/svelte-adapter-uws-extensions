@@ -36,6 +36,8 @@ export interface RedisCursorOptions {
 	 * @default 16
 	 */
 	topicThrottle?: number;
+	/** Most local and peer movers one topic delivers per tick. Default 64; Infinity removes the bound. */
+	maxMovers?: number;
 
 	/**
 	 * Extract user-identifying data from userData.
@@ -321,6 +323,8 @@ export interface RedisCursorTracker {
 		perSubscriberFlushes: number;
 		bpSkips: number;
 		culledEntriesDropped: number;
+		/** Mover-ticks deferred by maxMovers, counted once per deferred tick. */
+		moversDeferred: number;
 	};
 
 	/**

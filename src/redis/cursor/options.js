@@ -5,6 +5,8 @@
  * @module svelte-adapter-uws-extensions/redis/cursor/options
  */
 
+let maxMoversInertWarned = false;
+
 /**
  * Fail-closed default projection for catalog and join frames. Only a stable,
  * JSON-safe `id` is copied. Every display/profile field requires an explicit
@@ -35,6 +37,7 @@ function defaultCursorSelect(obj) {
  * @property {number} maxTopicLength
  * @property {number} throttleMs
  * @property {number} topicThrottleMs
+ * @property {number} maxMovers
  * @property {number} snapshotIntervalMs
  * @property {(userData: any) => any} select
  * @property {number} cursorTtl
@@ -71,6 +74,18 @@ export function resolveCursorOptions(options = {}) {
 	}
 	const throttleMs = options.throttle ?? 16;
 	const topicThrottleMs = options.topicThrottle ?? 16;
+	const maxMovers = options.maxMovers ?? 64;
+	if (maxMovers !== Infinity && (!Number.isInteger(maxMovers) || maxMovers < 1)) {
+		throw new Error('cursor: maxMovers must be a positive integer or Infinity');
+	}
+	if (options.maxMovers !== undefined && options.maxMovers !== null && maxMovers !== Infinity && topicThrottleMs === 0 && !maxMoversInertWarned) {
+		maxMoversInertWarned = true;
+		console.warn(
+			'[extensions] cursor: maxMovers has no effect with topicThrottle: 0, because the bound ' +
+			'counts movers per tick and topicThrottle: 0 sends every move at once with no tick. ' +
+			'Set a topicThrottle above 0 to bound fan-out per topic.'
+		);
+	}
 	const snapshotIntervalMs = options.snapshotIntervalMs ?? 100;
 	// Zero-config cursors announce only the connection's `id`. An explicit
 	// select is the application's own policy and its result is used as-is.
@@ -222,6 +237,7 @@ export function resolveCursorOptions(options = {}) {
 		maxTopicLength,
 		throttleMs,
 		topicThrottleMs,
+		maxMovers,
 		snapshotIntervalMs,
 		select,
 		cursorTtl,

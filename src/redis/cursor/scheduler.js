@@ -41,6 +41,7 @@ export function createScheduler({
 	bpEnabled,
 	bpMaxBufferedBytes,
 	topicThrottleMs,
+	maxMovers,
 	position,
 	viewportCell,
 	viewportPadding,
@@ -137,6 +138,7 @@ export function createScheduler({
 	// Cursor moves dropped by the jitter filter (minMove) before they reached
 	// the flush. Always 0 when minMove is 0 (the default). Exposed via stats().
 	let jitterDropped = 0;
+	let moversDeferred = 0;
 
 	// Per-subscriber-walk observability (lifetime counters, like `flushCount`):
 	// `perSubscriberFlushes` is how many flushes took the per-subscriber walk
@@ -192,28 +194,26 @@ export function createScheduler({
 	 */
 	function flushBoth(topic, state) {
 		const entries = [];
+		const localEntries = [];
 		let flushPlatform = null;
-		let localCount = 0;
-
-		// Local-origin slice first so we can take a prefix for the relay. The
-		// dirty maps are cleared even when this throws (queueSnapshot serializes
-		// the data), so one bad entry cannot be retried, and fail, on every
-		// later flush of the topic.
-		try {
-			for (const [k, v] of state.dirty) {
-				entries.push({ key: k, data: v.data });
-				flushPlatform = v.platform;
-				queueSnapshot(topic, k, v.user, v.data);
-				localCount++;
+		const limit = topicThrottleMs > 0 ? maxMovers : Infinity;
+		// One queue across both origins prevents busy local movers from
+		// starving peer movers. Replacing a value keeps its arrival position.
+		for (const value of state.order) {
+			if (entries.length === limit) break;
+			const key = value.key;
+			const pending = value.local ? state.dirty : state.inboundDirty;
+			state.order.delete(value);
+			pending.delete(key);
+			const entry = { key, data: value.data };
+			entries.push(entry);
+			flushPlatform ||= value.platform;
+			if (value.local) {
+				localEntries.push(entry);
+				queueSnapshot(topic, key, value.user, value.data);
 			}
-			for (const [k, v] of state.inboundDirty) {
-				entries.push({ key: k, data: v.data });
-				flushPlatform ||= v.platform;
-			}
-		} finally {
-			state.dirty.clear();
-			state.inboundDirty.clear();
 		}
+		moversDeferred += state.order.size;
 
 		if (!flushPlatform || entries.length === 0) return;
 
@@ -294,11 +294,11 @@ export function createScheduler({
 		}
 
 		// Relay LOCAL-ORIGIN slice only; never re-relay what came from peers.
-		if (localCount > 0) {
-			if (localCount === 1) {
-				relay(topic, EVENTS.UPDATE, entries[0]);
+		if (localEntries.length > 0) {
+			if (localEntries.length === 1) {
+				relay(topic, EVENTS.UPDATE, localEntries[0]);
 			} else {
-				relay(topic, EVENTS.BULK, entries.slice(0, localCount));
+				relay(topic, EVENTS.BULK, localEntries);
 			}
 		}
 	}
@@ -351,15 +351,18 @@ export function createScheduler({
 				} catch (err) {
 					if (failed++ === 0) { firstError = err; firstFailedTopic = topic; }
 				}
-				dirtyTopics.delete(topic);
-				if (!hasLocalInterest(topic)) topicFlush.delete(topic);
-
 				// Target-anchored: advance lastFlush by the cadence amount.
 				// Multi-cycle backlog collapse to `nowTs` so the next
 				// broadcast's `monotonicNow() - lastFlush >= topicThrottleMs`
 				// delay computation does not fire every queued cycle on
 				// this turn.
 				state.lastFlush = drift < topicThrottleMs ? deadline : nowTs;
+				if (state.order.size > 0) {
+					nextDeadline = Math.min(nextDeadline, state.lastFlush + topicThrottleMs);
+				} else {
+					dirtyTopics.delete(topic);
+					if (!hasLocalInterest(topic)) topicFlush.delete(topic);
+				}
 			} else if (deadline < nextDeadline) {
 				nextDeadline = deadline;
 			}
@@ -391,8 +394,10 @@ export function createScheduler({
 	/** @type {number | null} */
 	let lastFlushFailureAt = null;
 
-	function armTick(delay) {
+	function armTick(state) {
 		if (tickTimer !== null) return;
+		const elapsed = monotonicNow() - state.lastFlush;
+		const delay = elapsed >= topicThrottleMs ? 0 : topicThrottleMs - elapsed;
 		tickTimer = setTimer(tick, delay);
 	}
 
@@ -444,10 +449,16 @@ export function createScheduler({
 			// is treated as "cycle ready" with zero drift on the very first
 			// tick. Without this, `Date.now() - 0` would be a huge "lateness"
 			// that pollutes the drift stats forever.
-			state = { dirty: new Map(), inboundDirty: new Map(), lastFlush: monotonicNow() - topicThrottleMs };
+			state = { dirty: new Map(), inboundDirty: new Map(), order: new Set(), lastFlush: monotonicNow() - topicThrottleMs };
 			topicFlush.set(topic, state);
 		}
-		state.dirty.set(key, { user, data, platform });
+		let pending = state.dirty.get(key);
+		if (pending) { pending.user = user; pending.data = data; pending.platform = platform; }
+		else {
+			pending = { key, user, data, platform, local: true };
+			state.dirty.set(key, pending);
+			state.order.add(pending);
+		}
 		dirtyTopics.add(topic);
 
 		if (topicThrottleMs <= 0) {
@@ -457,9 +468,7 @@ export function createScheduler({
 			return;
 		}
 
-		const elapsed = monotonicNow() - state.lastFlush;
-		const delay = elapsed >= topicThrottleMs ? 0 : topicThrottleMs - elapsed;
-		armTick(delay);
+		armTick(state);
 	}
 
 	/**
@@ -493,10 +502,16 @@ export function createScheduler({
 
 		let state = topicFlush.get(topic);
 		if (!state) {
-			state = { dirty: new Map(), inboundDirty: new Map(), lastFlush: monotonicNow() - topicThrottleMs };
+			state = { dirty: new Map(), inboundDirty: new Map(), order: new Set(), lastFlush: monotonicNow() - topicThrottleMs };
 			topicFlush.set(topic, state);
 		}
-		state.inboundDirty.set(key, { data, platform });
+		let pending = state.inboundDirty.get(key);
+		if (pending) { pending.data = data; pending.platform = platform; }
+		else {
+			pending = { key, data, platform, local: false };
+			state.inboundDirty.set(key, pending);
+			state.order.add(pending);
+		}
 		dirtyTopics.add(topic);
 
 		if (topicThrottleMs <= 0) {
@@ -512,9 +527,7 @@ export function createScheduler({
 		// the same `state` and the same tracker-wide tick timer, so a local
 		// broadcast and a peer-relayed inbound landing in the same loop
 		// iteration ship together as one combined frame at the next tick.
-		const elapsed = monotonicNow() - state.lastFlush;
-		const delay = elapsed >= topicThrottleMs ? 0 : topicThrottleMs - elapsed;
-		armTick(delay);
+		armTick(state);
 	}
 
 	/** Record a move dropped by the update() jitter filter (minMove). */
@@ -530,6 +543,7 @@ export function createScheduler({
 			driftMaxMs: driftMax,
 			dirtyTopicsCurrent: dirtyTopics.size,
 			jitterDropped,
+			moversDeferred,
 			viewportsReported: subViewport.size,
 			perSubscriberFlushes,
 			bpSkips,

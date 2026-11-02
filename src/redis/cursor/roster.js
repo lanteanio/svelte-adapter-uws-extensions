@@ -131,5 +131,11 @@ export function createRoster({ topics, instanceId, cursorTtl, snapshotIntervalMs
 		if (timer !== null) clearTimer(timer);
 		timer = null;
 	}
-	return { record, merge, drop(topic) { live.delete(topic); provisional.delete(topic); }, clear, dispose() { disposed = true; clear(); } };
+	function visitKnown(visit) {
+		const cutoff = monotonicNow() - ttlMs;
+		for (const [topic, entries] of live) for (const [key, entry] of entries) {
+			if (!entry.removed && entry.ts >= cutoff && 'user' in entry) visit(topic, key, entry.user);
+		}
+	}
+	return { record, merge, visitKnown, drop(topic) { live.delete(topic); provisional.delete(topic); }, clear, dispose() { disposed = true; clear(); } };
 }

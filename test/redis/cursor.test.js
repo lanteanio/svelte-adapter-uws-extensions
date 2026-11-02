@@ -1992,7 +1992,8 @@ describe('redis cursor', () => {
 				viewportsReported: 0,
 				perSubscriberFlushes: 0,
 				bpSkips: 0,
-				culledEntriesDropped: 0
+				culledEntriesDropped: 0,
+				moversDeferred: 0
 			});
 			c.destroy();
 		});
