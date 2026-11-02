@@ -5,8 +5,7 @@ import type { CircuitBreaker } from '../shared/breaker.js';
 /**
  * Refill algorithm for a rate limiter.
  *
- * - `'window'` (default) - fixed-window counter, byte-identical to prior
- *   releases. The whole bucket refills at once at the window edge, so it admits
+ * - `'window'` (default) - fixed-window counter. The whole bucket refills at once at the window edge, so it admits
  *   up to ~2x `points` across an edge (the classic fixed-window boundary burst:
  *   a full budget just before the edge plus a full budget just after). Choose a
  *   smooth mode below when that burst matters.
@@ -42,8 +41,8 @@ export interface RedisRateLimitOptions {
 	keyBy?: 'ip' | 'connection' | ((ws: any) => string);
 	/**
 	 * Optional per-connection tenant resolver. When set, the bucket key is scoped by
-	 * the returned tenant id (joined to the key with a NUL, so it stays unambiguous even
-	 * for IPv6 keys), so two tenants sharing an IP / connection / custom key get
+	 * the returned tenant id using the version-2 JSON tuple `[tenantId, String(key)]`,
+	 * with null for an unscoped connection, so two tenants sharing a custom key get
 	 * independent buckets. Return null/undefined for an unscoped connection. When omitted,
 	 * reads the adapter's frozen connection attribution; an unattributed connection stays
 	 * in the unscoped principal key space.
@@ -75,7 +74,7 @@ export interface RedisRateLimitOptions {
 	/**
 	 * Refill algorithm. @default 'window'
 	 *
-	 * `'window'` is the fixed-window counter, byte-identical to prior releases;
+	 * `'window'` is the fixed-window counter;
 	 * it admits up to ~2x `points` across a window edge because the whole bucket
 	 * refills at once. `'sliding'` (sliding-window-counter) and `'gcra'`
 	 * (leaky-bucket / GCRA) remove that boundary burst. See {@link RefillMode}.

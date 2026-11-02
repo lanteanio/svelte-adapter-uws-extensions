@@ -317,7 +317,7 @@ is shown and a custom value replaces it:
 | Connection registry | `conns:*`, `regsess:*` (factory `keyPrefix` defaults to empty) |
 | Locks, leader, task fences | `lock:*`, `lock-fences:*`, `leader`, `fence:*` |
 | Cluster clock, topic broadcast | `clock:leader-offset`, `{topic-broadcast}:instances` |
-| Rate limits | `v1:ratelimit:*`, `v1:ratelimits:*`, `v1:ratelimitg:*` (per principal), `v1:ratelimit-tenant:*`, `v1:ratelimits-tenant:*`, `v1:ratelimitg-tenant:*` (`budget: 'tenant'`), `v1:ratelimitc:*` (composite), `v1:ratelimit-control:*`, `v1:upgrade-bucket:*` |
+| Rate limits | `v2:ratelimit:*`, `v2:ratelimits:*`, `v2:ratelimitg:*` (per principal), `v1:ratelimit-tenant:*`, `v1:ratelimits-tenant:*`, `v1:ratelimitg-tenant:*` (`budget: 'tenant'`), `v1:ratelimitc:*` (composite), `v1:ratelimit-control:*`, exact `v1:ratelimit:emergency` (legacy factor access), `v1:upgrade-bucket:*` |
 | Webhook controls | `whbudget:*`, `whbreaker:*` |
 
 Channels need their own `&` patterns. The bus `channel` (`uws:pubsub`), the
@@ -388,6 +388,16 @@ A 0.5 peer sends no total, so the bound is unknown and the rule fails closed.
 **Action.** Enable `clusterTopPublisher` only after the whole fleet runs 0.6,
 or accept the shedding for the length of the rollout. A stopped 0.5 instance's
 slice stops counting after `staleAfter`.
+
+### Rate-limit principal identities use version-2 tuples
+
+Principal buckets use JSON `[tenantId or null, String(key)]` identities in `v2:ratelimit:`, `v2:ratelimits:` and `v2:ratelimitg:`. Each scope and principal has its own bucket, including strings with NUL or lone UTF-16 surrogates. Tenant aggregates, composite limits, upgrade buckets and emergency controls retain their existing key families.
+
+Before deploying, grant those three version-2 key patterns under the client prefix. Retain the exact `v1:ratelimit:emergency` key permission along with `v1:ratelimit-control:*`: the emergency reader checks the historical factor, and `set()`/`clear()` access that historical key even when absent. Removing its permission makes those operations fail.
+
+Stop old admission writers before starting new writers. Mixed versions meter independent budgets and admit up to both allowances. Every principal receives a fresh allowance; old bans do not carry over. Reapply required bans through the new limiter before resuming traffic. Never dual-read, rename or copy old hashes: their identities are ambiguous and cannot be assigned safely.
+
+After old writers stop, inventory and retire the version-1 principal HASH buckets under `v1:ratelimit:*`, `v1:ratelimits:*` and `v1:ratelimitg:*`, preserving a STRING at `v1:ratelimit:emergency` and the tenant-aggregate, composite, upgrade and control families. Existing TTLs expire retired hashes naturally; manually unbanned hashes may have no TTL and require explicit cleanup. New `clear`, `reset` and `purgeUser` affect only version 2 and do not clean retired identities. Recovery inventories both versions; restore active version-2 buckets with original expiry and keep retired hashes out of active migration.
 
 ### The rate-limit emergency factor moved to its own key
 

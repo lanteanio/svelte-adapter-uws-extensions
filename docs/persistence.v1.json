@@ -687,10 +687,15 @@
 				{
 					"id": "bucket",
 					"type": "hash",
+					"template": "v2:ratelimit:<key>"
+				},
+				{
+					"id": "legacy-bucket",
+					"type": "hash",
 					"template": "v1:ratelimit:<key>"
 				}
 			],
-			"notes": "Preserve abuse-control policy and original expiry, or choose a documented conservative reset."
+			"notes": "Restore active version-2 tuple buckets with original expiry. Version-1 legacy buckets are inventory-only; never translate ambiguous legacy identities. Reapply required bans during the coordinated cutover."
 		},
 		{
 			"id": "rate-sliding",
@@ -699,10 +704,15 @@
 				{
 					"id": "bucket",
 					"type": "hash",
+					"template": "v2:ratelimits:<key>"
+				},
+				{
+					"id": "legacy-bucket",
+					"type": "hash",
 					"template": "v1:ratelimits:<key>"
 				}
 			],
-			"notes": "Restore rolling budget state with original expiry."
+			"notes": "Restore active version-2 rolling tuple budgets with original expiry. Version-1 legacy buckets are inventory-only; never translate ambiguous legacy identities. Reapply required bans during the coordinated cutover."
 		},
 		{
 			"id": "rate-gcra",
@@ -711,10 +721,15 @@
 				{
 					"id": "bucket",
 					"type": "hash",
+					"template": "v2:ratelimitg:<key>"
+				},
+				{
+					"id": "legacy-bucket",
+					"type": "hash",
 					"template": "v1:ratelimitg:<key>"
 				}
 			],
-			"notes": "Restore rate-control state with original expiry."
+			"notes": "Restore active version-2 tuple rate-control state with original expiry. Version-1 legacy buckets are inventory-only; never translate ambiguous legacy identities. Reapply required bans during the coordinated cutover."
 		},
 		{
 			"id": "rate-window-tenant",

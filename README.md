@@ -1295,7 +1295,7 @@ The session map is **independent of userId**: a connection may carry a userId, a
 
 ## Rate limiting
 
-Redis-backed counterpart to the core `createRateLimit` plugin, using an atomic Lua script. Await `consume` instead of reading the synchronous core result; the shared limiter also exposes `peek`. Rate limits are enforced across all server instances with exactly one Redis roundtrip per `consume()` call. `budget: 'tenant'` shares the allowance across a tenant's principals; the default is `'principal'`. See [tenant namespaces, weighted costs and configured caps](docs/tenancy.md).
+Redis-backed counterpart to the core `createRateLimit` plugin, using an atomic Lua script. Await `consume` instead of reading the synchronous core result; the shared limiter also exposes `peek`. Rate limits are enforced across all server instances with exactly one Redis roundtrip per `consume()` call. `budget: 'tenant'` shares the allowance across a tenant's principals; the default is `'principal'`. Principal storage uses a version-2 JSON tuple `[tenantId or null, String(key)]`, preserving distinct scopes even for NUL or lone-surrogate keys through consume, peek, local floors and administration. Upgrading requires [coordinated allowance and ban cutover](MIGRATION.md#rate-limit-principal-identities-use-version-2-tuples). See [tenant namespaces, weighted costs and configured caps](docs/tenancy.md).
 
 > **Authorization:** rate limiting is anti-abuse, not authorization. Identity-based access checks still live in your handler. The two layers compose: gate auth first, then meter. See [Authorize every extension call](#authorize-every-extension-call).
 
@@ -1360,7 +1360,7 @@ All methods are async (they hit Redis). The API otherwise matches the core plugi
 
 | `refill` | Behaviour |
 |---|---|
-| `'window'` (default) | Fixed-window counter. **Byte-identical to prior releases.** The whole bucket refills at once at the window edge, so it can admit up to **~2x `points` across an edge** - a full budget just before the edge plus a full budget just after (the classic fixed-window boundary burst). |
+| `'window'` (default) | Fixed-window counter. The whole bucket refills at once at the window edge, so it can admit up to **~2x `points` across an edge** - a full budget just before the edge plus a full budget just after (the classic fixed-window boundary burst). |
 | `'sliding'` | Sliding-window-counter: weights the previous window by its remaining overlap, so admission does not jump at the edge. No boundary burst. |
 | `'gcra'` | Leaky-bucket / GCRA: meters a smooth emission of one token every `interval / points` ms, tolerating a burst of up to `points`. No window edge, so no boundary burst. |
 

@@ -12,7 +12,7 @@
  */
 
 import { attribution } from 'svelte-adapter-uws/connection';
-import { scanAndUnlink, scanUnlinkExcept } from '../shared/redis-scan.js';
+import { scanAndUnlink } from '../shared/redis-scan.js';
 import { evalCached } from '../shared/eval-cached.js';
 import { withBreaker } from '../shared/breaker.js';
 import { isPrivateOrLoopbackAddress, isAddressHeaderConfigured } from '../shared/client-ip.js';
@@ -25,7 +25,7 @@ import {
 	GCRA_SCRIPT,
 	GCRA_PEEK_SCRIPT
 } from './token-bucket-script.js';
-import { createEmergencyScaleReader, createEmergencyScaleOps, LEGACY_EMERGENCY_KEY, unlinkLegacyBucket } from './emergency-scale.js';
+import { createEmergencyScaleReader, createEmergencyScaleOps } from './emergency-scale.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { defineOptions, option } from '../shared/options.js';
@@ -310,8 +310,7 @@ function createGcraFloor(maxPoints, interval, blockDuration, getScale) {
 
 // Per refill mode: the consume + peek Lua and the in-process floor factory. The
 // key infix keeps each mode in its own key space so switching modes never reads
-// a foreign-layout hash. `window` keeps the original 'ratelimit:' infix
-// (byte-identical to prior releases); the two smooth modes get their own.
+// a foreign-layout hash. Each budget layout also has its own version prefix.
 const REFILL_MODES = {
 	window: { consume: CONSUME_SCRIPT, peek: PEEK_SCRIPT, infix: 'ratelimit:', floor: createWindowFloor },
 	sliding: { consume: SLIDING_SCRIPT, peek: SLIDING_PEEK_SCRIPT, infix: 'ratelimits:', floor: createSlidingFloor },
@@ -491,7 +490,7 @@ export function createRateLimit(client, options) {
 	// Version prefix for Redis keys. Different script versions use different
 	// key spaces so rolling deployments with algorithm changes don't produce
 	// inconsistent rate limiting. Old-version keys expire naturally via TTL.
-	const SCRIPT_VERSION = 'v1';
+	const SCRIPT_VERSION = budget === 'principal' ? 'v2' : 'v1';
 	// A shared tenant allowance must not collide with an unscoped principal
 	// whose key happens to equal the tenant id. Keep both budget layouts apart.
 	const bucketPrefix = SCRIPT_VERSION + ':' + (budget === 'tenant'
@@ -582,13 +581,9 @@ export function createRateLimit(client, options) {
 		return 'unknown';
 	}
 
-	// The principal bucket tenant segment is FIRST and NUL-delimited,
-	// so a validated id stays unambiguous even when the key is an IPv6 address (colons).
-	// Null tenant -> no segment, byte-identical to the single-tenant key space. The id is
-	// rejected if it contains the NUL delimiter (the one char that would let two distinct
-	// tenants collide on one bucket); this is the injection-safety the realtime tier
-	// validates at its own boundary, enforced here too so the property does not silently
-	// depend on the caller's resolver. The check short-circuits on the null (default) path.
+	// Principal identities are JSON tuples. A null scope is explicit, and
+	// JSON escaping keeps arbitrary principal strings distinct on the UTF-8
+	// Redis wire, including embedded NUL and lone UTF-16 surrogates.
 	function bucketKey(key, tenantId) {
 		if (budget === 'tenant') {
 			if (typeof tenantId !== 'string' || tenantId.length === 0) {
@@ -599,9 +594,9 @@ export function createRateLimit(client, options) {
 		}
 		key = String(key);
 		if (tenantId && tenantId.indexOf('\0') !== -1) {
-			throw new Error('redis ratelimit: tenant id must not contain a NUL byte (it is the bucket-key delimiter)');
+			throw new Error('redis ratelimit: tenant id must not contain a NUL byte');
 		}
-		return client.key(bucketPrefix + (tenantId ? tenantId + '\0' : '') + key);
+		return client.key(bucketPrefix + JSON.stringify([tenantId || null, key]));
 	}
 
 	return {
@@ -711,60 +706,29 @@ export function createRateLimit(client, options) {
 			await withBreaker(b, () => redis.hset(bk, 'bannedUntil', 0));
 		},
 
-		// No tenant -> clears the whole key space (every tenant's buckets too, since the
-		// glob `*` spans the NUL-delimited tenant segments). Pass a tenant id to clear
-		// only that tenant's buckets. Scoped to this limiter's refill-mode key space.
+		// With no argument, clear this budget/refill mode across all scopes.
+		// A tenant selects only its tuple prefix in principal mode.
 		async clear(tenantId) {
 			if (budget === 'tenant' && tenantId != null) {
-				// Exact deletion: glob characters in an id cannot widen the scope.
 				const bk = bucketKey('', tenantId);
 				await withBreaker(b, () => redis.del(bk));
 				return;
 			}
-			// The tenant id is interpolated into a SCAN MATCH glob, so it needs
-			// the same delimiter guard as bucketKey PLUS a glob-metachar guard:
-			// clear('*') would otherwise wipe every tenant's buckets through a
-			// nominally tenant-scoped call. Coerce first - the id is
-			// interpolated as a string a line below, so validating the raw
-			// argument would miss a number and throw a TypeError on anything
-			// without .indexOf.
 			if (tenantId != null && typeof tenantId !== 'string') {
-				// Rejected rather than coerced. The falsy-tenant branch below
-				// is deliberate and matches `bucketKey`, which puts a falsy
-				// tenant's buckets in the UNTENANTED segment - so widening the
-				// test to `!= null` would desync the pair and make `clear(0)`
-				// scan `0\0*` and match nothing. But `clear(0)` reading as
-				// "clear everything" is a trap either way, and a numeric tenant
-				// does not work anywhere else in this module (`bucketKey` calls
-				// `tenantId.indexOf`), so the honest answer is to refuse the type.
 				throw new Error(`redis ratelimit: clear tenant id must be a string or null/undefined, got ${typeof tenantId}`);
 			}
 			if (tenantId != null && /[\0*?[\]\\]/.test(tenantId)) {
 				throw new Error('redis ratelimit: clear tenant id must not contain NUL or glob metacharacters (* ? [ ] \\)');
 			}
-			// '' passes the type and glob guards and is then FALSY, so it falls
-			// into the global branch below and a nominally tenant-scoped call
-			// wipes every tenant. It cannot be honoured as written either: an
-			// empty tenant lands in bucketKey's untenanted segment, whose keys
-			// are exactly the ones a glob cannot separate from the tenanted
-			// ones. Refused for the same reason clear(0) is - the two real
-			// calls are clear() for everything and clear(id) for one tenant.
 			if (tenantId === '') {
 				throw new Error('redis ratelimit: clear tenant id must not be empty - call clear() with no argument to clear every tenant');
 			}
-			const pattern = client.key(bucketPrefix + (tenantId ? tenantId + '\0*' : '*'));
-			// The unscoped fixed-window keyspace also holds a factor stored by an
-			// earlier version, which the emergency reader still honors. A bucket
-			// named `emergency` at that key is cleared; a factor there is not.
-			// No other pattern can match that key, so every other clear is a
-			// single scan.
-			const legacyKey = client.key(LEGACY_EMERGENCY_KEY);
-			if (!tenantId && legacyKey.startsWith(client.key(bucketPrefix))) {
-				await withBreaker(b, () => scanUnlinkExcept(redis, pattern,
-					(key) => key === legacyKey, unlinkLegacyBucket));
-			} else {
-				await withBreaker(b, () => scanAndUnlink(redis, pattern));
-			}
+			// JSON quoting can add backslashes even when the tenant itself has
+			// no glob metacharacters. Escape the entire encoded literal prefix.
+			const scope = tenantId ? JSON.stringify([tenantId]).slice(0, -1) + ',' : '';
+			const escaped = scope.replace(/[\\*?\[\]]/g, '\\$&');
+			const pattern = client.key(bucketPrefix + escaped + '*');
+			await withBreaker(b, () => scanAndUnlink(redis, pattern));
 		},
 
 		// Operator surface for the fleet-wide emergency factor. `set(0.2)`

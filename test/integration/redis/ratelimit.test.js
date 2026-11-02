@@ -12,6 +12,7 @@ import { createBackendClient, resetBackendKeys, isClusterBackend } from '../help
 import { waitRedisMs } from '../helpers/backend-clock.js';
 import { createRateLimit, createCompositeRateLimit } from '../../../src/redis/ratelimit.js';
 import { createUpgradeBucket } from '../../../src/redis/upgrade-bucket.js';
+import { ratelimitIdentityContract } from '../../helpers/ratelimit-identity-contract.js';
 
 function fakeWs(userData = {}) {
 	return { getUserData: () => userData };
@@ -33,6 +34,8 @@ describe('redis ratelimit (integration)', () => {
 	afterAll(async () => {
 		await client.quit();
 	});
+
+	ratelimitIdentityContract(() => client);
 
 	describe('CONSUME_SCRIPT basic token bucket', () => {
 		it('first consume is allowed and remaining decrements correctly', async () => {
@@ -271,11 +274,11 @@ describe('redis ratelimit (integration)', () => {
 			expect(r.remaining).toBe(2);
 		});
 
-		it('versioned key prefix lands on the wire (test:v1:ratelimit:<key>)', async () => {
+		it('versioned principal tuple lands on the wire', async () => {
 			const limiter = createRateLimit(client, { points: 2, interval: 60_000 });
 			const ws = fakeWs({ ip: '11.11.11.11' });
 			await limiter.consume(ws);
-			const exists = await client.redis.exists(client.key('v1:ratelimit:11.11.11.11'));
+			const exists = await client.redis.exists(client.key('v2:ratelimit:[null,"11.11.11.11"]'));
 			expect(exists).toBe(1);
 		});
 
@@ -291,7 +294,7 @@ describe('redis ratelimit (integration)', () => {
 			expect(await client.redis.get(survivor)).toBe('still-here');
 
 			// Versioned bucket must be gone.
-			const exists = await client.redis.exists(client.key('v1:ratelimit:12.12.12.12'));
+			const exists = await client.redis.exists(client.key('v2:ratelimit:[null,"12.12.12.12"]'));
 			expect(exists).toBe(0);
 
 			await client.redis.unlink(survivor);
@@ -305,7 +308,7 @@ describe('redis ratelimit (integration)', () => {
 			});
 			const ws = fakeWs({ ip: '13.13.13.13' });
 			await limiter.consume(ws);
-			const ttl = await client.redis.pttl(client.key('v1:ratelimit:13.13.13.13'));
+			const ttl = await client.redis.pttl(client.key('v2:ratelimit:[null,"13.13.13.13"]'));
 			// Script sets ttlMs = interval + 60000 on the success path.
 			expect(ttl).toBeGreaterThan(0);
 			expect(ttl).toBeLessThanOrEqual(60_000 + 60_000);
@@ -364,13 +367,13 @@ return {1, 0, 0}
 			expect(r.allowed).toBe(true);
 			expect(r.remaining).toBe(4); // what a consume would leave
 			// A read-only peek never writes the hash.
-			expect(await client.redis.exists(client.key('v1:ratelimit:peek-1'))).toBe(0);
+			expect(await client.redis.exists(client.key('v2:ratelimit:[null,"peek-1"]'))).toBe(0);
 
 			await lim.consume(ws, 2); // remaining 3
-			const before = await client.redis.hgetall(client.key('v1:ratelimit:peek-1'));
+			const before = await client.redis.hgetall(client.key('v2:ratelimit:[null,"peek-1"]'));
 			const p = await lim.peek(ws);
 			expect(p.remaining).toBe(2);
-			const after = await client.redis.hgetall(client.key('v1:ratelimit:peek-1'));
+			const after = await client.redis.hgetall(client.key('v2:ratelimit:[null,"peek-1"]'));
 			expect(after).toEqual(before); // byte-for-byte unchanged
 		});
 
@@ -400,8 +403,8 @@ return {1, 0, 0}
 			const g = createRateLimit(client, { points: 3, interval: 60_000, refill: 'gcra' });
 			await s.consume(fakeWs({ ip: 'mode-1' }));
 			await g.consume(fakeWs({ ip: 'mode-1' }));
-			expect(await client.redis.exists(client.key('v1:ratelimits:mode-1'))).toBe(1);
-			expect(await client.redis.exists(client.key('v1:ratelimitg:mode-1'))).toBe(1);
+			expect(await client.redis.exists(client.key('v2:ratelimits:[null,"mode-1"]'))).toBe(1);
+			expect(await client.redis.exists(client.key('v2:ratelimitg:[null,"mode-1"]'))).toBe(1);
 		});
 
 		// The boundary-burst characterization the doc claims: the fixed window
@@ -453,16 +456,16 @@ return {1, 0, 0}
 		it('keeps a bucket named emergency apart from the factor', async () => {
 			const lim = createRateLimit(client, { points: 5, interval: 60000, keyBy: () => 'emergency' });
 			expect((await lim.consume(fakeWs())).remaining).toBe(4);
-			// The bucket hash sits at the key earlier versions used for the factor.
-			expect(await client.redis.type(client.key('v1:ratelimit:emergency'))).toBe('hash');
+			// The principal tuple is separate from both emergency policy keys.
+			expect(await client.redis.type(client.key('v2:ratelimit:[null,"emergency"]'))).toBe('hash');
 			expect(await lim.emergency.get()).toBe(1);
 			await lim.emergency.set(0.5);
 			await lim.emergency.clear();
-			expect(await client.redis.type(client.key('v1:ratelimit:emergency'))).toBe('hash');
+			expect(await client.redis.type(client.key('v2:ratelimit:[null,"emergency"]'))).toBe('hash');
 			await lim.emergency.set(0.5);
 			await lim.clear();
 			expect(await lim.emergency.get()).toBe(0.5);
-			expect(await client.redis.exists(client.key('v1:ratelimit:emergency'))).toBe(0);
+			expect(await client.redis.exists(client.key('v2:ratelimit:[null,"emergency"]'))).toBe(0);
 		});
 
 		it('honors and then retires a factor stored at the earlier key', async () => {

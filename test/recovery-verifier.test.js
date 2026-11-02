@@ -178,6 +178,16 @@ it('classifies tenant-budget rate-limit buckets apart from principal buckets', a
 	expect(report.redis.matchedKeys).toBe(4);
 	for (const id of families) expect(report.redis.observations[id]).toMatchObject({ keys: 1, wrongTypes: 0 });
 });
+it('classifies current principal tuple families without losing retired bucket inventory', async () => {
+	const keys = { 'v2:ratelimit:[null,"u"]': 'hash', 'v2:ratelimits:["t","u"]': 'hash', 'v2:ratelimitg:[null,"u"]': 'hash', 'v1:ratelimit:retired': 'hash' };
+	const report = await runVerification({ schemaVersion: 1, redis: { keyPrefix: '', families: ['rate-window', 'rate-sliding', 'rate-gcra'] } }, {
+		redis: { scan: async () => ['0', Object.keys(keys)], type: async key => keys[key], pttl: async () => 60000 }
+	});
+	expect(report.redis.matchedKeys).toBe(4);
+	expect(report.redis.observations['rate-window']).toMatchObject({ keys: 2, wrongTypes: 0 });
+	expect(report.redis.observations['rate-sliding']).toMatchObject({ keys: 1, wrongTypes: 0 });
+	expect(report.redis.observations['rate-gcra']).toMatchObject({ keys: 1, wrongTypes: 0 });
+});
 it('rejects unknown scope fields and non-boolean Cluster selection', () => {
 	expect(() => validateConfig({ schemaVersion: 1, redis: { keyPrefix: '', families: ['sessions'], cluster: 'true' } })).toThrow();
 	expect(() => validateConfig({ schemaVersion: 1, redis: { keyPrefix: '', families: ['sessions'], minKeys: 1 } })).toThrow();

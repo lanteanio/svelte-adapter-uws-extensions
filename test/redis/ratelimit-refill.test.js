@@ -54,7 +54,7 @@ describe('ratelimit refill modes', () => {
 			await sliding.consume(mockWs({ ip: '1.2.3.4' }));
 			await gcra.consume(mockWs({ ip: '1.2.3.4' }));
 			const keys = [...client._hashes.keys()].filter((k) => k.includes('ratelimit')).sort();
-			expect(keys).toEqual(['test:v1:ratelimitg:1.2.3.4', 'test:v1:ratelimits:1.2.3.4']);
+			expect(keys).toEqual(['test:v2:ratelimitg:[null,"1.2.3.4"]', 'test:v2:ratelimits:[null,"1.2.3.4"]']);
 		});
 	});
 
@@ -115,9 +115,9 @@ describe('ratelimit refill modes', () => {
 			const lim = createRateLimit(client, { points: 3, interval: 1000, refill: 'sliding' });
 			const ws = mockWs({ ip: '4.4.4.4' });
 			await lim.consume(ws, 2); // 1 slot left in the window
-			const before = new Map(client._hashes.get('test:v1:ratelimits:4.4.4.4'));
+			const before = new Map(client._hashes.get('test:v2:ratelimits:[null,"4.4.4.4"]'));
 			const peeked = await lim.peek(ws);
-			const after = client._hashes.get('test:v1:ratelimits:4.4.4.4');
+			const after = client._hashes.get('test:v2:ratelimits:[null,"4.4.4.4"]');
 			expect(after.get('curr')).toBe(before.get('curr')); // no mutation
 			const consumed = await lim.consume(ws);
 			expect(peeked).toEqual(consumed);
@@ -173,9 +173,9 @@ describe('ratelimit refill modes', () => {
 			const lim = createRateLimit(client, { points: 5, interval: 1000, refill: 'gcra' });
 			const ws = mockWs({ ip: '4.4.4.4' });
 			await lim.consume(ws, 2);
-			const before = new Map(client._hashes.get('test:v1:ratelimitg:4.4.4.4'));
+			const before = new Map(client._hashes.get('test:v2:ratelimitg:[null,"4.4.4.4"]'));
 			const peeked = await lim.peek(ws);
-			const after = client._hashes.get('test:v1:ratelimitg:4.4.4.4');
+			const after = client._hashes.get('test:v2:ratelimitg:[null,"4.4.4.4"]');
 			expect(after.get('tat')).toBe(before.get('tat')); // no mutation
 			const consumed = await lim.consume(ws);
 			expect(peeked).toEqual(consumed);

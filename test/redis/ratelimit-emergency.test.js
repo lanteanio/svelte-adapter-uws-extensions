@@ -79,7 +79,7 @@ describe('ratelimit emergency scale', () => {
 			expect(await limiter.emergency.get()).toBe(1);
 		});
 
-		it('keeps a factor at the earlier key through clear() and clears a bucket there', async () => {
+		it('keeps a factor at the earlier key while clearing current named buckets', async () => {
 			const legacy = client.key('v1:ratelimit:emergency');
 			const limiter = createRateLimit(client, { points: 10, interval: 60000 });
 			await client.redis.set(legacy, '0.2');
@@ -89,9 +89,11 @@ describe('ratelimit emergency scale', () => {
 			await limiter.emergency.clear();
 			const named = createRateLimit(client, { points: 10, interval: 60000, keyBy: () => 'emergency' });
 			await named.consume(mockWs());
-			expect(await client.redis.exists(legacy)).toBe(1);
-			await named.clear();
+			const bucket = client.key('v2:ratelimit:[null,"emergency"]');
+			expect(await client.redis.exists(bucket)).toBe(1);
 			expect(await client.redis.exists(legacy)).toBe(0);
+			await named.clear();
+			expect(await client.redis.exists(bucket)).toBe(0);
 		});
 
 		it('scans once when the cleared keyspace cannot hold the earlier key', async () => {
@@ -109,7 +111,7 @@ describe('ratelimit emergency scale', () => {
 			scan.mockClear();
 			const window = createRateLimit(client, { points: 10, interval: 60000 });
 			await window.clear();
-			expect(passes()).toBe(2);
+			expect(passes()).toBe(1);
 		});
 
 		it('set/get/clear round-trips the shared key', async () => {

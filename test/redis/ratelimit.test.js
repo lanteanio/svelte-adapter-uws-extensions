@@ -59,12 +59,12 @@ describe('redis ratelimit', () => {
 	});
 
 	describe('tenant scoping', () => {
-		it('scopes the bucket key by the tenant resolver (NUL-delimited, IPv6-safe)', async () => {
+		it('scopes the bucket key by an explicit tenant/principal tuple', async () => {
 			const lim = createRateLimit(client, { points: 5, interval: 1000, tenant: (ws) => ws.getUserData().org });
 			await lim.consume(mockWs({ ip: '1.2.3.4', org: 'a' }));
 			await lim.consume(mockWs({ ip: '1.2.3.4', org: 'b' }));
 			const rlKeys = [...client._hashes.keys()].filter((k) => k.includes('ratelimit')).sort();
-			expect(rlKeys).toEqual(['test:v1:ratelimit:a\x001.2.3.4', 'test:v1:ratelimit:b\x001.2.3.4']);
+			expect(rlKeys).toEqual(['test:v2:ratelimit:["a","1.2.3.4"]', 'test:v2:ratelimit:["b","1.2.3.4"]']);
 		});
 
 		it('gives two tenants on the SAME ip independent buckets', async () => {
@@ -81,7 +81,7 @@ describe('redis ratelimit', () => {
 			await lim.consume(mockWs({ ip: '1.1.1.1', org: 'a' }));
 			await lim.consume(mockWs({ ip: '1.1.1.1', org: 'b' }));
 			await lim.clear('a');
-			expect([...client._hashes.keys()].filter((k) => k.includes('ratelimit'))).toEqual(['test:v1:ratelimit:b\x001.1.1.1']);
+			expect([...client._hashes.keys()].filter((k) => k.includes('ratelimit'))).toEqual(['test:v2:ratelimit:["b","1.1.1.1"]']);
 			await lim.clear();
 			expect([...client._hashes.keys()].filter((k) => k.includes('ratelimit'))).toEqual([]);
 		});
@@ -96,7 +96,7 @@ describe('redis ratelimit', () => {
 			// and then wipe every OTHER tenant's buckets.
 			await expect(lim.clear('')).rejects.toThrow(/must not be empty/);
 			expect([...client._hashes.keys()].filter((k) => k.includes('ratelimit')).sort())
-				.toEqual(['test:v1:ratelimit:a\x001.1.1.1', 'test:v1:ratelimit:b\x001.1.1.1']);
+				.toEqual(['test:v2:ratelimit:["a","1.1.1.1"]', 'test:v2:ratelimit:["b","1.1.1.1"]']);
 		});
 
 		it('reset(key, tenant) targets the tenant-scoped bucket', async () => {
@@ -105,12 +105,12 @@ describe('redis ratelimit', () => {
 			await lim.consume(mockWs({ ip: '5.5.5.5', org: 'b' }));
 			await lim.reset('5.5.5.5', 'a');
 			const rlKeys = [...client._hashes.keys()].filter((k) => k.includes('ratelimit'));
-			expect(rlKeys).toEqual(['test:v1:ratelimit:b\x005.5.5.5']);
+			expect(rlKeys).toEqual(['test:v2:ratelimit:["b","5.5.5.5"]']);
 		});
 
-		it('no tenant resolver -> byte-identical bare key', async () => {
+		it('no tenant resolver uses the null tuple scope', async () => {
 			await limiter.consume(mockWs({ ip: '2.2.2.2' }));
-			expect([...client._hashes.keys()].filter((k) => k.includes('ratelimit'))).toEqual(['test:v1:ratelimit:2.2.2.2']);
+			expect([...client._hashes.keys()].filter((k) => k.includes('ratelimit'))).toEqual(['test:v2:ratelimit:[null,"2.2.2.2"]']);
 		});
 
 		it('rejects a tenant id containing the NUL delimiter (injection-safety)', async () => {
@@ -145,7 +145,7 @@ describe('redis ratelimit', () => {
 			const allKeys = [...client._hashes.keys()];
 			const rlKeys = allKeys.filter((k) => k.includes('ratelimit'));
 			expect(rlKeys).toHaveLength(1);
-			expect(rlKeys[0]).toMatch(/^test:v\d+:ratelimit:1\.2\.3\.4$/);
+			expect(rlKeys[0]).toBe('test:v2:ratelimit:[null,"1.2.3.4"]');
 		});
 
 		it('clear() only scans versioned keys', async () => {
@@ -654,7 +654,7 @@ describe('redis ratelimit', () => {
 		it('does not mutate an existing bucket', async () => {
 			const ws = mockWs({ ip: '1.2.3.4' });
 			await limiter.consume(ws, 2); // remaining 3
-			const key = 'test:v1:ratelimit:1.2.3.4';
+			const key = 'test:v2:ratelimit:[null,"1.2.3.4"]';
 			const before = new Map(client._hashes.get(key));
 			const r = await limiter.peek(ws);
 			expect(r.remaining).toBe(2); // 3 - 1, without spending
@@ -740,7 +740,7 @@ describe('redis ratelimit', () => {
 			const def = createRateLimit(client, { points: 3, interval: 60000 });
 			const win = createRateLimit(client, { points: 3, interval: 60000, refill: 'window' });
 			await def.consume(mockWs({ ip: '1.2.3.4' }));
-			expect([...client._hashes.keys()]).toContain('test:v1:ratelimit:1.2.3.4');
+			expect([...client._hashes.keys()]).toContain('test:v2:ratelimit:[null,"1.2.3.4"]');
 			// A window-mode consume on the SAME ip shares that bucket.
 			const r = await win.consume(mockWs({ ip: '1.2.3.4' }));
 			expect(r.remaining).toBe(1); // 3 - 1(def) - 1(win)
