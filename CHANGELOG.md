@@ -79,6 +79,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Redis session raw methods enforce the lifecycle token limit of 4096 UTF-16 code units before backend or erasure-index work. Erasure validates indexed tokens before constructing record keys and preserves structured failure counts and tenant fences.
 - PostgreSQL dead-letter summaries retain prototype-named topics as ordinary own buckets, matching Redis. Registry attributes preserve every own scalar key through registration, hydration and cohort delivery, including prototype-named keys.
 - Connection-error redaction removes raw brackets and other driver-accepted punctuation from userinfo and query passwords, including encoded password parameter names. Valid JSON diagnostics retain unrelated fields; ambiguous free text favors removing the complete credential.
 - Redis presence ignores an expired membership the server has not reclaimed yet. `count()` and the join, leave and rollback scripts used `HLEN`, which keeps counting a field whose TTL has passed until the server's background expiry removes it: `count()` could include a user whose instance crashed, and a crashed instance's expired membership could suppress the leave of that user's last connection on another instance. They now count live fields with `HKEYS` on the server. `count()` costs O(users on the topic) of server time instead of O(1) and still returns only the number; a leave costs O(instances presenting that user).

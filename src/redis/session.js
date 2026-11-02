@@ -164,7 +164,7 @@ const REJECT = Symbol('session.reject');
 const TOKEN_BYTES = 32;
 
 // Defense-in-depth: a client-presented token is used as a Redis key, so cap its
-// length - a hostile cookie cannot then push pathologically large keys. Minted
+// UTF-16 code-unit length, as measured by String.length. Minted
 // tokens are 64 hex chars, far under this.
 const MAX_TOKEN_LENGTH = 4096;
 
@@ -836,6 +836,9 @@ export function createDistributedSession(client, options = {}) {
 		if (typeof token !== 'string' || token.length === 0) {
 			throw new Error('session: token must be a non-empty string');
 		}
+		if (token.length > MAX_TOKEN_LENGTH) {
+			throw new Error('session: token must contain at most ' + MAX_TOKEN_LENGTH + ' UTF-16 code units');
+		}
 		if (token.startsWith('byuser:')) {
 			throw new Error('session: token must not begin with reserved prefix byuser:');
 		}
@@ -1303,6 +1306,7 @@ export function createDistributedSession(client, options = {}) {
 			breaker?.failure(err);
 			throw err;
 		}
+		for (const token of tokens) validateToken(token);
 		for (let i = 0; i < tokens.length; i += PURGE_CHUNK) {
 			const chunk = tokens.slice(i, i + PURGE_CHUNK);
 			const reads = await batch(chunk.map((token) => ['get', fullKey(token)]));
@@ -1370,7 +1374,11 @@ export function createDistributedSession(client, options = {}) {
 		}
 		// Refuse legacy namespace collisions before deleting any indexed key.
 		// An old caller token may otherwise name another user's index.
-		for (const token of tokens) validateToken(token);
+		try {
+			for (const token of tokens) validateToken(token);
+		} catch (err) {
+			throw Object.assign(incompleteIndex(err), { removed: 0 });
+		}
 		let removed = 0;
 		let failure = null;
 		let residue = false;

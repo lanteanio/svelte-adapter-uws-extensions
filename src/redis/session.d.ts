@@ -41,7 +41,8 @@ export interface DistributedSessionOptions<T = unknown> {
 	/**
 	 * Extract the session token from the WebSocket upgrade context (typically a
 	 * cookie). Required for `withHooks` / `of` to load a session; without it -
-	 * or when it returns a falsy/non-string value - the connection is anonymous.
+	 * or when it returns a falsy/non-string value or a token longer than 4096
+	 * UTF-16 code units - the connection is anonymous without Redis access.
 	 * Runs at the HTTP upgrade, where the cookie is available (there is no
 	 * socket yet, which is why this takes the ctx, not a ws).
 	 */
@@ -127,6 +128,11 @@ export interface DistributedSessionOptions<T = unknown> {
 	metrics?: MetricsRegistry;
 }
 
+/**
+ * Raw token methods require a non-empty string of at most 4096 UTF-16 code
+ * units (String.length), excluding the reserved `byuser:` and `identity:`
+ * prefixes. Invalid tokens reject before Redis access or erasure-index writes.
+ */
 export interface DistributedSession<T = unknown> {
 	/**
 	 * Look up by token. Returns the stored data if present and not yet
@@ -137,7 +143,7 @@ export interface DistributedSession<T = unknown> {
 	 * (non-JSON) entry. The corrupt-entry path is treated as a miss so
 	 * the next `set` cleanly overwrites.
 	 *
-	 * Rejects only when Redis fails the read. With `forgetUserId`, the TTL
+	 * Rejects an invalid token or a Redis read failure. With `forgetUserId`, the TTL
 	 * refresh first refreshes the owner's erasure-index field; when that
 	 * fails, `get` still resolves the data and leaves the TTL unchanged.
 	 */
@@ -196,11 +202,13 @@ export interface DistributedSession<T = unknown> {
 	 *
 	 * Rejects with `code: 'ERASURE_INDEX_INCOMPLETE'` and
 	 * `erasureIndexIncomplete: true` when Redis fails, one of this user's
-	 * indexed records cannot be parsed or attributed, or a record keeps
+	 * indexed tokens are invalid, records cannot be parsed or attributed, or a record keeps
 	 * changing during the purge. The user's other reachable sessions are still
 	 * revoked (none are when the index itself cannot be read), and the
 	 * unresolved index fields stay for a retry. Rejects before deleting
-	 * anything when the index holds a reserved `byuser:` token. With
+	 * anything when the index holds an oversized token or a reserved prefix. The
+	 * index must be read first; a qualified purge also writes its erasure fence
+	 * before inspecting those fields. With
 	 * `forgetUserId`, user IDs are globally unique and tenantId does not
 	 * partition the store.
 	 *
