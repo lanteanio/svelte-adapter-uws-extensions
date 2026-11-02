@@ -218,9 +218,9 @@ function fakePg(nowFn = () => Date.now()) {
 				};
 			}
 			if (s.startsWith('SELECT topic, count(*)::int AS n FROM svti_dead_letter GROUP BY topic')) {
-				const map = {};
-				for (const r of visible) map[r.topic] = (map[r.topic] || 0) + 1;
-				return { rows: Object.entries(map).map(([topic, n]) => ({ topic, n })), rowCount: Object.keys(map).length };
+				const map = new Map();
+				for (const r of visible) map.set(r.topic, (map.get(r.topic) ?? 0) + 1);
+				return { rows: [...map].map(([topic, n]) => ({ topic, n })), rowCount: map.size };
 			}
 			throw new Error('fakePg: unhandled query: ' + s);
 		}
@@ -326,6 +326,22 @@ describe('postgres dead-letter store', () => {
 		expect(await store.summary()).toEqual({ total: 3, byTopic: { a: 2, b: 1 }, oldest: 10, newest: 30 });
 		await store.clear();
 		expect(await store.summary()).toEqual({ total: 0, byTopic: {}, oldest: null, newest: null });
+	});
+
+	it('retains prototype-named topics as own summary buckets', async () => {
+		for (const topic of ['__proto__', '__proto__', 'constructor', 'prototype', 'safe']) {
+			await store.add(rec({ topic }));
+		}
+		const summary = await store.summary();
+		expect(Object.getPrototypeOf(summary.byTopic)).toBe(null);
+		expect(Object.keys(summary.byTopic).sort()).toEqual(['__proto__', 'constructor', 'prototype', 'safe']);
+		expect(summary.byTopic.__proto__).toBe(2);
+		expect(summary.byTopic.constructor).toBe(1);
+		expect(summary.byTopic.prototype).toBe(1);
+		expect(Object.values(summary.byTopic).reduce((sum, n) => sum + n, 0)).toBe(summary.total);
+		expect(summary.total).toBe(5);
+		await store.clear();
+		expect(Object.getPrototypeOf((await store.summary()).byTopic)).toBe(null);
 	});
 
 	it('evicts the oldest beyond max on write', async () => {

@@ -452,7 +452,7 @@ export function createDeadLetter(client, options = {}) {
 				`SELECT topic, count(*)::int AS n FROM ${table} WHERE ${liveRows} GROUP BY topic`
 			));
 			/** @type {Record<string, number>} */
-			const byTopic = {};
+			const byTopic = Object.create(null);
 			for (const r of byTopicRows.rows) byTopic[r.topic] = r.n;
 			const t = totals.rows[0];
 			return {

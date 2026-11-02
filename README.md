@@ -1211,7 +1211,7 @@ Best fit: targeted latest-value streams where the target is a *user*, not a topi
 
 #### Attribute-targeted broadcast
 
-`registry.sendTo(criteria, topic, event, data)` is the cluster-routed counterpart to the adapter's `platform.sendTo(filter, ...)`. Captures per-user attributes at registration time via the `attributes(ws)` option, indexes them in memory on every instance, and resolves a match into one envelope per owning instance. Keys are entirely user-defined - whatever you return from `attributes(ws)` is what `sendTo` can match against. The adapter's `platform.sendTo` examples use `userData.role === 'admin'`; the cluster version follows the same shape:
+`registry.sendTo(criteria, topic, event, data)` is the cluster-routed counterpart to the adapter's `platform.sendTo(filter, ...)`. Captures per-user attributes at registration time via the `attributes(ws)` option, indexes them in memory on every instance, and resolves a match into one envelope per owning instance. Keys are entirely user-defined - whatever you return from `attributes(ws)` is what `sendTo` can match against. Own scalar keys named `__proto__`, `constructor` and `prototype` work like any other key; inherited keys are ignored. `lookup().attrs` is a null-prototype record, including when empty, so inspect it with `Object.keys`, `Object.entries` or `Object.hasOwn`. The adapter's `platform.sendTo` examples use `userData.role === 'admin'`; the cluster version follows the same shape:
 
 ```js
 import { createConnectionRegistry } from 'svelte-adapter-uws-extensions/redis/registry';
@@ -1762,7 +1762,7 @@ Eviction is fair-share across tenants. A record's tenant is the scope its topic 
 
 Retention never trusts the producer's `failedAt` stamp: eviction clocks off Redis's own `TIME`, and an implausible stamp (missing, zero, or in the server's future) is stored as the server's now. A producer with a skewed clock can neither mass-evict healthy records nor pin its own past the window - undelivered payloads can carry user data, so `ttlMs` is a real retention bound, not advisory.
 
-A Postgres variant backs the same store in a `svti_dead_letter` table for deployments that keep durable state in Postgres:
+On both backends, `summary().byTopic` is a null-prototype record: every topic, including `__proto__`, `constructor` and `prototype`, is an own bucket. Use `Object.keys`, `Object.entries` or `Object.hasOwn` to inspect it. A Postgres variant backs the same store in a `svti_dead_letter` table for deployments that keep durable state in Postgres:
 
 ```js
 import { createDeadLetter } from 'svelte-adapter-uws-extensions/postgres/dead-letter';

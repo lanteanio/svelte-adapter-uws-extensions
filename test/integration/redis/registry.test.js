@@ -290,6 +290,45 @@ describe('redis connection registry (integration)', () => {
 			return wsWithSession({ userId, attrs }, sessionId);
 		}
 
+		for (const phase of ['new registration', 'pre-existing registration']) {
+			it.each([['__proto__', 'target'], ['constructor', 7], ['prototype', true]])(
+				`routes %s from a ${phase} without broadening its recipients`, async (key, value) => {
+					const ownerPlatform = mockPlatform();
+					const originPlatform = mockPlatform();
+					const owner = makeRegistryWithAttrs();
+					const target = wsWithAttrs('target', 'target-s', { [key]: value });
+					const other = wsWithAttrs('other', 'other-s', { [key]: 'different' });
+					await owner.hooks.open(wsWithAttrs('owner-ready', 'owner-ready-s', {}), { platform: ownerPlatform });
+					ownerPlatform.request = async () => ({ ready: true });
+					if (phase === 'pre-existing registration') {
+						await owner.hooks.open(target, { platform: ownerPlatform });
+						await owner.hooks.open(other, { platform: ownerPlatform });
+					}
+					const origin = makeRegistryWithAttrs();
+					await origin.hooks.open(wsWithAttrs('origin', 'origin-s', {}), { platform: originPlatform });
+					expect(await origin.request('owner-ready', 'ready', null)).toEqual({ ready: true });
+					if (phase === 'new registration') {
+						await owner.hooks.open(target, { platform: ownerPlatform });
+						await owner.hooks.open(other, { platform: ownerPlatform });
+					}
+					const entry = await origin.lookup('target');
+					expect(Object.getPrototypeOf(entry.attrs)).toBe(null);
+					expect(Object.hasOwn(entry.attrs, key)).toBe(true);
+					expect(entry.attrs[key]).toBe(String(value));
+					// A zero count sends nothing; the first hydrated match sends once.
+					await expect.poll(() => origin.sendTo({ [key]: value }, 'notice', 'changed', { n: 1 }), { timeout: 5000 })
+						.toBe(1);
+					await expect.poll(() => ownerPlatform.sent.length, { timeout: 5000 }).toBe(1);
+					expect(ownerPlatform.sent[0]).toMatchObject({ ws: target, topic: 'notice', event: 'changed', data: { n: 1 } });
+					expect(originPlatform.sent).toHaveLength(0);
+					expect(await origin.sendTo({ [key]: 'absent' }, 'notice', 'changed')).toBe(0);
+					expect(await origin.request('owner-ready', 'ready', null)).toEqual({ ready: true });
+					expect(ownerPlatform.sent).toHaveLength(1);
+					expect(originPlatform.sent).toHaveLength(0);
+				}
+			);
+		}
+
 		it('reaches a remote user via the secondary index after the events channel propagates', async () => {
 			const platformA = mockPlatform();
 			const platformB = mockPlatform();

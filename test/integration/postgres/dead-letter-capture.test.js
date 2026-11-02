@@ -20,6 +20,26 @@ describe('dead-letter capture survives database housekeeping errors', () => {
 		await client.query('DROP FUNCTION IF EXISTS svti_dlq_pause_capture()');
 	});
 	afterAll(async () => { await client.end(); });
+	it('keeps every prototype-named topic in its durable summary', async () => {
+		store = createDeadLetter(client, { table, cleanupInterval: 0 });
+		for (const topic of ['__proto__', '__proto__', 'constructor', 'prototype', 'safe']) {
+			await store.add(record({ topic }));
+		}
+		const summary = await store.summary();
+		expect(Object.getPrototypeOf(summary.byTopic)).toBe(null);
+		expect(Object.keys(summary.byTopic).sort()).toEqual(['__proto__', 'constructor', 'prototype', 'safe']);
+		expect(summary.byTopic.__proto__).toBe(2);
+		expect(summary.byTopic.constructor).toBe(1);
+		expect(summary.byTopic.prototype).toBe(1);
+		expect(Object.values(summary.byTopic).reduce((n, count) => n + count, 0)).toBe(summary.total);
+		expect(summary.total).toBe(5);
+		expect(await store.count()).toBe(5);
+		await store.clear();
+		const empty = await store.summary();
+		expect(Object.getPrototypeOf(empty.byTopic)).toBe(null);
+		expect(Object.keys(empty.byTopic)).toEqual([]);
+		expect(empty.total).toBe(0);
+	});
 	it.each(['size', 'ttl', 'breaker'])('returns the durable receipt when %s housekeeping fails', async phase => {
 		breaker = phase === 'breaker' ? createCircuitBreaker({ failureThreshold: 1 }) : undefined;
 		store = createDeadLetter(client, { table, max: 1, ttlMs: 60000, cleanupInterval: 0, breaker });

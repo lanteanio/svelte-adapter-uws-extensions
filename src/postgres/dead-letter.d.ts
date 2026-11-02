@@ -67,6 +67,7 @@ export interface PgDeadLetterStore extends PostgresStoreReadiness {
 	remove(id: string): Promise<boolean>;
 	count(filter?: { topic?: string }): Promise<number>;
 	list(filter?: { topic?: string; limit?: number }): Promise<DeadLetterRecord[]>;
+	/** Topic counts are own properties of a null-prototype record, including prototype-named topics. */
 	summary(): Promise<{ total: number; byTopic: Record<string, number>; oldest: number | null; newest: number | null }>;
 	/**
 	 * Right-to-erasure: delete every record stamped with a user's id in the

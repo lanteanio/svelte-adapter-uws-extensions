@@ -531,7 +531,7 @@ export function createConnectionRegistry(client, options) {
 		const prevAttrs = userIdAttrs.get(userId);
 		if (prevAttrs) unindexUser(userId, prevAttrs);
 		userToInstance.set(userId, ownerInstanceId);
-		userIdAttrs.set(userId, attrs || {});
+		userIdAttrs.set(userId, attrs || Object.create(null));
 		indexUser(userId, attrs);
 		if (userToInstance.size >= MAX_REGISTRY_USER_INDEX && !userIndexWarnFired) {
 			userIndexWarnFired = true;
@@ -642,8 +642,8 @@ export function createConnectionRegistry(client, options) {
 	 * @returns {Record<string, string>}
 	 */
 	function normalizeAttrs(raw) {
-		if (!raw || typeof raw !== 'object') return {};
-		const out = {};
+		const out = Object.create(null);
+		if (!raw || typeof raw !== 'object') return out;
 		for (const [k, v] of Object.entries(raw)) {
 			if (typeof k !== 'string' || k.length === 0) continue;
 			if (v === null || v === undefined) continue;
@@ -698,7 +698,7 @@ export function createConnectionRegistry(client, options) {
 		let openEnvelope = '';
 		if (attributes) {
 			try {
-				openEnvelope = encodeEnvelope({ ...userEvent('open', userId), attrs: attrs || {} });
+				openEnvelope = encodeEnvelope({ ...userEvent('open', userId), attrs: attrs || Object.create(null) });
 				announceChannel = eventsChannel;
 			} catch { /* over maxEnvelopeBytes */ }
 		}
@@ -746,12 +746,12 @@ export function createConnectionRegistry(client, options) {
 	}
 
 	function parseAttrsField(raw) {
-		if (typeof raw !== 'string' || raw.length === 0) return {};
+		if (typeof raw !== 'string' || raw.length === 0) return Object.create(null);
 		try {
 			const parsed = JSON.parse(raw);
 			return normalizeAttrs(parsed);
 		} catch {
-			return {};
+			return Object.create(null);
 		}
 	}
 
@@ -2115,7 +2115,7 @@ export function createConnectionRegistry(client, options) {
 				sessionToWs.set(sessionId, ws);
 				if (qualified) socketUsers.set(ws, userId);
 
-				const attrs = attributes ? normalizeAttrs(attributes(ws)) : {};
+				const attrs = normalizeAttrs(attributes ? attributes(ws) : undefined);
 
 				// Update our own view of the secondary index synchronously
 				// before the broadcast lands - self-targeting `sendTo` calls

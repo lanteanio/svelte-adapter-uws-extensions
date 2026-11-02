@@ -965,6 +965,92 @@ describe('redis connection registry', () => {
 		});
 	});
 
+	describe('attributes / sendTo: prototype-named keys', () => {
+		const cases = [['__proto__', 'target'], ['constructor', 7], ['prototype', true]];
+		const opts = {
+			identify: (ws) => ws.getUserData()?.userId,
+			attributes: (ws) => ws.getUserData()?.attrs,
+			heartbeat: 60000
+		};
+		const drain = async () => {
+			await new Promise((resolve) => setImmediate(resolve));
+			await new Promise((resolve) => setImmediate(resolve));
+		};
+
+		it.each(cases)('preserves %s through open, lookup and local matching', async (key, value) => {
+			const local = createConnectionRegistry(client, opts);
+			try {
+				const match = wsWithSession({ userId: 'match', attrs: { [key]: value } }, 'match-s');
+				const other = wsWithSession({ userId: 'other', attrs: { [key]: 'other' } }, 'other-s');
+				await local.hooks.open(match, { platform });
+				await local.hooks.open(other, { platform });
+				const entry = await local.lookup('match');
+				expect(Object.getPrototypeOf(entry.attrs)).toBe(null);
+				expect(Object.keys(entry.attrs)).toEqual([key]);
+				expect(Object.hasOwn(entry.attrs, key)).toBe(true);
+				expect(entry.attrs[key]).toBe(String(value));
+				const raw = await client.redis.hgetall(client.key('conns:match'));
+				expect(Object.keys(JSON.parse(raw.attrs))).toEqual([key]);
+				expect(await local.sendTo({ [key]: value }, 'notice', 'changed', { n: 1 })).toBe(1);
+				expect(platform.sent).toEqual([{ ws: match, topic: 'notice', event: 'changed', data: { n: 1 } }]);
+				expect(await local.sendTo({ [key]: 'absent' }, 'notice', 'changed')).toBe(0);
+				expect(platform.sent).toHaveLength(1);
+			} finally {
+				await local.destroy();
+			}
+		});
+
+		for (const phase of ['event', 'bootstrap']) {
+			it.each(cases)(`routes %s through ${phase} hydration and receiver matching`, async (key, value) => {
+				const origin = createConnectionRegistry(client, opts);
+				const owner = createConnectionRegistry(client, opts);
+				const ownedPlatform = mockPlatform();
+				const match = wsWithSession({ userId: 'remote-match', attrs: { [key]: value } }, 'remote-match-s');
+				const other = wsWithSession({ userId: 'remote-other', attrs: { [key]: 'other' } }, 'remote-other-s');
+				const activateOrigin = async () => {
+					await origin.hooks.open(wsWithSession({ userId: 'origin' }, 'origin-s'), { platform });
+					await drain();
+				};
+				try {
+					if (phase === 'event') await activateOrigin();
+					await owner.hooks.open(match, { platform: ownedPlatform });
+					await owner.hooks.open(other, { platform: ownedPlatform });
+					await drain();
+					if (phase === 'bootstrap') await activateOrigin();
+					expect(await origin.sendTo({ [key]: value }, 'notice', 'changed', { n: 2 })).toBe(1);
+					await drain();
+					expect(ownedPlatform.sent).toEqual([{ ws: match, topic: 'notice', event: 'changed', data: { n: 2 } }]);
+					expect(platform.sent).toHaveLength(0);
+					await client.redis.publish(client.key('__push:' + owner.instanceId), JSON.stringify({
+						type: 'sendTo', criteria: { [key]: 'absent' }, topic: 'notice', event: 'changed'
+					}));
+					await drain();
+					expect(ownedPlatform.sent).toHaveLength(1);
+				} finally {
+					await origin.destroy();
+					await owner.destroy();
+				}
+			});
+		}
+
+		it('drops inherited keys and non-scalar values, retaining a proto-free empty record', async () => {
+			const local = createConnectionRegistry(client, opts);
+			try {
+				const attrs = Object.create({ ['__proto__']: 'inherited', constructor: 'inherited' });
+				attrs.prototype = { nested: true };
+				const ws = wsWithSession({ userId: 'empty', attrs }, 'empty-s');
+				await local.hooks.open(ws, { platform });
+				const entry = await local.lookup('empty');
+				expect(Object.getPrototypeOf(entry.attrs)).toBe(null);
+				expect(Object.keys(entry.attrs)).toEqual([]);
+				await expect(local.sendTo(attrs, 'notice', 'changed')).rejects.toThrow('at least one attribute key');
+				expect(platform.sent).toHaveLength(0);
+			} finally {
+				await local.destroy();
+			}
+		});
+	});
+
 	describe('attributes / sendTo: oversized envelope', () => {
 		it('still delivers to local sockets when no peer needs an envelope', async () => {
 			const local = createConnectionRegistry(client, {

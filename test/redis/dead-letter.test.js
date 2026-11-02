@@ -84,12 +84,17 @@ describe('redis dead-letter store', () => {
 		await store.add(rec({ topic: '__proto__', failedAt: 10 }));
 		await store.add(rec({ topic: '__proto__', failedAt: 20 }));
 		await store.add(rec({ topic: 'constructor', failedAt: 30 }));
+		await store.add(rec({ topic: 'prototype', failedAt: 40 }));
+		await store.add(rec({ topic: 'safe', failedAt: 50 }));
 
 		const sum = await store.summary();
-		expect(sum.total).toBe(3);
+		expect(sum.total).toBe(5);
 		expect(Object.getPrototypeOf(sum.byTopic)).toBe(null);
 		expect(sum.byTopic.__proto__).toBe(2);
 		expect(sum.byTopic.constructor).toBe(1);
+		expect(sum.byTopic.prototype).toBe(1);
+		expect(Object.keys(sum.byTopic).sort()).toEqual(['__proto__', 'constructor', 'prototype', 'safe']);
+		expect(Object.values(sum.byTopic).reduce((n, count) => n + count, 0)).toBe(sum.total);
 	});
 
 	it('evicts the oldest beyond max', async () => {

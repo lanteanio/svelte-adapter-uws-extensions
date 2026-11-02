@@ -36,7 +36,9 @@ export interface RegistryOptions {
 	 * broadcasts. Shallow values only - string, number, boolean.
 	 * Numbers and booleans round-trip via `String()` for index-key
 	 * consistency. Compound queries (regex, array containment, nested
-	 * objects) are deliberately out of scope.
+	 * objects) are deliberately out of scope. Own keys, including `__proto__`,
+	 * `constructor` and `prototype`, are ordinary attributes; inherited keys
+	 * are ignored.
 	 *
 	 * Required for `sendTo(...)` - callers using only `request`,
 	 * `send`, and `sendCoalesced` can omit it; the events channel and
@@ -109,7 +111,7 @@ export interface RegistryEntry {
 	instanceId: string;
 	sessionId: string;
 	ts: number;
-	/** Attributes captured by the optional `attributes(ws)` option. Empty when none were configured. */
+	/** Null-prototype record of captured own scalar attributes. Empty when none were configured. */
 	attrs: Record<string, string>;
 }
 
