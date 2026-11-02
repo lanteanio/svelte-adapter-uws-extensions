@@ -382,9 +382,13 @@ export function createForgetStore(stores, options) {
 		async purgeUser(tenantId, userId, cascade) {
 			if (typeof userId !== 'string' || userId.length === 0) return {};
 			tenantId = validateTenantId(tenantId);
-			const jobs = entries.map(([name, s]) =>
-				Promise.resolve(/** @type {any} */ (s).purgeUser(tenantId, userId, cascade)).then((n) => ({ name, n }))
-			);
+			const jobs = entries.map(([name, s]) => {
+				try {
+					return Promise.resolve(/** @type {any} */ (s).purgeUser(tenantId, userId, cascade)).then((n) => ({ name, n }));
+				} catch (error) {
+					return Promise.reject(error);
+				}
+			});
 			if (redis) {
 				const scope = tenantId == null ? null : tenantId;
 				// The two cluster legs never reject the whole job: each surfaces
@@ -437,7 +441,11 @@ export function createForgetStore(stores, options) {
 			// that count on the error as `removed`; keep it in the breakdown.
 			for (let i = 0; i < entries.length; i++) {
 				const r = settled[i];
-				const removed = r.status === 'rejected' ? /** @type {any} */ (r.reason)?.removed : undefined;
+				let removed;
+				if (r.status === 'rejected') {
+					try { removed = /** @type {any} */ (r.reason)?.removed; }
+					catch { /* An unreadable optional count cannot discard the erasure results. */ }
+				}
 				if (Number.isSafeInteger(removed) && removed > 0) {
 					const name = entries[i][0];
 					counts[name] = (counts[name] || 0) + removed;

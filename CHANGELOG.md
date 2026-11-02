@@ -82,6 +82,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Composed erasure attempts every store and cluster leg after a synchronous component failure, retaining structured incomplete results and partial counts.
+
 - Redis Platform wrappers preserve the adapter's complete published member inventory, with matching mock capabilities and an inventory-derived drift gate.
 - Cursor erasure sends REMOVE to observers on the erasing server as well as peers.
 - Dependency verification retains complete audit reports and checks an exact, expiring development-tool policy against the live registry.

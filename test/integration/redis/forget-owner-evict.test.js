@@ -111,6 +111,26 @@ describe('createForgetStore cluster owner eviction (integration)', () => {
 		expect(await redis.hgetall('__live-presence:\0cursors:@t/acme/board')).toEqual({});
 	});
 
+	it('keeps native cluster erasure and partial results after a synchronous component failure', async () => {
+		const topic = '@t/team/room';
+		await seedOwnerRoom(topic, { o: 'member', 'j:member': 1, 'n:member': 1, 'j:other': 2, 'n:other': 1 });
+		await redis.hset('__live-presence:' + topic, 'c:member', '1', 'd:member', '{}', 'c:other', '1');
+		let finalCalls = 0;
+		const failure = Object.assign(new Error('component unavailable'), { removed: 3 });
+		const combined = createForgetStore({
+			broken: { purgeUser() { throw failure; } },
+			final: { purgeUser() { finalCalls++; return 2; } }
+		}, { redis });
+		const error = await combined.purgeUser('team', 'member').catch(error => error);
+		expect(error).toMatchObject({ code: 'ERASURE_INCOMPLETE', failures: [failure], partialCounts: { broken: 3, final: 2, roomOwners: 1, presenceRoster: 2 },
+			ownerSuccessions: [{ topic, owner: 'other', reason: 'succeeded' }], presenceTopics: [topic] });
+		expect(finalCalls).toBe(1);
+		expect(await redis.hget('__live-room-owner:' + topic, 'o')).toBe('other');
+		expect(await redis.hmget('__live-room-owner:' + topic, 'j:member', 'n:member')).toEqual([null, null]);
+		expect(await redis.hmget('__live-presence:' + topic, 'c:member', 'd:member')).toEqual([null, null]);
+		expect(await redis.hget('__live-presence:' + topic, 'c:other')).toBe('1');
+	});
+
 	it('is idempotent: a second purge finds nothing and reports no successions', async () => {
 		await seedOwnerRoom('room1', { o: 'u1', q: 2, 'j:u1': 1, 'j:u2': 2, 'n:u1': 1, 'n:u2': 1 });
 
