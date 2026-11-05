@@ -11,11 +11,13 @@ import { createIdempotencyStore } from '../../../src/postgres/idempotency.js';
 import { createDeadLetter } from '../../../src/postgres/dead-letter.js';
 import { createAlarmStore } from '../../../src/postgres/alarm-store.js';
 import { manifest, runVerification, postgresRecoveryConfig, connectPostgresRecovery } from '../../../docs/tools/recovery-verify.mjs';
+import { PROJECT_NAME } from '../global-setup-postgres.js';
 
 it('restores a real PostgreSQL archive and detects partial replay and sequence restoration read-only', async () => {
 	const admin = createPgClient({ connectionString: process.env.INTEGRATION_POSTGRES_URL, autoShutdown: false });
 	const connection = database => { const url = new URL(process.env.INTEGRATION_POSTGRES_URL); url.pathname = '/' + database; return url.href; };
-	const project = process.env.INTEGRATION_COMPOSE_PROJECT || 'svelte-adapter-uws-ext-int-postgres';
+	// The stack's project name follows the host port unless one is given.
+	const project = PROJECT_NAME;
 	const container = execFileSync('docker', ['compose', '-p', project, '-f', 'test/integration/docker-compose.yml', 'ps', '-q', 'postgres'], { encoding: 'utf8', windowsHide: true }).trim();
 	const config = { schemaVersion: 1, postgres: { stores: Object.fromEntries(manifest.postgres.map(item => [item.id, item.table])) } };
 	let source, reader, replay, tasks, cache, dlq;

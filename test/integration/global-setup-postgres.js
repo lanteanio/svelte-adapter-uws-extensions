@@ -16,7 +16,7 @@ const composePath = path.join(__dirname, 'docker-compose.yml');
 // project to run side-by-side with another stack:
 //   INTEGRATION_POSTGRES_HOST_PORT=55440 INTEGRATION_COMPOSE_PROJECT=my-slice npm run test:integration:postgres
 const POSTGRES_HOST_PORT = Number(process.env.INTEGRATION_POSTGRES_HOST_PORT) || 55432;
-const PROJECT_NAME = process.env.INTEGRATION_COMPOSE_PROJECT
+export const PROJECT_NAME = process.env.INTEGRATION_COMPOSE_PROJECT
 	|| (POSTGRES_HOST_PORT === 55432
 		? 'svelte-adapter-uws-ext-int-postgres'
 		: `svelte-adapter-uws-ext-int-postgres-${POSTGRES_HOST_PORT}`);
