@@ -2,7 +2,7 @@
 	"schemaVersion": 2,
 	"owner": "svelte-adapter-uws-extensions",
 	"entryBudgetLines": 80,
-	"readmeMaxLines": 4801,
+	"readmeMaxLines": 4800,
 	"paths": [
 		{
 			"key": "identity",

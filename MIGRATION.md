@@ -391,13 +391,35 @@ slice stops counting after `staleAfter`.
 
 ### Rate-limit principal identities use version-2 tuples
 
-Principal buckets use JSON `[tenantId or null, String(key)]` identities in `v2:ratelimit:`, `v2:ratelimits:` and `v2:ratelimitg:`. Each scope and principal has its own bucket, including strings with NUL or lone UTF-16 surrogates. Tenant aggregates, composite limits, upgrade buckets and emergency controls retain their existing key families.
+**Symptom.** After the upgrade every principal starts with a full allowance and
+earlier bans no longer apply. Redis refuses principal `consume()`, `peek()` and
+the admin calls for a user whose ACL lacks the `v2:` patterns. While old and
+new instances run together each meters its own budget, so a principal can be
+admitted up to twice its allowance.
 
-Before deploying, grant those three version-2 key patterns under the client prefix. Retain the exact `v1:ratelimit:emergency` key permission along with `v1:ratelimit-control:*`: the emergency reader checks the historical factor, and `set()`/`clear()` access that historical key even when absent. Removing its permission makes those operations fail.
+**Why.** Principal buckets are keyed by a JSON `[tenantId or null, key]` tuple
+under `v2:ratelimit:`, `v2:ratelimits:` and `v2:ratelimitg:`. The `v1:` keys
+joined tenant and key with NUL and sent them as raw UTF-8, so an unscoped key
+containing NUL could share a tenant principal's bucket, and keys that differed
+only in lone UTF-16 surrogates shared one. Old buckets cannot be translated,
+because the tenant and key cannot be recovered from them. Tenant budgets,
+composite limits, upgrade buckets and the emergency controls keep their keys.
 
-Stop old admission writers before starting new writers. Mixed versions meter independent budgets and admit up to both allowances. Every principal receives a fresh allowance; old bans do not carry over. Reapply required bans through the new limiter before resuming traffic. Never dual-read, rename or copy old hashes: their identities are ambiguous and cannot be assigned safely.
-
-After old writers stop, inventory and retire the version-1 principal HASH buckets under `v1:ratelimit:*`, `v1:ratelimits:*` and `v1:ratelimitg:*`, preserving a STRING at `v1:ratelimit:emergency` and the tenant-aggregate, composite, upgrade and control families. Existing TTLs expire retired hashes naturally; manually unbanned hashes may have no TTL and require explicit cleanup. New `clear`, `reset` and `purgeUser` affect only version 2 and do not clean retired identities. Recovery inventories both versions; restore active version-2 buckets with original expiry and keep retired hashes out of active migration.
+**Action.** Grant `v2:ratelimit:*`, `v2:ratelimits:*` and `v2:ratelimitg:*`
+under the client prefix, and keep `v1:ratelimit-control:*` plus the exact key
+`v1:ratelimit:emergency`, which `emergency.set()`, `emergency.clear()`,
+`emergency.get()` and every limiter's background factor read still touch.
+Without that grant, `set()` and `clear()` reject after writing or deleting the
+new key, `get()` rejects while no factor is set there, and limiters keep
+applying the last factor they read once it expires or is cleared. Stop old
+instances before starting new ones and reapply any bans you need before
+admitting traffic. Old principal hashes under `v1:ratelimit:*`,
+`v1:ratelimits:*` and `v1:ratelimitg:*` are never read and expire by their TTL;
+delete the ones without a TTL by hand (an `unban()` of an expired bucket leaves
+one), leaving the string at `v1:ratelimit:emergency`. `clear`, `reset` and
+`purgeUser` only touch `v2:` buckets. When restoring from a backup, restore the
+`v2:` buckets with their original expiry and leave the `v1:` principal hashes
+out.
 
 ### The rate-limit emergency factor moved to its own key
 
