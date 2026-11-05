@@ -391,7 +391,7 @@ describe('redis dead-letter forget tombstone (right-to-erasure completeness)', (
 		expect(await store.add(drec({ startedAt: 100 }))).toBeNull();
 		expect(await store.count()).toBe(0);
 		clockMs += 1;
-		// The next server millisecond is genuinely later and remains usable.
+		// One server millisecond later the capture is kept.
 		expect(await store.add(drec({ startedAt: 100 }))).not.toBeNull();
 		expect(await store.count()).toBe(1);
 	});

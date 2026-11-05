@@ -198,9 +198,10 @@ export function stripInternal(obj, ancestors, depth, budget, dropKey) {
  * - **Every URL in the string, not just the first.** Callers pass whole
  *   error messages and whole stack traces, which routinely carry the DSN
  *   more than once; redacting only the first occurrence leaks the rest.
- *   Whitespace ends ordinary URL text, but remains a credential byte until
- *   an authority `@` or a query parameter/fragment boundary. JSON containers
- *   are decoded per string so unrelated fields and formatting are retained.
+ *   The scan does not stop at whitespace: a userinfo password runs to the
+ *   last `@` before the next `/`, `?` or `#`, and a query password to the
+ *   next `&` or `#` or the end of the string. JSON containers are decoded
+ *   per string so unrelated fields and formatting are retained.
  *
  * @param {unknown} url
  * @returns {string}

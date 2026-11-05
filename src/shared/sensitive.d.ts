@@ -78,16 +78,14 @@ export const STRIP_MAX_NODES: number;
  *   without treating brackets inside a password as host syntax.
  * - **Query-string passwords** (`postgres://host/db?password=hunter2`).
  *   Case-insensitive match on decoded `password` / `pass` / `pwd` keys;
- *   raw punctuation remains part of the value through the next `&`.
+ *   the value runs to the next `&` or `#`, or to the end of the string.
  * - **Every URL in the string.** Whole messages and whole stack traces are
- *   valid input and routinely carry the DSN more than once. Whitespace
- *   terminates ordinary URL text, but remains part of a credential -
- *   punctuation such as a closing quote is NOT a terminator, because the
- *   sub-delims `!$&'()*+,;=` are legal unescaped in a userinfo password and
- *   stopping at one would leave the credential unredacted.
- *   Valid JSON containers retain their string boundaries and other fields.
- *   Query passwords without a parameter or fragment boundary can consume
- *   trailing free text, including line breaks, to prevent suffix disclosure.
+ *   valid input and routinely carry the DSN more than once. The scan does
+ *   not stop at whitespace or punctuation, since pg and ioredis accept both
+ *   in a password: a userinfo password runs to the last `@` before the next
+ *   `/`, `?` or `#`. Free text after a URL can be redacted with it, never
+ *   text before it. Valid JSON input is redacted per string value and keeps
+ *   its other fields and formatting.
  *
  * @example
  * redactConnectionUrl('redis://:s3cret@redis.internal:6379');

@@ -8,7 +8,7 @@ import { createRedisClient } from '../../src/redis/index.js';
 import { ReplayStorageError } from '../../src/shared/replay-helpers.js';
 import { setOperationalEventSink } from '../../src/shared/diagnostic.js';
 
-// Keep only values the actual installed driver reads as the full password.
+// Keep only values the installed driver parses as the whole password.
 function acceptedPasswords(protocol, query) {
 	const accepted = [];
 	for (const code of [9, 10, 11, 12, 13, ...Array.from({ length: 95 }, (_, index) => index + 32)]) {

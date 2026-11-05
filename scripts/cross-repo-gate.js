@@ -26,9 +26,12 @@
  *   contracts native WebSocket delivery through the packed realtime message
  *            hook and extensions bus preserves local and remote values/order.
  *
- *   delivery-contracts native Redis/PostgreSQL revocation with stream/derived
- *            authorization. Requires explicit loopback INTEGRATION_REDIS_URL
- *            and INTEGRATION_POSTGRES_URL for isolated test services.
+ *   delivery-contracts authorizeDelivery through the packed heads across two
+ *            processes over Redis and PostgreSQL: a recipient revoked while
+ *            its delivery waits for authorization never gets the payload,
+ *            for raw platform, realtime stream and derived subscriptions.
+ *            Needs INTEGRATION_REDIS_URL and INTEGRATION_POSTGRES_URL naming
+ *            isolated loopback test services; without them the rung fails.
  *
  * These are the cross-head proof: they run against the tarballs. The rest
  * re-run each repo's own suite IN ITS OWN TREE, where the sibling heads come
@@ -52,7 +55,8 @@
  *
  *   node scripts/cross-repo-gate.js
  *
- * The sibling heads are discovered on disk; every knob below is optional.
+ * The sibling heads are discovered on disk and every flag below is optional.
+ * A full run also needs the two delivery-contracts URLs above.
  *
  *   --repo <path>        Add or override a repo path (repeatable): a head, or
  *                        the svelte-adapter-bunserve checkout. The package
@@ -613,10 +617,10 @@ function rungDeliveryContracts() {
 	}
 	const r = run(process.execPath, [join(state.consumer, 'cross-repo-delivery.mjs')], state.consumer, { env: { REQUIRE_UWS: '1' }, timeout: 120000 });
 	if (r.code !== 0 || !r.stdout.includes('Packed delivery contract passed:')) {
-		record('delivery-contracts', FAIL, 'packed native backend delivery authorization failed', r.stdout + '\n' + r.stderr);
+		record('delivery-contracts', FAIL, 'authorizeDelivery over the packed heads failed', r.stdout + '\n' + r.stderr);
 		return false;
 	}
-	record('delivery-contracts', PASS, 'real Redis/PG cross-process revocation; native raw, realtime stream and opaque derived deliveries');
+	record('delivery-contracts', PASS, 'Redis and PostgreSQL revocation across processes for raw, realtime stream and derived deliveries');
 	return true;
 }
 

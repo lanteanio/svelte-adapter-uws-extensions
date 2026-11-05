@@ -164,7 +164,7 @@ export interface MockPlatform extends Omit<Platform, keyof MockPlatformState>, M
  */
 export function mockPlatform(): MockPlatform;
 
-/** The adapter's canonical member inventory, shared by the mock and wrapper drift gates. */
+/** Every public Platform member name: the adapter's `PLATFORM_MEMBERS` from `svelte-adapter-uws/platform-contract`. */
 export const PLATFORM_KEYS: ReadonlyArray<string>;
 
 // - Mock WebSocket -----------------------------------------------------------

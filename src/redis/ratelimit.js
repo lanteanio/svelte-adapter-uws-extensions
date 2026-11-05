@@ -356,9 +356,9 @@ return 1
  *   tenants sharing an IP / connection / custom key get independent buckets and a tenant's
  *   admin ops (`reset` / `ban` / `unban` / `clear`) touch only that tenant. Return
  *   null/undefined for an unscoped connection. When omitted, reads the adapter's frozen
- *   connection attribution. With neither, the principal key space stays byte-identical.
- *   The id is joined to a principal key with a NUL,
- *   so it stays unambiguous even when the key is an IPv6 address.
+ *   connection attribution. With neither, the connection uses the unscoped `null` tenant.
+ *   The bucket key is a JSON `[tenantId, key]` tuple, so it stays unambiguous whatever
+ *   the key holds, an IPv6 address or a NUL included.
  * @property {'principal' | 'tenant'} [budget='principal'] - Per-principal allowance by
  *   default; 'tenant' shares one allowance across every principal of that tenant and
  *   requires a non-empty tenant id. reset/ban/unban use their tenant argument and ignore
@@ -374,7 +374,7 @@ return 1
  *   - only the request-path verdict
  *   degrades. Off (today's reject-to-caller behavior) unless set.
  * @property {'window' | 'sliding' | 'gcra'} [refill='window'] - Refill algorithm.
- *   'window' (default) is the fixed-window counter, byte-identical to prior releases;
+ *   'window' (default) is the fixed-window counter;
  *   it admits up to ~2x points across a window edge (the whole bucket refills at once).
  *   'sliding' is a sliding-window-counter and 'gcra' is a leaky-bucket/GCRA - both remove
  *   that boundary burst. Each mode uses its own key space, so switching modes never reads a

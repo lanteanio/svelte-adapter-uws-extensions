@@ -70,8 +70,8 @@ export function isHealthEvent(event, data) {
 	if (Object.keys(data).some(key => key !== 'at' && key !== detail)) return false;
 	const value = data[detail];
 	try {
-		// Preserve the policy factory's existing object-container acceptance,
-		// including arrays. The enclosing health data still has its own shape.
+		// Accept every container the policy factory accepts, arrays included;
+		// the surrounding health data was shape-checked above.
 		validatePolicyEnvelope(value, detail);
 		return true;
 	} catch {

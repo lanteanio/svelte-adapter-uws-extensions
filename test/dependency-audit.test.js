@@ -39,7 +39,7 @@ function lockMutation(change) {
 	return { ...input(), lockText: JSON.stringify(value) };
 }
 
-describe('bounded dependency audit policy', () => {
+describe('dependency audit exception', () => {
 	it('accepts a clean report after expiry without consulting exception inputs', () => {
 		expect(validateDependencyAudit({
 			...cleanInput(), now: Date.parse('2026-11-10T00:00:00Z'),

@@ -201,14 +201,15 @@ export interface DistributedSession<T = unknown> {
 	 * leaves this user's index.
 	 *
 	 * Rejects with `code: 'ERASURE_INDEX_INCOMPLETE'` and
-	 * `erasureIndexIncomplete: true` when Redis fails, one of this user's
-	 * indexed tokens are invalid, records cannot be parsed or attributed, or a record keeps
+	 * `erasureIndexIncomplete: true` when Redis fails, an indexed token is
+	 * invalid, a record cannot be parsed or attributed, or a record keeps
 	 * changing during the purge. The user's other reachable sessions are still
 	 * revoked (none are when the index itself cannot be read), and the
-	 * unresolved index fields stay for a retry. Rejects before deleting
-	 * anything when the index holds an oversized token or a reserved prefix. The
-	 * index must be read first; a qualified purge also writes its erasure fence
-	 * before inspecting those fields. With
+	 * unresolved index fields stay for a retry. An oversized or reserved-prefix
+	 * token in the index the purge reads first rejects before anything is
+	 * deleted; a qualified purge writes its erasure fence before that check.
+	 * Such a token in the legacy index, found after the qualified records were
+	 * erased, rejects with those records counted in `removed`. With
 	 * `forgetUserId`, user IDs are globally unique and tenantId does not
 	 * partition the store.
 	 *

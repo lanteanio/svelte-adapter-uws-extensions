@@ -28,7 +28,8 @@ export interface RedisCursorOptions {
 	/**
 	 * World-state tick rate, in ms. Per-topic aggregate cap on broadcasts:
 	 * each topic emits at most one frame per window, carrying the latest
-	 * position for every cursor that moved. Bandwidth per peer scales with
+	 * position of up to `maxMovers` cursors that moved; the rest go out in
+	 * later windows. Bandwidth per peer scales with
 	 * active-mover count, not with mover-count times per-mover rate.
 	 * Default 16 (60Hz) suits typical small-to-medium rooms; raise to 33
 	 * (30Hz) for high-density rooms where wire bytes matter.

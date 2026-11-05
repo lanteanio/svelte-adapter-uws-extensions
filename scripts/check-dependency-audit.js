@@ -9,10 +9,11 @@ const ADVISORY = 'https://github.com/advisories/GHSA-gcqx-w48m-w2h4';
 const EXPIRES = '2026-11-09T00:00:00Z';
 const LOCK_DIGEST = 'bdde6e92b3bde883b9f7366946b1f15cef1690f669c374a3f7d65f7681944d6b';
 
-// The merge in node-resolve copies constant defaults. The Svelte plugin
-// merges executable local configuration during config setup, before module
-// compilation. These artifacts have no request-data merge path. Any change
-// to this dependency tree or its advisory graph requires another review.
+// GHSA-gcqx-w48m-w2h4 (deepmerge prototype poisoning) reaches this tree only
+// through build tooling: @rollup/plugin-node-resolve merges constant defaults,
+// and the Svelte plugin merges local configuration during config setup, before
+// any module compiles. Neither merges request data. Any other tree, advisory
+// or a date past EXPIRES fails; update these pins only after rechecking that.
 const PINS = {
 	'deepmerge': ['4.3.1', 'sha512-3sUqbMEc77XqpdNO7FRyRog+eW3ph+GYCbj+rK+uYyRMuwsVy0rMiVtPn+QJlKFvWP/1PYpapqYn0Me2knFn+A=='],
 	'@rollup/plugin-node-resolve': ['16.0.3', 'sha512-lUYM3UBGuM93CnMPG1YocWu7X802BrNF3jW2zny5gQyLQgRFJhV1Sq0Zi74+dh/6NBx1DxFC4b4GXg9wUCG5Qg=='],
@@ -80,8 +81,8 @@ function auditReport(input) {
 
 /**
  * Validate captured command output without changing the report.
- * The clock, command status and registry reply are inputs so hostile cases
- * can exercise the same decision without invoking npm or the network.
+ * The clock, command status and registry reply are inputs so tests can drive
+ * the same decision without running npm or touching the network.
  *
  * @param {{ auditText: string, lockText?: string, registryText?: string,
  *   auditStatus: number | null, registryStatus?: number | null,

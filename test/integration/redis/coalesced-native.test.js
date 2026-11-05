@@ -102,12 +102,11 @@ for (const mode of ['classic', 'sharded']) describe(`${mode} coalesced relay ove
 		const wrapped = sender.wrap(source.platform);
 		wrapped.publish(topic, 'ready', { ready: true }, { seq: false });
 		const clients = [local, slow, observer];
-		await waitFor(() => clients.every(client => framesFor(client, topic, 'ready').length === 1), 'real Redis round-trip control', clients);
+		await waitFor(() => clients.every(client => framesFor(client, topic, 'ready').length === 1), 'Redis round trip', clients);
 
-		// Pause only one real client. Fill its native output buffer with at most
-		// 64 MiB, stopping when uWS refuses another frame after a settling turn.
-		// Both coalesced values and later drain callbacks use the untouched
-		// platform implementation; no platform method is replaced by this test.
+		// Pause one client and fill its uWS output buffer, at most 64 MiB, until
+		// a send is refused after a settling turn. The coalesced values and the
+		// drain callbacks go through the unmodified platform.
 		slow.socket.pause();
 		expect(nativeSlow).toBeDefined();
 		const chunk = new Uint8Array(1024 * 1024);
@@ -123,15 +122,14 @@ for (const mode of ['classic', 'sharded']) describe(`${mode} coalesced relay ove
 			if (nativeSlow.send(chunk, true) === 2) { backpressured = true; break; }
 			accepted++;
 		}
-		expect(backpressured, 'The real paused receiver must refuse native sends before coalescing is asserted').toBe(true);
+		expect(backpressured, 'paused receiver must report backpressure before the burst').toBe(true);
 		expect(nativeSlow.getBufferedAmount()).toBeGreaterThan(0);
 		const count = 8;
 		for (let index = 0; index < count; index++) {
 			expect(wrapped.relayCoalesced(topic, 'position', { index }, 'cursor')).toBe(true);
 		}
-		// The healthy subscriber is on the same target server and Redis topic.
-		// Its fence proves the receiver processed the entire burst before the
-		// paused socket resumes, rather than relying on an arbitrary delay.
+		// The observer is on the same server and Redis topic, so its fence frame
+		// arrives only after the server processed the whole burst.
 		wrapped.publish(topic, 'burst-fence', { identity }, { seq: false });
 		await waitFor(() => framesFor(observer, topic, 'burst-fence').length === 1, 'receiver-side Redis burst fence', [local, observer]);
 		expect(framesFor(observer, topic, 'position').map(frame => frame.data)).toEqual(Array.from({ length: count }, (_, index) => ({ index })));

@@ -29,7 +29,7 @@ afterEach(async () => {
 	await Promise.all([...servers, ...leaked].map(close));
 	servers.clear(); clients.clear(); vi.restoreAllMocks();
 	const errors = failures.splice(0);
-	assert.equal(leaked.length, 0, 'each completed source read must close its actual UDP socket');
+	assert.equal(leaked.length, 0, 'each completed source read must close its UDP socket');
 	if (errors.length) throw new AggregateError(errors, 'Loopback NTP responder failed');
 });
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -106,7 +106,7 @@ describe('NTP source over local UDP only', () => {
 		assert.equal(await ntp.read(), 1_700_000_000_500); assert.equal(calls, 2);
 	});
 	for (const [name, header] of [['unsynchronized stratum', { stratum: 16 }], ['unsupported version', { version: 0 }], ['unsynchronized LI', { leap: 3 }]]) {
-		it('rejects a matching actual-peer reply with ' + name, async () => {
+		it('rejects a correlated reply from the configured peer with ' + name, async () => {
 			const responder = await server((packet, peer, socket) => send(socket, reply(packet, undefined, header), peer));
 			await assert.rejects(source(responder).read(), /stratum|version|unsynchronized/);
 		});

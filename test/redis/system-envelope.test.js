@@ -54,7 +54,7 @@ for (const kind of ['pubsub', 'sharded']) {
 					expect(local.published[1].data.recovery).toBe(recovery);
 					for (const frame of local.published) expect(frame.options).toEqual({ relay: false, seq: false });
 					expect(relayed).not.toHaveBeenCalled();
-					// Exercise the actual producer's JSON form as a custom peer publish.
+					// Replay the producer's JSON as a peer publish.
 					for (const { topic, event, data } of local.published) {
 						const raw = JSON.stringify({ instanceId: 'peer', topic, event, data });
 						if (kind === 'pubsub') await client.redis.publish('remote-policy', raw);
@@ -147,7 +147,7 @@ for (const kind of ['pubsub', 'sharded']) {
 			const other = mockWs();
 			platform.subscribe(subscriber, '__realtime');
 			platform.subscribe(other, 'application');
-			// The default mock walk is empty; exercise actual recipient delivery.
+			// The default mock walk visits nobody; list both sockets so delivery reaches them.
 			platform.forEachSubscriber = (topic, visit) => {
 				for (const ws of [subscriber, other]) if (ws.isSubscribed(topic)) visit(ws);
 			};

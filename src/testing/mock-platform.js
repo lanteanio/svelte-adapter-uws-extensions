@@ -1,7 +1,7 @@
 import { PLATFORM_MEMBERS } from 'svelte-adapter-uws/platform-contract';
 import { trackedSubscribe, trackedUnsubscribe } from 'svelte-adapter-uws/subscriptions';
 
-/** The adapter owns the inventory; new members require explicit mock and wrapper support. */
+/** Re-exported from the adapter. A member added there fails the parity test until the mock and both bus wraps provide it. */
 export const PLATFORM_KEYS = PLATFORM_MEMBERS;
 
 /**

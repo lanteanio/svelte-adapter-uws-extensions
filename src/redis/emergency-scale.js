@@ -30,9 +30,11 @@
 import { wallEpoch } from '../shared/runtime.js';
 import { evalCached } from '../shared/eval-cached.js';
 
-// A namespace no limiter bucket key can produce: bucket keys live under
-// `v1:ratelimit:`, `v1:ratelimits:`, `v1:ratelimitg:` and `v1:ratelimitc:`, so
-// neither a bucket named `emergency` nor a limiter clear() can reach it.
+// A namespace no limiter bucket key can produce: principal buckets live under
+// `v2:`, tenant budgets under `v1:ratelimit-tenant:` and its siblings,
+// composite limits under `v1:ratelimitc:` and upgrade buckets under
+// `v1:upgrade-bucket:`, so neither a bucket named `emergency` nor a limiter
+// clear() can reach it.
 const EMERGENCY_KEY = 'v1:ratelimit-control:emergency';
 // Earlier versions stored the factor inside the fixed-window bucket keyspace.
 // A string there is a factor written by such a version and is still honored

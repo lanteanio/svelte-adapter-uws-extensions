@@ -5,10 +5,11 @@ import type { CircuitBreaker } from '../shared/breaker.js';
 /**
  * Refill algorithm for a rate limiter.
  *
- * - `'window'` (default) - fixed-window counter. The whole bucket refills at once at the window edge, so it admits
- *   up to ~2x `points` across an edge (the classic fixed-window boundary burst:
- *   a full budget just before the edge plus a full budget just after). Choose a
- *   smooth mode below when that burst matters.
+ * - `'window'` (default) - fixed-window counter. The whole bucket refills at
+ *   once at the window edge, so it admits up to ~2x `points` across an edge
+ *   (the classic fixed-window boundary burst: a full budget just before the
+ *   edge plus a full budget just after). Choose a smooth mode below when that
+ *   burst matters.
  * - `'sliding'` - sliding-window-counter: weights the previous window by its
  *   remaining overlap, so admission does not jump at the edge.
  * - `'gcra'` - leaky-bucket / GCRA: meters a smooth emission of one token every
