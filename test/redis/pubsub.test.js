@@ -428,9 +428,9 @@ describe('redis pubsub bus', () => {
 		it('sendCoalesced delegates to the original platform', () => {
 			const wrapped = bus.wrap(platform);
 			const ws = {};
-			wrapped.sendCoalesced(ws, { key: 'price', payload: { v: 100 } });
+			wrapped.sendCoalesced(ws, { key: 'price', topic: 'prices', event: 'tick', data: { v: 100 } });
 			expect(platform.sentCoalesced).toHaveLength(1);
-			expect(platform.sentCoalesced[0]).toMatchObject({ ws, key: 'price', payload: { v: 100 } });
+			expect(platform.sentCoalesced[0]).toMatchObject({ ws, key: 'price', topic: 'prices', event: 'tick', data: { v: 100 } });
 		});
 
 		it('request delegates to the original platform', async () => {

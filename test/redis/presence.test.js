@@ -11,6 +11,7 @@ import { mockRedisClient } from '../helpers/mock-redis.js';
 import { mockPlatform } from '../helpers/mock-platform.js';
 import { mockWs } from '../helpers/mock-ws.js';
 import { createPresence, WsClosedError } from '../../src/redis/presence.js';
+import { createPresence as createMemoryPresence } from 'svelte-adapter-uws/plugins/presence';
 import { createCircuitBreaker, CircuitBrokenError } from '../../src/shared/breaker.js';
 import { createMetrics } from '../../src/prometheus/index.js';
 
@@ -69,11 +70,13 @@ describe('redis presence', () => {
 			expect(() => createPresence(client, { ttl: -1 })).toThrow();
 		});
 
-		it('reads select as the in-memory plugin does: falsy is the default, a non-function fails the join', async () => {
-			for (const select of [false, '', 0]) expect(() => createPresence(client, { select })).not.toThrow();
-			const presence = createPresence(client, { select: 'identity' });
-			await expect(presence.join(mockWs({ id: 'u1' }), 'room', mockPlatform())).rejects.toThrow(TypeError);
-			presence.destroy();
+		it('reads select as the in-memory plugin does: null is not set, anything else but a function is refused at creation', () => {
+			for (const select of [false, '', 0, 'identity', {}]) {
+				expect(() => createMemoryPresence({ select })).toThrow('presence: select must be a function');
+				expect(() => createPresence(client, { select })).toThrow('presence: select must be a function');
+			}
+			expect(() => createMemoryPresence({ select: null })).not.toThrow();
+			createPresence(client, { select: null }).destroy();
 		});
 	});
 

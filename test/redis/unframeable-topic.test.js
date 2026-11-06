@@ -1,5 +1,6 @@
-// A topic with a double quote, a backslash or a control character cannot be
-// put into a frame: the adapter throws when it builds the envelope. Presence
+// A topic with a double quote, a backslash, a control character or an
+// unpaired surrogate cannot be put into a frame: the adapter throws when it
+// builds the envelope. Presence
 // and cursor reject such a topic where it enters, and their timers keep going
 // for every other topic, and report, when one topic's publish throws.
 
@@ -14,7 +15,13 @@ import { registeredRecord } from '../helpers/diagnostic-line.js';
 import { installFakeRuntimeClock, releaseRuntimeClock } from '../helpers/runtime-clock.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const BAD = ['say "hi"', 'back\\slash', 'line\nbreak', 'tab\there', 'nul\u0000'];
+const BAD = [
+	'say "hi"', 'back\\slash', 'line\nbreak', 'tab\there', 'nul\u0000',
+	// A lone high surrogate, a lone low one, and a pair in the wrong order.
+	'high' + String.fromCharCode(0xd800), String.fromCharCode(0xdc00) + 'low', 'swap' + String.fromCharCode(0xde00, 0xd83d)
+];
+/** A well-formed surrogate pair (U+1F600) is ordinary text. */
+const PAIRED = 'room-' + String.fromCharCode(0xd83d, 0xde00);
 
 async function until(check, timeoutMs = 2000) {
 	const start = Date.now();
@@ -138,6 +145,18 @@ describe('cursor and an unframeable topic', () => {
 		expect(active).toBe(0);
 		expect(subscriber).not.toHaveBeenCalled();
 		expect(platform.published).toEqual([]);
+	});
+
+	it('update() refuses an unpaired surrogate with the adapter\'s message and keeps a well-formed pair', () => {
+		const client = mockRedisClient('uf4b:');
+		const platform = mockPlatform();
+		const cursor = createCursor(client, { throttle: 0, topicThrottle: 0, snapshotIntervalMs: 0 });
+		expect(() => cursor.update(mockWs({ id: '1' }), BAD.at(-3), { x: 1 }, platform))
+			.toThrow('Topic must not contain quotes, backslashes, control characters, or unpaired surrogates');
+		expect(() => cursor.update(mockWs({ id: '1' }), PAIRED, { x: 1 }, platform)).not.toThrow();
+		const active = cursor.stats().activeTopicsTotal;
+		cursor.destroy();
+		expect(active).toBe(1);
 	});
 
 	it('snapshot() silently rejects invalid names before authorization or retained state', async () => {

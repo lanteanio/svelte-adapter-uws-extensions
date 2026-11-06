@@ -195,8 +195,14 @@ fractional Redis lifetime failed every write that set it. The
 [changelog](CHANGELOG.md) lists every option. `undefined` and `null` are
 "not set", and a falsy `breaker` or `metrics` is still none. Options the
 adapter's in-memory presence, cursor, groups and rate-limit plugins also read
-accept every value those plugins accept, so swapping one for its Redis
-counterpart never meets a new refusal. The one exception is presence
+accept exactly the values those plugins accept and refuse the others, so
+swapping one for its Redis counterpart never meets a refusal only one side
+makes. The refusals those plugins added in svelte-adapter-uws 0.6.0-next.97
+carry their message inside ours, among them a presence `select` that is not a function,
+presence `transient` and `clientUpdateFields` that are not arrays of strings,
+cursor `viewport.enabled` and `backpressure.enabled` that are not booleans,
+presence and cursor timers above 2147483647 ms, and a group `meta` that is not
+a plain object. The one exception is presence
 `heartbeat: 0`, which the in-memory plugin reads as "no heartbeat" and the Redis
 presence refuses: its heartbeat also renews every local entry's Redis TTL, so
 without it every present user would expire after `ttl` seconds. Keep a

@@ -180,9 +180,9 @@ const validateOptions = defineOptions({
 	types: 'RedisGroupOptions in redis/groups.d.ts'
 }, {
 	maxMembers: option.known,
-	// Read exactly as the adapter's in-memory groups plugin reads it, so an app
+	// Refused as the adapter's in-memory groups plugin refuses it, so an app
 	// moving between the two never meets a refusal only one of them makes.
-	meta: option.known,
+	meta: option.plainObject,
 	// Sent to Redis in milliseconds (PEXPIRE), and bounds the settle timers.
 	memberTtl: wholeExpiry({ scale: 1000, unit: 'seconds', also: timerCeiling({ scale: 1000, unit: 'seconds' }) }),
 	maxEnvelopeBytes: option.known,

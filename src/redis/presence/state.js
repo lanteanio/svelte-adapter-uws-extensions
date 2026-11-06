@@ -34,8 +34,9 @@ export function createPresenceState(client, options = {}) {
 	const keyField = options.key || 'id';
 	// Zero-config presence copies the dedup key and nothing else. An explicit
 	// select is the application's own policy and its result is used as-is, apart
-	// from the reserved names the join drops (see withoutReservedNames). Any
-	// falsy select takes the default, as in the adapter's in-memory plugin.
+	// from the reserved names the join drops (see withoutReservedNames). An
+	// omitted select takes the default; createPresence refuses one that is not
+	// a function, as the adapter's in-memory plugin does.
 	const select = options.select || makeDefaultPresenceSelect(keyField);
 	if (!options.select && (isSensitiveFieldName(keyField) || isStructurallyUnsafeFieldName(keyField))) {
 		console.warn(
@@ -45,11 +46,9 @@ export function createPresenceState(client, options = {}) {
 		);
 	}
 	// A wire presence-update frame writes nothing unless the application lists
-	// the names it lets clients write. A bare string is the obvious typo, and
-	// reading it as "unset" would make the requested client update vanish.
-	if (options.clientUpdateFields !== undefined && !Array.isArray(options.clientUpdateFields)) {
-		throw new Error('redis presence: clientUpdateFields must be an array of field names');
-	}
+	// the names it lets clients write. createPresence has already refused a
+	// list that is not an array of strings: a bare string is the obvious typo,
+	// and reading it as "unset" would make the requested client update vanish.
 	const fieldNames = createFieldNameRule(keyField, options.clientUpdateFields);
 	const warnReservedField = fieldNames.listsClientFields ? null : createReservedFieldWarner(keyField);
 	const maxFieldsBytes = options.maxFieldsBytes ?? 8192;

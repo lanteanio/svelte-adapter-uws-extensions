@@ -1,5 +1,7 @@
 import { PLATFORM_MEMBERS } from 'svelte-adapter-uws/platform-contract';
 import { trackedSubscribe, trackedUnsubscribe } from 'svelte-adapter-uws/subscriptions';
+import { assertEnvelopeName } from '../shared/frame-topic.js';
+import { collapseByCoalesceKey } from '../shared/_coalesce-batch.js';
 
 /** Re-exported from the adapter. A member added there fails the parity test until the mock and both bus wraps provide it. */
 export const PLATFORM_KEYS = PLATFORM_MEMBERS;
@@ -9,6 +11,18 @@ let mockProcesses = 0;
 /** The options `authorizeDelivery` takes, as the adapter's test platform reads them. */
 const DELIVERY_OPTION_KEYS = new Set(['maxPendingBytes', 'timeoutMs']);
 const MAX_TIMER_MS = 2147483647;
+
+/**
+ * Refuse a topic and event the adapter's platform could not put into a frame,
+ * with its errors: both are checked for type before either for content.
+ * @param {unknown} topic
+ * @param {unknown} event
+ */
+function assertNames(topic, event) {
+	if (typeof topic !== 'string' || typeof event !== 'string') throw new TypeError('Topic/event names must be strings.');
+	assertEnvelopeName(topic);
+	assertEnvelopeName(event);
+}
 
 /**
  * Create a mock platform that records publish/send calls.
@@ -212,11 +226,18 @@ export function mockPlatform() {
 		// the same pattern now / monotonic / random use. Default returns a
 		// fixed stamp shape so the parity surface stays populated.
 		hlc: () => ({ wall: 0, logical: 0, nodeId: 'mock' }),
+		// Names are refused as the adapter's platform refuses them, so a test
+		// against the mock meets the error production would throw.
 		publish(topic, event, data, options) {
+			assertNames(topic, event);
 			p.published.push({ topic, event, data, options });
 			return true;
 		},
 		publishBatched(messages, options) {
+			// The entries the adapter would send, after a later value replaced
+			// an earlier one under the same coalesce key, are all checked before
+			// the call is recorded, so a refused batch leaves no partial record.
+			for (const m of collapseByCoalesceKey(messages)) assertNames(m.topic, m.event);
 			p.publishedBatches.push({ messages, options });
 			for (let i = 0; i < messages.length; i++) {
 				const m = messages[i];
@@ -234,7 +255,10 @@ export function mockPlatform() {
 			const { compress, ...otherOptions } = options ?? {};
 			return p.publish(topic, event, data, { ...otherOptions, compress: compress === true });
 		},
+		// An empty batch returns before any name is checked, as on the adapter.
 		publishWireBatch(topic, event, entries, wire, options) {
+			if (!Array.isArray(entries) || entries.length === 0) return false;
+			assertNames(topic, event);
 			let delivered = false;
 			for (const entry of entries) {
 				const local = { ...options };
@@ -249,6 +273,8 @@ export function mockPlatform() {
 			return p.send(ws, topic, event, data, { ...otherOptions, compress: compress === true });
 		},
 		sendWireBatch(ws, topic, event, entries, wire, options) {
+			if (!Array.isArray(entries) || entries.length === 0) return 1;
+			assertNames(topic, event);
 			let result = 1;
 			for (const entry of entries) result = p.sendWire(ws, topic, event, entry.data, wire, options);
 			return result;
@@ -256,17 +282,21 @@ export function mockPlatform() {
 		registerWireCodec() {},
 		requestTopic() { return Promise.resolve([]); },
 		send(ws, topic, event, data, options) {
+			assertNames(topic, event);
 			p.sent.push({ ws, topic, event, data, options });
 			return 1;
 		},
 		sendCoalesced(ws, payload) {
+			assertNames(payload?.topic, payload?.event);
 			p.sentCoalesced.push({ ws, ...payload });
 			return 1;
 		},
-		// As the adapter's test platform: the key is recorded as the string the
-		// relay carries, and with no simulated cluster nothing reaches a
-		// sibling, so the call reports false.
+		// As the adapter's test platform: the names are checked in every mode,
+		// the key is recorded as the string the relay carries, and with no
+		// simulated cluster nothing reaches a sibling, so the call reports false.
 		relayCoalesced(topic, event, data, coalesceKey) {
+			assertEnvelopeName(topic);
+			assertEnvelopeName(event);
 			p.relayedCoalesced.push({ topic, event, data, coalesceKey: coalesceKey == null ? '' : '' + coalesceKey });
 			return false;
 		},
@@ -303,6 +333,7 @@ export function mockPlatform() {
 			return messages.map((m) => p.publish(m.topic, m.event, m.data, m.options));
 		},
 		sendTo(filter, topic, event, data) {
+			assertNames(topic, event);
 			return 0;
 		},
 		subscribers(topic) {

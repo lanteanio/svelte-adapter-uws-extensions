@@ -243,6 +243,7 @@ const validateOptions = defineOptions({
 }, {
 	storage: option.known,
 	size: option.known,
+	maxTopics: option.known,
 	ttl: option.known,
 	durability: option.known,
 	minReplicas: option.known,

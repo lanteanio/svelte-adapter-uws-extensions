@@ -139,6 +139,7 @@ const validateOptions = defineOptions({
 }, {
 	table: option.known,
 	size: option.known,
+	maxTopics: option.known,
 	ttl: option.known,
 	autoMigrate: option.boolean,
 	cleanupInterval: option.known,

@@ -1,11 +1,13 @@
 // A Redis presence, cursor, group or rate limiter is a drop-in for the
 // adapter's in-memory plugin of the same name. For every option both read,
-// a value the in-memory plugin accepts must not be refused here, or an app
-// that works on one throws when moved to the other. The one exception is
-// presence `heartbeat: 0`, which the in-memory plugin reads as "no heartbeat"
-// and the Redis presence cannot honor: its heartbeat also renews the Redis
-// TTL of every local entry. plugin-option-behaviour.test.js checks that the
-// accepted values also behave the same.
+// a value is accepted here exactly when the in-memory plugin accepts it: one
+// refused only here makes an app that works on the in-memory plugin throw when
+// moved, and one accepted only here lets an app depend on a value it could not
+// move back with. The one exception is presence `heartbeat: 0`, which the
+// in-memory plugin reads as "no heartbeat" and the Redis presence cannot
+// honor: its heartbeat also renews the Redis TTL of every local entry.
+// plugin-option-behaviour.test.js checks that the accepted values also behave
+// the same.
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createPresence as leadPresence } from 'svelte-adapter-uws/plugins/presence';
 import { createCursor as leadCursor } from 'svelte-adapter-uws/plugins/cursor';
@@ -64,18 +66,18 @@ for (const [name, lead, ours, options] of plugins) {
 }
 
 describe('options shared with the in-memory plugins', () => {
-	it.each(rows)('%s: accepted here whenever the in-memory plugin accepts it', (id, lead, ours, key, value) => {
+	it.each(rows)('%s: accepted here exactly when the in-memory plugin accepts it', (id, lead, ours, key, value) => {
 		const leadResult = outcome(() => lead({ [key]: value }));
 		const ourResult = outcome(() => ours(mockRedisClient(), { [key]: value }));
 		if (exceptions.has(id)) {
 			expect([leadResult, ourResult]).toEqual(['ok', 'throws']);
 			return;
 		}
-		if (leadResult === 'ok') expect(ourResult).toBe('ok');
+		expect(ourResult).toBe(leadResult);
 	});
 
-	// The check above only asserts when the in-memory plugin accepts a value,
-	// so a plugin that started refusing everything would pass it silently.
+	// Two plugins that both started refusing everything would still agree
+	// above, so the in-memory side must accept enough values to compare.
 	it.each(keys)('%s: the in-memory plugin accepts some of the values tried', (_id, lead, key) => {
 		const accepted = ODD_VALUES.filter((value) => outcome(() => lead({ [key]: value })) === 'ok');
 		expect(accepted.length).toBeGreaterThanOrEqual(3);

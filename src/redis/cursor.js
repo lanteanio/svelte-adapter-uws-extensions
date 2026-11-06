@@ -161,8 +161,9 @@ const validateOptions = defineOptions({
 	// a refusal only one of them makes.
 	maxDataBytes: option.known,
 	maxTopicLength: option.known,
-	throttle: option.known,
-	topicThrottle: option.known,
+	// Both feed a Node timer; the factory's own checks judge the rest.
+	throttle: timerCeiling(),
+	topicThrottle: timerCeiling(),
 	maxMovers: option.known,
 	select: option.known,
 	position: option.known,
@@ -179,6 +180,11 @@ const validateOptions = defineOptions({
 	maxEnvelopeBytes: option.known,
 	breaker: option.collaborator,
 	metrics: option.collaborator
+}, {
+	nested: {
+		viewport: new Set(['enabled', 'padding', 'cell']),
+		backpressure: new Set(['enabled', 'maxBufferedBytes'])
+	}
 });
 
 /**
@@ -858,7 +864,7 @@ export function createCursor(client, options = {}) {
 					if (exceedsDepth(data, MAX_PROJECTION_DEPTH)) { inputDropped('data_limit', 'update'); return; }
 				} catch { inputDropped('serialization_failed', 'update'); return; }
 			}
-			if (!topics.has(topic) && !isFramableTopic(topic)) throw new TypeError('Topic must not contain quotes, backslashes, or control characters');
+			if (!topics.has(topic) && !isFramableTopic(topic)) throw new TypeError('Topic must not contain quotes, backslashes, control characters, or unpaired surrogates');
 			mUpdates?.inc({ topic: mt(topic) });
 			ensureSubscriber(platform);
 
@@ -1413,9 +1419,12 @@ export function createCursor(client, options = {}) {
 					// Refuse a name attach() would reject before authorizing it.
 					if (invalidTopicReason(realTopic)) return 'INVALID_TOPIC';
 					// The adapter only routes a client wire-subscribe to a `__`
-					// topic when the app opted into `allowSystemTopicSubscribe`;
-					// authorize it exactly like attach() does.
-					const denial = await authorizeTopic(ws, realTopic, platform);
+					// topic when the app opted into `allowSystemTopicSubscribe`.
+					// A client asking for the tap channel observes the room, so
+					// it takes the observer lane as snapshot() does and as the
+					// adapter's in-memory plugin does: with the grant gate armed,
+					// the connection must already hold the room itself.
+					const denial = await authorizeTopic(ws, realTopic, platform, OBSERVER_LANE);
 					// RETURN the denial reason - the adapter treats anything
 					// that is not `false` or a string as ALLOW, so a bare
 					// `return` here would withhold the snapshot while still

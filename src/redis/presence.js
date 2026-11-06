@@ -82,7 +82,7 @@ import { createConsistencyAuditor } from '../shared/auditor.js';
 import { checkRedisPresenceLocalIndex } from '../shared/invariants.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
-import { defineOptions, interval, option, wholeExpiry } from '../shared/options.js';
+import { defineOptions, interval, option, timerCeiling, wholeExpiry } from '../shared/options.js';
 
 const onlineMetricCollectors = new WeakMap();
 function collectOnlineMetric(gauge, mapTopic, counts) {
@@ -159,14 +159,17 @@ const validateOptions = defineOptions({
 	// exactly as it reads them, so an app moving between the two never meets
 	// a refusal only one of them makes.
 	key: option.known,
-	select: option.known,
+	// Refused here rather than at the first join, where a non-function
+	// select would only fail once a user is already connecting.
+	select: option.function,
 	maxFieldsBytes: option.known,
 	maxTotalFieldsBytes: option.known,
-	topicThrottle: option.known,
-	heartbeat: option.known,
-	transient: option.known,
+	// Both feed a Node timer; the factory's own checks judge the rest.
+	topicThrottle: timerCeiling(),
+	heartbeat: timerCeiling(),
+	transient: option.fieldNames,
 	binary: option.known,
-	clientUpdateFields: option.known,
+	clientUpdateFields: option.fieldNames,
 	maxTopicsPerConnection: option.known,
 	// Sent to Redis in milliseconds (HPEXPIRE / PX).
 	ttl: wholeExpiry({ scale: 1000, unit: 'seconds' }),
@@ -1051,7 +1054,7 @@ export function createPresence(client, options = {}) {
 	const tracker = {
 		async join(ws, topic, platform) {
 			if (typeof topic !== 'string') throw new TypeError('Topic must be a string');
-			if (!isFramableTopic(topic)) throw new TypeError('Topic must not contain quotes, backslashes, or control characters');
+			if (!isFramableTopic(topic)) throw new TypeError('Topic must not contain quotes, backslashes, control characters, or unpaired surrogates');
 			if (topic.startsWith('__')) return;
 			startHeartbeat();
 

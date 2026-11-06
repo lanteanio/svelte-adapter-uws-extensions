@@ -178,4 +178,19 @@ describe('cursor room membership', () => {
 		expect(verdict).toBe('FORBIDDEN');
 		cursors.destroy();
 	});
+
+	// As the adapter's in-memory plugin: a client asking for the tap channel
+	// observes the room, so with the grant gate armed it must already hold the
+	// room. attach() is the lane that establishes the grant and asks without it.
+	it('authorizes the wire subscribe on the observer lane', async () => {
+		const cursors = createCursor(mockRedisClient('t10:'), opts);
+		const platform = mockPlatform();
+		await cursors.hooks.subscribe(mockWs({ id: 'watcher' }), '__cursor:board', { platform });
+		await cursors.attach(mockWs({ id: 'member' }), 'board', platform);
+		expect(platform.checkedSubscribe.map(({ topic, options }) => [topic, options])).toEqual([
+			['board', { requireGrant: true }],
+			['board', undefined]
+		]);
+		cursors.destroy();
+	});
 });

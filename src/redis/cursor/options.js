@@ -5,6 +5,8 @@
  * @module svelte-adapter-uws-extensions/redis/cursor/options
  */
 
+import { assertBooleanOption } from '../../shared/options.js';
+
 let maxMoversInertWarned = false;
 
 /**
@@ -201,26 +203,30 @@ export function resolveCursorOptions(options = {}) {
 			throw new Error(`redis cursor: ${name} must be true or an options object`);
 		}
 	}
-	if (bp.maxBufferedBytes !== undefined && bp.enabled === undefined) {
+	// Read with `=== true`, so `enabled: 'true'` would silently leave the
+	// section off. A nested null is "not set", as at the top level.
+	assertBooleanOption('redis cursor: backpressure.enabled', bp.enabled);
+	assertBooleanOption('redis cursor: viewport.enabled', vp.enabled);
+	if (bp.maxBufferedBytes != null && bp.enabled == null) {
 		throw new Error('redis cursor: backpressure.maxBufferedBytes is set but backpressure.enabled is not - did you mean { enabled: true }?');
 	}
 	if (
-		bp.maxBufferedBytes !== undefined &&
+		bp.maxBufferedBytes != null &&
 		(!Number.isInteger(bpMaxBufferedBytes) || bpMaxBufferedBytes < 1)
 	) {
 		throw new Error('redis cursor: backpressure.maxBufferedBytes must be a positive integer');
 	}
-	if ((vp.padding !== undefined || vp.cell !== undefined) && vp.enabled === undefined) {
+	if ((vp.padding != null || vp.cell != null) && vp.enabled == null) {
 		throw new Error('redis cursor: viewport.padding/cell is set but viewport.enabled is not - did you mean { enabled: true }?');
 	}
 	if (
-		vp.padding !== undefined &&
+		vp.padding != null &&
 		(typeof viewportPadding !== 'number' || !Number.isFinite(viewportPadding) || viewportPadding < 0)
 	) {
 		throw new Error('redis cursor: viewport.padding must be a non-negative number');
 	}
 	if (
-		vp.cell !== undefined &&
+		vp.cell != null &&
 		(typeof viewportCell !== 'number' || !Number.isFinite(viewportCell) || viewportCell <= 0)
 	) {
 		throw new Error('redis cursor: viewport.cell must be a positive number');

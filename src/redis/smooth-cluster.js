@@ -130,7 +130,7 @@ const validateOptions = defineOptions({
  * @param {SmoothClusterOptions} [options]
  */
 export function createSmoothCluster(client, options = {}) {
-	options = validateOptions(options);
+	options = validateOptions(options ?? {});
 	const redis = client.redis;
 	const channel = client.key('smooth:events');
 	const instanceId = randomBytes(8).toString('hex');

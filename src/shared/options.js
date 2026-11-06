@@ -107,6 +107,53 @@ function rule(expected, test) {
 const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const isFiniteNumber = (value) => typeof value === 'number' && Number.isFinite(value);
 
+/**
+ * Refuse a present value that is not a boolean, with the adapter's message.
+ * For a flag read as `=== true` or `=== false`, the string `'false'` from an
+ * environment variable silently picks the wrong side.
+ *
+ * @param {string} surface - how the message names the option, e.g. `redis cursor: viewport.enabled`
+ * @param {unknown} value
+ */
+export function assertBooleanOption(surface, value) {
+	if (value === undefined || value === null || typeof value === 'boolean') return;
+	throw new Error(
+		`${surface} must be true or false - got ${describeValue(value)} (${typeof value}). ` +
+		'Only false turns it off, so any other value would silently leave it on. If the value ' +
+		"comes from the environment, convert it explicitly (e.g. process.env.X !== 'false')."
+	);
+}
+
+/**
+ * Refuse a present value that is not an array of strings, with the adapter's
+ * messages. A field list is compared against field names, so a non-string
+ * entry can never match and would be dropped without a word.
+ *
+ * @param {string} surface
+ * @param {unknown} value
+ */
+export function assertStringArrayOption(surface, value) {
+	if (value === undefined || value === null) return;
+	if (Array.isArray(value)) {
+		for (const entry of value) {
+			if (typeof entry === 'string') continue;
+			throw new Error(
+				`${surface} entries must be field-name strings - got ${describeValue(entry)} (${typeof entry}). ` +
+				'An entry is matched against field names, so any other type would never match.'
+			);
+		}
+		return;
+	}
+	throw new Error(`${surface} must be an array of field names - got ${describeValue(value)} (${typeof value}).`);
+}
+
+/** An object whose prototype is `Object.prototype` or `null`, so a spread copies it as written. */
+const isPlainObject = (value) => {
+	if (value === null || typeof value !== 'object') return false;
+	const proto = Object.getPrototypeOf(value);
+	return proto === Object.prototype || proto === null;
+};
+
 export const option = Object.freeze({
 	/** Accepted key whose value the factory judges itself. */
 	known: () => {},
@@ -119,8 +166,15 @@ export const option = Object.freeze({
 	boolean: rule('true or false', (value) => typeof value === 'boolean'),
 	function: rule('a function', (value) => typeof value === 'function'),
 	object: rule('an object', isObject),
+	/**
+	 * Copied with a spread: a string would turn into indexed characters, and a
+	 * Map or a Date would flatten to its own enumerable fields.
+	 */
+	plainObject: rule('a plain object', isPlainObject),
 	string: rule('a string', (value) => typeof value === 'string'),
 	stringArray: rule('an array of strings', (value) => Array.isArray(value) && value.every((entry) => typeof entry === 'string')),
+	/** A list matched against field names, refused as the adapter's plugins refuse it. */
+	fieldNames: assertStringArrayOption,
 	numberArray: rule('an array of finite numbers', (value) => Array.isArray(value) && value.every(isFiniteNumber)),
 	positiveNumber: rule('a number > 0', (value) => isFiniteNumber(value) && value > 0),
 	positiveInteger: rule('an integer >= 1', (value) => Number.isSafeInteger(value) && value >= 1),
@@ -283,15 +337,20 @@ function boundedEditDistance(a, b, bound) {
  * shallow copy (same prototype) without those keys. A key declared with
  * `option.nullable` keeps its `null`, which is a setting of its own there.
  *
+ * A section named in `nested` (an options object such as the cursor's
+ * `viewport`) has its own keys checked the same way, and an unknown one is
+ * reported with its section, as `viewport.padd`.
+ *
  * @template T
  * @param {{ factory: string, label: string, types: string }} names
  *   `factory` is the function users call (named in the unknown-key warning),
  *   `label` prefixes value errors the way the factory's own errors do, and
  *   `types` points at the documented options interface.
  * @param {Record<string, (surface: string, value: unknown) => void>} schema
+ * @param {{ nested?: Record<string, Set<string>> }} [sections]
  * @returns {(bag: T) => T}
  */
-export function defineOptions({ factory, label, types }, schema) {
+export function defineOptions({ factory, label, types }, schema, { nested } = {}) {
 	const known = new Set(Object.keys(schema));
 	const keepsNull = new Set(Object.keys(schema).filter((key) => schema[key] === option.nullable));
 	const entries = Object.entries(schema);
@@ -307,10 +366,19 @@ export function defineOptions({ factory, label, types }, schema) {
 		let absent = null;
 		for (const key of Object.keys(options)) {
 			if (options[key] === null && !keepsNull.has(key)) (absent ??= []).push(key);
-			if (known.has(key)) continue;
-			(unknown ??= []).push(key);
+			if (!known.has(key)) {
+				(unknown ??= []).push(describeUnknown(key, known, ''));
+				continue;
+			}
+			const inner = nested?.[key];
+			const section = options[key];
+			if (inner && isObject(section)) {
+				for (const sub of Object.keys(/** @type {object} */ (section))) {
+					if (!inner.has(sub)) (unknown ??= []).push(describeUnknown(sub, inner, key + '.'));
+				}
+			}
 		}
-		if (unknown !== null) warnUnknown(factory, types, known, unknown);
+		if (unknown !== null) warnUnknown(factory, types, unknown);
 		if (absent === null) return bag;
 		const copy = Object.assign(Object.create(Object.getPrototypeOf(options)), options);
 		for (const key of absent) delete copy[key];
@@ -319,20 +387,25 @@ export function defineOptions({ factory, label, types }, schema) {
 }
 
 /**
+ * @param {string} key
+ * @param {Set<string>} known
+ * @param {string} prefix - the section an inner key belongs to, as `viewport.`
+ */
+function describeUnknown(key, known, prefix) {
+	const suggestion = suggestOptionKey(key, known);
+	return suggestion === null ? prefix + key : `${prefix}${key} (did you mean '${prefix}${suggestion}'?)`;
+}
+
+/**
  * @param {string} factory
  * @param {string} types
- * @param {Set<string>} known
- * @param {string[]} unknown
+ * @param {string[]} described
  */
-function warnUnknown(factory, types, known, unknown) {
-	const id = `${types}\0${factory}\0${unknown.slice().sort().join('\0')}`;
+function warnUnknown(factory, types, described) {
+	const id = `${types}\0${factory}\0${described.slice().sort().join('\0')}`;
 	if (warnedUnknownKeySets.has(id)) return;
 	if (warnedUnknownKeySets.size >= MAX_WARNED_UNKNOWN_KEY_SETS) warnedUnknownKeySets.clear();
 	warnedUnknownKeySets.add(id);
-	const described = unknown.map((key) => {
-		const suggestion = suggestOptionKey(key, known);
-		return suggestion === null ? key : `${key} (did you mean '${suggestion}'?)`;
-	});
 	console.warn(
 		`[extensions] unknown ${factory} option(s): ${described.join(', ')} - ` +
 		`not recognized by ${factory} and ignored. Check the spelling against the ` +

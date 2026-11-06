@@ -72,7 +72,7 @@ const validateRetryBudgetOptions = defineOptions({
  * @param {{ capacity?: number, intervalMs?: number, breaker?: object }} [options]
  */
 export function createRetryBudget(client, options = {}) {
-	options = validateRetryBudgetOptions(options);
+	options = validateRetryBudgetOptions(options ?? {});
 	const capacity = options.capacity ?? 100;
 	const intervalMs = options.intervalMs ?? 10000;
 	if (!Number.isFinite(capacity) || capacity < 1) {
@@ -126,7 +126,7 @@ const validateWebhookBreakerOptions = defineOptions({
  * @param {{ failureThreshold?: number, resetMs?: number, probeConcurrency?: number, breaker?: object }} [options]
  */
 export function createWebhookBreaker(client, options = {}) {
-	options = validateWebhookBreakerOptions(options);
+	options = validateWebhookBreakerOptions(options ?? {});
 	const failureThreshold = options.failureThreshold ?? 5;
 	const resetMs = options.resetMs ?? 30000;
 	const probeConcurrency = options.probeConcurrency ?? 1;

@@ -443,7 +443,7 @@ describe('redis sharded bus', () => {
 			const bus = createShardedBus(client);
 			const wrapped = bus.wrap(platform);
 			const ws = {};
-			wrapped.sendCoalesced(ws, { key: 'cursor:doc-1', payload: { x: 10, y: 20 } });
+			wrapped.sendCoalesced(ws, { key: 'cursor:doc-1', topic: 'doc-1', event: 'move', data: { x: 10, y: 20 } });
 			await wrapped.request(ws, 'confirm', { op: 'delete' });
 
 			expect(platform.sentCoalesced).toHaveLength(1);

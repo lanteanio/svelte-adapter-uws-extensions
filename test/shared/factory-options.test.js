@@ -120,12 +120,22 @@ const cases = [
 			[{ consistencyAuditIntervalMs: '1000' }, 'redis presence: consistencyAuditIntervalMs must be a number >= 0 (milliseconds)'],
 			[{ consistencyAuditIntervalMs: -1 }, 'redis presence: consistencyAuditIntervalMs must be a number >= 0 (milliseconds)'],
 			// Refused by the adapter's presence wire codec, as by its in-memory plugin.
-			[{ binary: 'false' }, 'presence: binary must be true or false']
+			[{ binary: 'false' }, 'presence: binary must be true or false'],
+			// Refused with the in-memory plugin's messages, which ours contain.
+			[{ select: false }, 'presence: select must be a function'],
+			[{ select: 'identity' }, 'presence: select must be a function'],
+			[{ transient: 'typing' }, 'presence: transient must be an array of field names - got "typing" (string).'],
+			[{ transient: ['typing', 5] }, 'presence: transient entries must be field-name strings - got 5 (number).'],
+			[{ clientUpdateFields: 'role' }, 'presence: clientUpdateFields must be an array of field names - got "role" (string).'],
+			[{ clientUpdateFields: ['role', 1] }, 'presence: clientUpdateFields entries must be field-name strings - got 1 (number).'],
+			[{ heartbeat: MAX + 1 }, overflow('redis presence: heartbeat')],
+			[{ topicThrottle: MAX + 1 }, overflow('redis presence: topicThrottle')]
 		],
 		[
 			{ select: null }, { breaker: null }, { metrics: null }, { ttl: 1.5 }, { transient: [] }, { binary: false }, { consistencyAuditIntervalMs: 0 }, { heartbeat: MAX },
+			{ topicThrottle: MAX }, { transient: null }, { clientUpdateFields: null }, { clientUpdateFields: [] },
 			// Values the adapter's in-memory presence plugin accepts.
-			{ transient: 'typing' }, { transient: ['typing', 5] }, { key: 0 }, { heartbeat: MAX + 1 }, { topicThrottle: MAX + 1 }
+			{ key: 0 }
 		]],
 	['createCursor', (o) => createCursor(redis, o), ['throtle', 'throttle'],
 		[
@@ -134,12 +144,20 @@ const cases = [
 			[{ ttl: Math.floor(MAX / 1000) + 1 }, overflow('redis cursor: ttl')],
 			// Refused by the adapter's cursor wire codec, as by its in-memory plugin.
 			[{ binary: 0 }, 'cursor: binary must be true or false'],
-			[{ dictionary: 'no' }, 'cursor: dictionary must be true or false']
+			[{ dictionary: 'no' }, 'cursor: dictionary must be true or false'],
+			// Refused with the in-memory plugin's messages, which ours contain.
+			[{ throttle: MAX + 1 }, overflow('redis cursor: throttle')],
+			[{ topicThrottle: MAX + 1 }, overflow('redis cursor: topicThrottle')],
+			[{ viewport: { enabled: 'true' } }, 'cursor: viewport.enabled must be true or false - got "true" (string). Only false turns it off'],
+			[{ backpressure: { enabled: 1, maxBufferedBytes: 5 } }, 'cursor: backpressure.enabled must be true or false - got 1 (number).'],
+			[{ backpressure: { enabled: null, maxBufferedBytes: 5 } }, 'cursor: backpressure.maxBufferedBytes is set but backpressure.enabled is not']
 		],
 		[
 			{ select: null }, { breaker: null }, { metrics: null }, { binary: false }, { dictionary: false }, { ttl: 30 },
-			// Values the adapter's in-memory cursor plugin accepts.
-			{ throttle: MAX + 1 }, { topicThrottle: MAX + 1 }
+			{ throttle: MAX }, { topicThrottle: MAX },
+			// A nested null is not set, as at the top level.
+			{ viewport: { enabled: true, padding: null, cell: null } }, { backpressure: { enabled: true, maxBufferedBytes: null } },
+			{ viewport: { enabled: null } }, { backpressure: { enabled: false } }
 		]],
 	// Fractional intervals and blocks are accepted, as the in-memory limiter
 	// accepts them; their Redis expiries are rounded up.
@@ -158,10 +176,14 @@ const cases = [
 	['createGroup', (o) => createGroup(redis, 'room', o), ['maxMember', 'maxMembers'],
 		[
 			[{ memberTtl: 1.0001 }, whole('redis group: memberTtl')],
-			[{ memberTtl: Math.floor(MAX / 1000) + 1 }, overflow('redis group: memberTtl')]
+			[{ memberTtl: Math.floor(MAX / 1000) + 1 }, overflow('redis group: memberTtl')],
+			// Refused with the in-memory plugin's message, which ours contains.
+			[{ meta: 'vip' }, 'group: meta must be a plain object - got "vip" (string)'],
+			[{ meta: ['a'] }, 'group: meta must be a plain object'],
+			[{ meta: new Map() }, 'group: meta must be a plain object'],
+			[{ meta: false }, 'group: meta must be a plain object']
 		],
-		// meta: 'vip' is shallow-copied, as the in-memory groups plugin copies it.
-		[{ meta: null }, { onJoin: null }, { breaker: null }, { metrics: null }, { memberTtl: 1.5 }, { meta: 'vip' }, { meta: {} }]],
+		[{ meta: null }, { onJoin: null }, { breaker: null }, { metrics: null }, { memberTtl: 1.5 }, { meta: {} }, { meta: Object.create(null) }]],
 	['createDistributedSession', (o) => createDistributedSession(redis, o), ['ttlms', 'ttlMs'],
 		[[{ ttlMs: 1500.5 }, whole('session: ttlMs')], [{ refreshOnGet: 'no' }, 'session: refreshOnGet must be true or false']],
 		[{ breaker: null }, { metrics: null }, { refreshOnGet: false }, { onLoadError: null }]],
@@ -407,10 +429,46 @@ describe('null takes the default, observed', () => {
 
 describe('values shared with the in-memory plugins read the same way', () => {
 	it('group meta is shallow-copied as the in-memory groups plugin copies it', async () => {
-		const vip = keep(createGroup(redis, 'vip-room', { meta: 'vip' }));
-		expect(await vip.getMeta()).toEqual({ 0: 'v', 1: 'i', 2: 'p' });
+		const meta = { tier: 'vip' };
+		const vip = keep(createGroup(redis, 'vip-room', { meta }));
+		meta.tier = 'changed';
+		expect(await vip.getMeta()).toEqual({ tier: 'vip' });
 		const empty = keep(createGroup(redis, 'empty-room', { meta: {} }));
 		expect(await empty.getMeta()).toEqual({});
+	});
+
+	it('cursor viewport and backpressure keys are checked as the in-memory plugin checks them', () => {
+		const before = unknownWarnings().length;
+		keep(createCursor(redis, { viewport: { enabled: true, paddng: 8 }, backpressure: { enabled: true, maxBuffered: 1 } }));
+		keep(createCursor(redis, { viewport: { enabled: true, paddng: 8 }, backpressure: { enabled: true, maxBuffered: 1 } }));
+		expect(unknownWarnings().slice(before)).toEqual([
+			"[extensions] unknown createCursor option(s): viewport.paddng (did you mean 'viewport.padding'?), backpressure.maxBuffered - " +
+			'not recognized by createCursor and ignored. Check the spelling against the documented options (RedisCursorOptions in redis/cursor.d.ts).'
+		]);
+		// The shorthand `true` has no keys to check.
+		keep(createCursor(redis, { viewport: true, backpressure: true }));
+		expect(unknownWarnings().slice(before)).toHaveLength(1);
+	});
+
+	it('replay maxTopics is a documented key on every backend', () => {
+		const before = unknownWarnings().length;
+		keep(createReplay(redis, { maxTopics: 50 }));
+		keep(createReplay(redis, { maxTopics: 50, storage: 'stream' }));
+		keep(createPgReplay(pg, { maxTopics: 50 }));
+		expect(unknownWarnings().slice(before)).toEqual([]);
+	});
+
+	// As the in-memory lock, session, smooth and webhook-control factories
+	// read `options ?? {}`.
+	it.each([
+		['createDistributedLock', () => createDistributedLock(redis, null)],
+		['createDistributedSession', () => createDistributedSession(redis, null)],
+		['createSmoothCluster', () => createSmoothCluster(redis, null)],
+		['createRetryBudget', () => createRetryBudget(redis, null)],
+		['createWebhookBreaker', () => createWebhookBreaker(redis, null)],
+		['createCrdtCluster', () => createCrdtCluster(redis, null)]
+	])('%s takes a null options object as no options', (_name, build) => {
+		expect(() => keep(build())).not.toThrow();
 	});
 });
 

@@ -221,7 +221,7 @@ const validateOptions = defineOptions({
  * ```
  */
 export function createDistributedSession(client, options = {}) {
-	options = validateOptions(options);
+	options = validateOptions(options ?? {});
 	if (!client || !client.redis) {
 		throw new Error('session: client (from createRedisClient) is required');
 	}

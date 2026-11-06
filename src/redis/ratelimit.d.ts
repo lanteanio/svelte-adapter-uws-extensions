@@ -38,8 +38,13 @@ export interface RedisRateLimitOptions {
 	 * global bucket. Set ADDRESS_HEADER (and XFF_DEPTH) so the real client IP is resolved, or pass
 	 * an explicit keyBy. The limiter logs a one-shot warning the first time it denies on a
 	 * loopback/private key while ADDRESS_HEADER is unset.
+	 *
+	 * A function's result is keyed as the in-memory limiter keys it: a number by its string
+	 * form, so `42` and `'42'` share a bucket, and `undefined` and `null` in one no-key bucket
+	 * kept apart from the strings `'undefined'` and `'null'`. An object, function or symbol
+	 * result makes `consume()` and `peek()` reject; join the parts into one string yourself.
 	 */
-	keyBy?: 'ip' | 'connection' | ((ws: any) => string);
+	keyBy?: 'ip' | 'connection' | ((ws: any) => string | number | null | undefined);
 	/**
 	 * Optional per-connection tenant resolver. When set, the bucket key is scoped by
 	 * the returned tenant id using the version-2 JSON tuple `[tenantId, String(key)]`,

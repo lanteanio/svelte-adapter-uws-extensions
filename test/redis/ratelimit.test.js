@@ -345,6 +345,33 @@ describe('redis ratelimit', () => {
 			expect((await rl.consume(ws2)).allowed).toBe(false);
 			expect((await rl.consume(ws3)).allowed).toBe(true);
 		});
+
+		// Keyed as the adapter's in-memory limiter keys a keyBy result.
+		it('custom function: a number shares the bucket of its string form', async () => {
+			const rl = createRateLimit(client, { points: 1, interval: 60000, keyBy: (ws) => ws.getUserData().key });
+			expect((await rl.consume(mockWs({ key: 42 }))).allowed).toBe(true);
+			expect((await rl.consume(mockWs({ key: '42' }))).allowed).toBe(false);
+		});
+
+		it('custom function: undefined and null share one no-key bucket apart from the strings', async () => {
+			const rl = createRateLimit(client, { points: 1, interval: 60000, keyBy: (ws) => ws.getUserData().key });
+			expect((await rl.consume(mockWs({ key: undefined }))).allowed).toBe(true);
+			expect((await rl.consume(mockWs({ key: null }))).allowed).toBe(false);
+			expect((await rl.consume(mockWs({ key: 'undefined' }))).allowed).toBe(true);
+			expect((await rl.consume(mockWs({ key: 'null' }))).allowed).toBe(true);
+		});
+
+		it.each([
+			['an object', { user: 'u1' }, '{"user":"u1"} (object)'],
+			['a function', () => 'u1', '(function)'],
+			['a symbol', Symbol('u1'), 'Symbol(u1) (symbol)']
+		])('custom function: %s is refused on consume and peek', async (_kind, key, shown) => {
+			const rl = createRateLimit(client, { points: 1, interval: 60000, keyBy: () => key });
+			const message = 'ratelimit: keyBy must return a string (or a number) - got ';
+			await expect(rl.consume(mockWs())).rejects.toThrow(message);
+			await expect(rl.consume(mockWs())).rejects.toThrow(shown);
+			await expect(rl.peek(mockWs())).rejects.toThrow(message);
+		});
 	});
 
 	describe('reset / ban / unban / clear', () => {

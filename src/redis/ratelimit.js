@@ -28,7 +28,7 @@ import {
 import { createEmergencyScaleReader, createEmergencyScaleOps } from './emergency-scale.js';
 import { emitRegisteredFailure } from '../shared/diagnostic.js';
 import { EXTENSIONS_ERROR_IDS } from '../error-registry.js';
-import { defineOptions, option } from '../shared/options.js';
+import { defineOptions, describeValue, option } from '../shared/options.js';
 
 export { createEmergencyScaleOps as createRateLimitEmergency } from './emergency-scale.js';
 export { createCompositeRateLimit } from './composite-ratelimit.js';
@@ -36,6 +36,31 @@ export { createCompositeRateLimit } from './composite-ratelimit.js';
 // Upper bound on in-process floor buckets so a keyed flood during an outage
 // cannot exhaust memory; least-recently-touched entries are evicted first.
 const FLOOR_MAX_ENTRIES = 10000;
+
+/**
+ * The one bucket every `undefined` or `null` keyBy result shares - a caller
+ * with no key, such as an anonymous user keyed by user id. Kept apart from the
+ * strings `'undefined'` and `'null'`, which are ordinary keys.
+ */
+const NO_KEY_BUCKET = '\0no-key';
+
+/**
+ * The bucket key for a custom keyBy result that is not a string, as the
+ * adapter's in-memory limiter keys it. A number, bigint or boolean is keyed by
+ * its string form, so `42` and `'42'` share a bucket; `undefined` and `null`
+ * share one bucket of their own. An object, a function or a symbol is refused:
+ * its string form would put every such caller in one shared bucket.
+ * @param {unknown} key
+ * @returns {string}
+ */
+function customKeyString(key) {
+	if (key === undefined || key === null) return NO_KEY_BUCKET;
+	if (typeof key !== 'object' && typeof key !== 'function' && typeof key !== 'symbol') return String(key);
+	throw new Error(
+		`redis ratelimit: keyBy must return a string (or a number) - got ${describeValue(key)} (${typeof key}). ` +
+		'Join the parts into one string yourself, e.g. `${user}:${ip}`.'
+	);
+}
 
 /**
  * @typedef {Object} FloorBucket
@@ -343,7 +368,7 @@ return 1
  * @property {number} points - Tokens available per interval. Must be a positive integer.
  * @property {number} interval - Refill interval in milliseconds. Must be positive.
  * @property {number} [blockDuration=0] - Auto-ban duration in ms when exhausted. 0 = no ban.
- * @property {'ip' | 'connection' | ((ws: any) => string)} [keyBy='ip'] - Key extraction mode.
+ * @property {'ip' | 'connection' | ((ws: any) => string | number | null | undefined)} [keyBy='ip'] - Key extraction mode.
  *   In 'ip' mode (the default) the bucket key is `userData.remoteAddress`, which the adapter
  *   resolves from ADDRESS_HEADER / XFF_DEPTH. Behind an address-rewriting proxy (docker
  *   userland-proxy, an L4 load balancer, a non-XFF proxy) with ADDRESS_HEADER unset, every
@@ -565,7 +590,10 @@ export function createRateLimit(client, options) {
 	 * Falls back to `ip`, `address`, then 'unknown'.
 	 */
 	function resolveKey(ws) {
-		if (typeof keyBy === 'function') return keyBy(ws);
+		if (typeof keyBy === 'function') {
+			const k = keyBy(ws);
+			return typeof k === 'string' ? k : customKeyString(k);
+		}
 		if (keyBy === 'connection') {
 			let k = wsKeys.get(ws);
 			if (!k) {

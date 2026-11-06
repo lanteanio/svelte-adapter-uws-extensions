@@ -429,18 +429,6 @@ const plugins = [
 	['ratelimit', { lead: rateSides.lead, redis: rateSides.redis }, rateScenarios]
 ];
 
-/**
- * Rows where the two sides are known to differ, each with the reason. A
- * keyBy that returns a fresh object every call: the in-memory limiter keys
- * its Map by that object's identity, so every call gets a new bucket and
- * nothing is ever limited; the Redis limiter turns the key into a string,
- * so every such call shares one bucket.
- */
-const divergent = new Map([
-	['ratelimit.keyBy=fn(0)/' + ODD_VALUES.findIndex((v) => typeof v === 'function'), 'object key'],
-	['ratelimit.keyBy=fn(1)/' + (ODD_VALUES.findIndex((v) => typeof v === 'function') + 1), 'object key']
-]);
-
 /** Values a side accepts at construction, judged without running a scenario. */
 function constructs(side, key, value) {
 	try {
@@ -477,7 +465,6 @@ describe('options shared with the in-memory plugins behave the same', () => {
 		if (!constructs(sides.lead, key, value) || !constructs(sides.redis, key, value)) return;
 		const lead = await scenario(sides.lead, { [key]: value });
 		const redis = await scenario(sides.redis, { [key]: value });
-		if (divergent.has(_id)) expect(redis).not.toEqual(lead);
-		else expect(redis).toEqual(lead);
+		expect(redis).toEqual(lead);
 	});
 });
