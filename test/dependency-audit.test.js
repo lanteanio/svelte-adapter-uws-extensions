@@ -42,7 +42,7 @@ function lockMutation(change) {
 describe('dependency audit exception', () => {
 	it('accepts a clean report after expiry without consulting exception inputs', () => {
 		expect(validateDependencyAudit({
-			...cleanInput(), now: Date.parse('2026-11-10T00:00:00Z'),
+			...cleanInput(), now: Date.parse('2026-12-01T00:00:00Z'),
 			lockText: 'not the pinned tree', registryText: '"4.3.2"', registryStatus: 1, registryFailure: true
 		})).toEqual({ findings: 0 });
 		expect(validateDependencyAudit(cleanInput())).toEqual({ findings: 0 });
@@ -79,12 +79,12 @@ describe('dependency audit exception', () => {
 		expect(() => validateDependencyAudit({ ...cleanInput(), ...altered })).toThrow();
 	});
 
-	it('accepts exactly the captured five low development findings without changing the report', () => {
+	it('accepts exactly the captured four low development findings without changing the report', () => {
 		const captured = input();
 		expect(validateDependencyAudit(captured)).toEqual({
-			findings: 5, severity: 'low',
+			findings: 4, severity: 'low',
 			advisory: 'https://github.com/advisories/GHSA-gcqx-w48m-w2h4',
-			expires: '2026-11-09T00:00:00Z'
+			expires: '2026-11-30T00:00:00Z'
 		});
 		expect(captured.auditText).toBe(auditText);
 	});
@@ -131,7 +131,7 @@ describe('dependency audit exception', () => {
 			value => { value.packages['node_modules/extra'] = { version: '1.0.0', dependencies: { deepmerge: '4.3.1' }, dev: true }; },
 			value => { value.packages['node_modules/extra/node_modules/deepmerge'] = { ...value.packages['node_modules/deepmerge'] }; },
 			value => { value.packages[''].dependencies.deepmerge = '4.3.1'; },
-			value => { value.packages['node_modules/@rollup/plugin-node-resolve'].dependencies.deepmerge = '*'; }
+			value => { value.packages['node_modules/@sveltejs/kit'].dependencies.deepmerge = '*'; }
 		];
 		for (const mutate of mutations) expect(() => validateDependencyAudit(lockMutation(mutate))).toThrow('dependency graph changed');
 	});
@@ -148,7 +148,7 @@ describe('dependency audit exception', () => {
 			value.vulnerabilities['@sveltejs/kit'].via = ['missing'];
 		});
 		const cycle = auditMutation(value => {
-			value.vulnerabilities['@rollup/plugin-node-resolve'].via = ['svelte-adapter-uws'];
+			value.vulnerabilities['@sveltejs/vite-plugin-svelte'].via = ['svelte-adapter-uws'];
 		});
 		expect(() => validateDependencyAudit(missing)).toThrow('missing advisory reference');
 		expect(() => validateDependencyAudit(cycle)).toThrow('cyclic advisory references');
@@ -156,12 +156,12 @@ describe('dependency audit exception', () => {
 
 	it('refuses a new acyclic relationship among known packages', () => {
 		const captured = auditMutation(value => {
-			value.vulnerabilities['@sveltejs/vite-plugin-svelte'].via.push('@rollup/plugin-node-resolve');
+			value.vulnerabilities['svelte-adapter-uws'].via.push('@sveltejs/vite-plugin-svelte');
 		});
 		expect(() => validateDependencyAudit(captured)).toThrow('unreviewed advisory dependency');
 	});
 
-	it.each(['2026-11-09T00:00:00Z', '2026-11-10T00:00:00Z', 'invalid'])('expires at the boundary: %s', date => {
+	it.each(['2026-11-30T00:00:00Z', '2026-12-01T00:00:00Z', 'invalid'])('expires at the boundary: %s', date => {
 		expect(() => validateDependencyAudit({ ...input(), now: Date.parse(date) })).toThrow('expired');
 	});
 
@@ -204,7 +204,7 @@ describe('audit execution evidence', () => {
 		const run = vi.fn()
 			.mockReturnValueOnce({ status: 1, stdout: auditText, stderr: '' })
 			.mockReturnValueOnce({ status: 0, stdout: '"4.3.1"\n', stderr: '' });
-		expect(runDependencyAudit(directory, run, now).findings).toBe(5);
+		expect(runDependencyAudit(directory, run, now).findings).toBe(4);
 		expect(readFileSync(join(directory, 'source/dependency-audit.json'), 'utf8')).toBe(auditText);
 		expect(run.mock.calls[0][0]).toEqual(['audit', '--json', '--include=dev', '--include=optional', '--include=peer', '--audit-level=low', '--registry=https://registry.npmjs.org', '--fetch-retries=0', '--fetch-timeout=15000']);
 		expect(run.mock.calls[1][0]).toEqual(['view', 'deepmerge', 'version', '--json', '--registry=https://registry.npmjs.org', '--prefer-online', '--fetch-retries=0', '--fetch-timeout=10000']);
@@ -215,7 +215,7 @@ describe('audit execution evidence', () => {
 		const directory = temporaryRoot();
 		writeFileSync(join(directory, 'package-lock.json'), 'a different, patched tree');
 		const run = vi.fn().mockReturnValueOnce({ status: 0, stdout: JSON.stringify(cleanReport), stderr: '' });
-		expect(runDependencyAudit(directory, run, Date.parse('2026-11-10T00:00:00Z'))).toEqual({ findings: 0 });
+		expect(runDependencyAudit(directory, run, Date.parse('2026-12-01T00:00:00Z'))).toEqual({ findings: 0 });
 		expect(run).toHaveBeenCalledTimes(1);
 		expect(readFileSync(join(directory, 'source/dependency-audit.json'), 'utf8')).toBe(JSON.stringify(cleanReport));
 	});

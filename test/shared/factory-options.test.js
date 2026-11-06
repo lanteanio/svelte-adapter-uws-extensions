@@ -118,23 +118,28 @@ const cases = [
 			[{ ttl: 1.0001 }, whole('redis presence: ttl')],
 			[{ keyspaceNotifications: 'yes' }, 'redis presence: keyspaceNotifications must be true or false'],
 			[{ consistencyAuditIntervalMs: '1000' }, 'redis presence: consistencyAuditIntervalMs must be a number >= 0 (milliseconds)'],
-			[{ consistencyAuditIntervalMs: -1 }, 'redis presence: consistencyAuditIntervalMs must be a number >= 0 (milliseconds)']
+			[{ consistencyAuditIntervalMs: -1 }, 'redis presence: consistencyAuditIntervalMs must be a number >= 0 (milliseconds)'],
+			// Refused by the adapter's presence wire codec, as by its in-memory plugin.
+			[{ binary: 'false' }, 'presence: binary must be true or false']
 		],
 		[
 			{ select: null }, { breaker: null }, { metrics: null }, { ttl: 1.5 }, { transient: [] }, { binary: false }, { consistencyAuditIntervalMs: 0 }, { heartbeat: MAX },
 			// Values the adapter's in-memory presence plugin accepts.
-			{ binary: 'false' }, { transient: 'typing' }, { transient: ['typing', 5] }, { key: 0 }, { heartbeat: MAX + 1 }, { topicThrottle: MAX + 1 }
+			{ transient: 'typing' }, { transient: ['typing', 5] }, { key: 0 }, { heartbeat: MAX + 1 }, { topicThrottle: MAX + 1 }
 		]],
 	['createCursor', (o) => createCursor(redis, o), ['throtle', 'throttle'],
 		[
 			[{ snapshotIntervalMs: Math.floor(MAX / 2) + 1 }, overflow('redis cursor: snapshotIntervalMs')],
 			[{ ttl: 1.5 }, whole('redis cursor: ttl')],
-			[{ ttl: Math.floor(MAX / 1000) + 1 }, overflow('redis cursor: ttl')]
+			[{ ttl: Math.floor(MAX / 1000) + 1 }, overflow('redis cursor: ttl')],
+			// Refused by the adapter's cursor wire codec, as by its in-memory plugin.
+			[{ binary: 0 }, 'cursor: binary must be true or false'],
+			[{ dictionary: 'no' }, 'cursor: dictionary must be true or false']
 		],
 		[
 			{ select: null }, { breaker: null }, { metrics: null }, { binary: false }, { dictionary: false }, { ttl: 30 },
 			// Values the adapter's in-memory cursor plugin accepts.
-			{ binary: 0 }, { dictionary: 'no' }, { throttle: MAX + 1 }, { topicThrottle: MAX + 1 }
+			{ throttle: MAX + 1 }, { topicThrottle: MAX + 1 }
 		]],
 	// Fractional intervals and blocks are accepted, as the in-memory limiter
 	// accepts them; their Redis expiries are rounded up.

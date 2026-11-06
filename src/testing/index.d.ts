@@ -76,6 +76,12 @@ interface MockPlatformState {
 	publishedBatches: Array<{ messages: Array<{ topic: string; event: string; data?: any; coalesceKey?: string; options?: any }>; options?: { compress?: boolean } }>;
 	/** All `send()` calls recorded as `{ ws, topic, event, data, options }`. */
 	sent: Array<{ ws: any; topic: string; event: string; data: any; options?: any }>;
+	/** All `relayCoalesced()` calls recorded as `{ topic, event, data, coalesceKey }`, the key as the string the relay carries (`''` when none). Each returns `false`: no sibling is simulated. */
+	relayedCoalesced: Array<{ topic: string; event: string; data?: unknown; coalesceKey: string }>;
+	/** The installed `authorizeDelivery()` policy as `{ callback, options }`, or `null`. A second install throws, as on the adapter; `reset()` clears it. The mock delivers nothing, so it never calls the policy. */
+	deliveryAuthorization: { callback: any; options?: any } | null;
+	/** A UUID, distinct per mock. Writable, so a test can give two mocks one process id, as sibling workers share one. */
+	processId: string;
 	/** All `subscribe()` calls recorded as `{ ws, topic }`. Returns `null` (allow) by default. */
 	subscribed: Array<{ ws: any; topic: string }>;
 	/** All `unsubscribe()` calls recorded as `{ ws, topic }`. Returns `false` (no-op) by default. */

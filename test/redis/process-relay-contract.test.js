@@ -23,6 +23,9 @@ for (const [name, factory] of [['standard', createPubSubBus], ['sharded', create
 			if (processAware) {
 				source.processId = sibling.processId = 'process-one';
 				remote.processId = 'process-two';
+			} else {
+				// An adapter that predates processId does not define the member.
+				for (const platform of [source, sibling, remote]) delete platform.processId;
 			}
 			source.trace.enabled = tracing;
 			const native = source.publish;

@@ -4,6 +4,12 @@ import { trackedSubscribe, trackedUnsubscribe } from 'svelte-adapter-uws/subscri
 /** Re-exported from the adapter. A member added there fails the parity test until the mock and both bus wraps provide it. */
 export const PLATFORM_KEYS = PLATFORM_MEMBERS;
 
+let mockProcesses = 0;
+
+/** The options `authorizeDelivery` takes, as the adapter's test platform reads them. */
+const DELIVERY_OPTION_KEYS = new Set(['maxPendingBytes', 'timeoutMs']);
+const MAX_TIMER_MS = 2147483647;
+
 /**
  * Create a mock platform that records publish/send calls.
  * Matches the core svelte-adapter-uws Platform interface.
@@ -19,6 +25,8 @@ export function mockPlatform() {
 		publishedBatches: [],
 		sent: [],
 		sentCoalesced: [],
+		relayedCoalesced: [],
+		deliveryAuthorization: null,
 		requested: [],
 		subscribed: [],
 		unsubscribed: [],
@@ -255,6 +263,38 @@ export function mockPlatform() {
 			p.sentCoalesced.push({ ws, ...payload });
 			return 1;
 		},
+		// As the adapter's test platform: the key is recorded as the string the
+		// relay carries, and with no simulated cluster nothing reaches a
+		// sibling, so the call reports false.
+		relayCoalesced(topic, event, data, coalesceKey) {
+			p.relayedCoalesced.push({ topic, event, data, coalesceKey: coalesceKey == null ? '' : '' + coalesceKey });
+			return false;
+		},
+		// Refused as the adapter refuses it, in the same order: one policy per
+		// platform, a function, and only the options it reads. The mock
+		// delivers nothing, so the policy is recorded and never called.
+		authorizeDelivery(callback, options) {
+			if (p.deliveryAuthorization !== null) throw new Error('Delivery authorization is already configured');
+			if (typeof callback !== 'function') throw new TypeError('authorizeDelivery requires a function');
+			if (options !== undefined && (options === null || typeof options !== 'object' || Array.isArray(options))) {
+				throw new TypeError('authorizeDelivery options must be an object');
+			}
+			const values = options ?? {};
+			for (const key of Object.keys(values)) {
+				if (!DELIVERY_OPTION_KEYS.has(key)) throw new TypeError('Unknown authorizeDelivery option ' + key);
+			}
+			const bytes = values.maxPendingBytes;
+			const timeout = values.timeoutMs;
+			if (bytes != null && (!Number.isSafeInteger(bytes) || bytes <= 0)) throw new TypeError('Invalid authorizeDelivery maxPendingBytes');
+			if (timeout != null && (!Number.isSafeInteger(timeout) || timeout <= 0 || timeout > MAX_TIMER_MS)) {
+				throw new TypeError('Invalid authorizeDelivery timeoutMs');
+			}
+			p.deliveryAuthorization = { callback, options };
+		},
+		// A UUID, distinct per mock, as each adapter process has its own. A
+		// plain field, so a test can reassign it to stand for another process,
+		// or delete it to stand for an adapter without one.
+		processId: '00000000-0000-4000-8000-' + (++mockProcesses).toString(16).padStart(12, '0'),
 		request(ws, event, data, options) {
 			p.requested.push({ ws, event, data, options });
 			return Promise.resolve(undefined);
@@ -335,6 +375,8 @@ export function mockPlatform() {
 			p.publishedBatches.length = 0;
 			p.sent.length = 0;
 			p.sentCoalesced.length = 0;
+			p.relayedCoalesced.length = 0;
+			p.deliveryAuthorization = null;
 			p.requested.length = 0;
 			p.subscribed.length = 0;
 			p.unsubscribed.length = 0;

@@ -6,34 +6,31 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ADVISORY = 'https://github.com/advisories/GHSA-gcqx-w48m-w2h4';
-const EXPIRES = '2026-11-09T00:00:00Z';
-const LOCK_DIGEST = 'bdde6e92b3bde883b9f7366946b1f15cef1690f669c374a3f7d65f7681944d6b';
+const EXPIRES = '2026-11-30T00:00:00Z';
+const LOCK_DIGEST = '7eb336b6ac54bc25d572172c93678a8b84e05198be47083a82eee849bcee8bd9';
 
 // GHSA-gcqx-w48m-w2h4 (deepmerge prototype poisoning) reaches this tree only
-// through build tooling: @rollup/plugin-node-resolve merges constant defaults,
-// and the Svelte plugin merges local configuration during config setup, before
-// any module compiles. Neither merges request data. Any other tree, advisory
-// or a date past EXPIRES fails; update these pins only after rechecking that.
+// through build tooling: Kit's Svelte plugin merges local configuration during
+// config setup, before any module compiles, and never merges request data.
+// Any other tree, advisory or a date past EXPIRES fails; update these pins
+// only after rechecking that.
 const PINS = {
 	'deepmerge': ['4.3.1', 'sha512-3sUqbMEc77XqpdNO7FRyRog+eW3ph+GYCbj+rK+uYyRMuwsVy0rMiVtPn+QJlKFvWP/1PYpapqYn0Me2knFn+A=='],
-	'@rollup/plugin-node-resolve': ['16.0.3', 'sha512-lUYM3UBGuM93CnMPG1YocWu7X802BrNF3jW2zny5gQyLQgRFJhV1Sq0Zi74+dh/6NBx1DxFC4b4GXg9wUCG5Qg=='],
 	'@sveltejs/vite-plugin-svelte': ['7.0.0', 'sha512-ILXmxC7HAsnkK2eslgPetrqqW1BKSL7LktsFgqzNj83MaivMGZzluWq32m25j2mDOjmSKX7GGWahePhuEs7P/g=='],
 	'@sveltejs/kit': ['3.0.1', 'sha512-8JMCCq7ZUJELi3hbhb0+c9Rs8qnbHW90vhOfM+t1FSF4fhIpG9/FOsH4IYgcITMhbdkSrrn+Kvd9G+q8A+UO6Q=='],
-	'svelte-adapter-uws': ['0.6.0-next.96', 'sha512-dTqZEWXOKm7s9tG6dXoeOOnz2/FLmwus4Foj3hVk2N4h6nKUObI5CZGDe9O0TJyPQ//BgOvyFhJxgdS1bZ70Qg==']
+	'svelte-adapter-uws': ['0.6.0-next.97', 'sha512-c0piWbMNxfNa12uZGHXvPwjaWq1lP2MUPjdi/xijCWjvpuGGoRZguBTiOrCv/SoGcuuHiBQ1CC/oeLRGciOCjw==']
 };
 const VIA = {
 	'deepmerge': [],
-	'@rollup/plugin-node-resolve': ['deepmerge'],
 	'@sveltejs/vite-plugin-svelte': ['deepmerge'],
 	'@sveltejs/kit': ['@sveltejs/vite-plugin-svelte'],
-	'svelte-adapter-uws': ['@rollup/plugin-node-resolve', '@sveltejs/kit']
+	'svelte-adapter-uws': ['@sveltejs/kit']
 };
 const DIRECT = new Set(['@sveltejs/kit', 'svelte-adapter-uws']);
 const EFFECTS = {
-	'deepmerge': ['@rollup/plugin-node-resolve', '@sveltejs/vite-plugin-svelte'],
-	'@rollup/plugin-node-resolve': ['svelte-adapter-uws'],
+	'deepmerge': ['@sveltejs/vite-plugin-svelte'],
 	'@sveltejs/vite-plugin-svelte': ['@sveltejs/kit'],
-	'@sveltejs/kit': [],
+	'@sveltejs/kit': ['svelte-adapter-uws'],
 	'svelte-adapter-uws': []
 };
 const names = Object.keys(PINS);
@@ -135,7 +132,7 @@ export function validateDependencyAudit(input) {
 		} else if (!sameStrings(node.via, VIA[name])) refuse('unreviewed advisory dependency: ' + name);
 		if (!sameStrings(node.effects, EFFECTS[name])) refuse('advisory effects changed: ' + name);
 	}
-	return { findings: 5, severity: 'low', advisory: ADVISORY, expires: EXPIRES };
+	return { findings: names.length, severity: 'low', advisory: ADVISORY, expires: EXPIRES };
 }
 
 function npmCommand(args, root, timeout) {

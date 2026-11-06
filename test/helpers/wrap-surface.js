@@ -6,6 +6,7 @@ import { PLATFORM_KEYS } from '../../src/testing/mock-platform.js';
  */
 export const PROVIDED_ANYWAY = Object.freeze({
 	publish: 'the member the bus relays',
+	relayCoalesced: 'the bus relays the latest value to other instances itself',
 	topic: 'built on the wrap\'s own publish, so a topic helper relays too',
 	now: 'falls back to the runtime clock',
 	monotonic: 'falls back to the runtime clock',

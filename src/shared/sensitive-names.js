@@ -42,9 +42,9 @@ const SENSITIVE_WORDS = new Set([
 	// Data-encryption and key-encryption keys. These acronyms are the names of
 	// the key material itself, not merely qualifiers for a following `key`.
 	'dek', 'kek',
-	// Card verification values. These are single words, so the compound set below
-	// is the wrong home for them: putting them there is exactly what let
-	// `cardCvv` and `cvvCode` ride a roster while a bare `cvv` was dropped.
+	// Card verification values. These are single words, so they belong here and
+	// not in the compound set below: a word match covers the bare `cvv` and every
+	// name that has it as one of its words, such as `cardCvv` and `cvvCode`.
 	'cvv', 'cvc'
 ]);
 
@@ -83,8 +83,8 @@ const SENSITIVE_COMPOUNDS = [
 	'nationalinsurance', 'aadhaarnumber', 'nhsnumber', 'medicalrecordnumber',
 	'maidenname', 'placeofbirth',
 	// Contact and date-of-birth PII. `phonenumber` and `mobilenumber` are the
-	// same datum as the word-matched `phone`; leaving them out is what made
-	// `phoneNumber` drop while `mobileNumber` and `phonenumber` rode along.
+	// same datum as the word-matched `phone`, so `phoneNumber`, `mobileNumber`
+	// and the flat `phonenumber` all get the same verdict.
 	'dateofbirth', 'birthdate', 'birthday', 'phonenumber', 'mobilenumber',
 	// Postal PII, named one compound at a time ON PURPOSE.
 	//
@@ -118,8 +118,8 @@ const EXACT_SENSITIVE_NAMES = new Set([
  * matching to agree with their camelCase and separator-delimited spellings.
  *
  * These are the long, unambiguous tokens only. `phone` is deliberately NOT
- * here - a substring match on it is what dropped `microphone`, `microphoneOn`
- * and `headphones` - and neither are the short ones (`cc` in `account`, `pin`
+ * here - a substring match on it would drop `microphone`, `microphoneOn` and
+ * `headphones` - and neither are the short ones (`cc` in `account`, `pin`
  * in `spinner`). Those stay word-matched, which is exactly the split that makes
  * both directions correct.
  */
@@ -172,7 +172,7 @@ const CREDENTIAL_KEY_QUALIFIERS = new Set([
 	'aws', 'stripe', 'host',
 	// `service` covers the two most damaging real-world instances: Supabase's
 	// `serviceRoleKey`, which bypasses row-level security, and GCP's
-	// `serviceAccountKey`. Both were broadcast to every peer on the roster.
+	// `serviceAccountKey`. Either one on a roster reaches every peer.
 	'service'
 ]);
 
@@ -202,11 +202,10 @@ const BENIGN_KEY_NOUNS = new Set([
  * Suffixes that keep a FLAT `author...` name in the display-identity family.
  *
  * `auth` is matched per word, and a flat lowercase name is one word, so
- * `authorid` was tested as a single token, failed the exact `AUTHOR_WORDS`
- * lookup and was dropped - while `authorId`, `author_id` and `AUTHOR_ID` all
- * passed. Same value, opposite verdicts, in the family this file works hardest
- * to keep on a roster. Matching an author word plus one of these identity
- * suffixes restores the flat spelling without admitting `authorization`, whose
+ * `authorid` is a single token that the exact `AUTHOR_WORDS` lookup does not
+ * match, while `authorId`, `author_id` and `AUTHOR_ID` split into words it
+ * does. Matching an author word plus one of these identity suffixes gives the
+ * flat spelling the same verdict without admitting `authorization`, whose
  * remainder (`ization`) is not one of them.
  */
 const AUTHOR_FLAT_SUFFIXES = new Set([
@@ -570,8 +569,8 @@ export function isSensitiveFieldName(name) {
 			if (flatContactIsSensitive(flat)) return true;
 			const ordinalFlat = stripWordOrdinal(flat);
 			if (ordinalFlat === 'key' || ordinalFlat === 'keys') return true;
-			// Inspect the FINAL key-looking segment. Taking the first stopped
-			// inside an owner such as `monkey` / `keyboard` and never reached the
+			// Inspect the FINAL key-looking segment. The first one can sit
+			// inside an owner such as `monkey` / `keyboard`, short of the
 			// credential suffix in `monkeystreamkey`.
 			const keyAt = flat.lastIndexOf('key');
 			if (keyAt !== -1) {
@@ -599,9 +598,9 @@ export function isSensitiveFieldName(name) {
 				const before = parts.length > 0
 					? parts.reduce((a, b) => (b.length > a.length ? b : a))
 					: ordinalHead;
-				// Only a flat name that is EXACTLY `key` is the bare case. Collapsing
-				// an unknown remainder into it instead made `keyboard` and `keycode`
-				// read as a bare key and drop, while their humped twins passed.
+				// Only a flat name that is EXACTLY `key` is the bare case. An unknown
+				// remainder stays its own segment, so `keyboard` and `keycode` get
+				// the same verdict as `keyBoard` and `keyCode`.
 				/** @type {string[]} */
 				const segmented = [];
 				if (before !== '') segmented.push(before);
@@ -816,9 +815,9 @@ export function exceedsDepth(value, maxDepth) {
 		// getter on userData runs OUR code on the app's terms, and one that
 		// throws here would surface out of `presence.join()` / `cursor.update()`
 		// - fire-and-forget calls with no caller to catch it. The sibling
-		// `JSON.stringify` on this same value is already wrapped; this walk was
-		// the one unguarded read left, and a getter that throws only on its
-		// SECOND call passes the stringify and then escapes from here.
+		// `JSON.stringify` on this same value is wrapped as well, and both must
+		// be: a getter that throws only on its SECOND call passes the stringify
+		// and would otherwise escape from here.
 		try {
 			if (Array.isArray(node)) {
 				for (let i = 0; i < node.length; i++) stack.push({ node: node[i], depth: depth + 1 });
@@ -840,11 +839,11 @@ export function exceedsDepth(value, maxDepth) {
  * gadgets (they would become properties of a wire object) and transport
  * metadata.
  *
- * The transport set is wider than the one name the runtime injects. Matching
- * only `remoteAddress` left the client IP crossing the boundary under two other
- * spellings this project's own documentation endorses: the ratelimit plugin
- * reads `ud.remoteAddress || ud.ip || ud.address` and documents `ip` and
- * `address` as client-IP slots, so an app following that convention published
+ * The transport set is wider than the one name the runtime injects. Beside
+ * `remoteAddress` it covers the two other client-IP spellings this project's
+ * own documentation endorses: the ratelimit plugin reads
+ * `ud.remoteAddress || ud.ip || ud.address` and documents `ip` and `address`
+ * as client-IP slots, and an app following that convention must not publish
  * every peer's IP on the roster.
  *
  * `headers`, `url` and `requestId` are here for the same reason. The case this
@@ -867,21 +866,21 @@ export function isStructurallyUnsafeFieldName(name) {
 	// are exactly what a roster is for, and `host` as a word would eat `hostId`
 	// on any meeting surface.
 	// The ordinal spellings too - `address1` and `address2` are the canonical
-	// form-field pair and both passed while the bare `address` dropped. Gated on
+	// form-field pair and get the same verdict as the bare `address`. Gated on
 	// the last character for the same reason as the word rule: the strip is for a
 	// minority of names and must not cost the majority a second lookup.
 	const joined = joinedFieldName(name);
 	if (TRANSPORT_EXACT_NAMES.has(joined)) return true;
 	if (endsWithDigit(joined) && TRANSPORT_EXACT_NAMES.has(stripTrailingDigits(joined))) return true;
 
-	// Word-matched names. Matching only the bare spellings left the client IP
-	// crossing under every qualified one - `clientIp`, `ipAddress`, `remoteIp`,
-	// `peerIp`, `remoteAddr` - while the unqualified `ip` was correctly dropped.
+	// Word-matched names. A word match covers the qualified client-IP
+	// spellings - `clientIp`, `ipAddress`, `remoteIp`, `peerIp`, `remoteAddr` -
+	// as well as the unqualified `ip`.
 	// `zip` and `zipCode` are unaffected: `zip` is its own word, not `ip`.
 	const words = fieldNameWords(name);
 	// A flat lowercase database/JSON spelling is one word, so the word rule
-	// above has the same third-spelling hole the credential rules had:
-	// `remoteIp` and `remote_ip` drop while `remoteip` rides. Recover only
+	// above cannot see `ip` inside `remoteip` the way it does in `remoteIp`
+	// and `remote_ip`, just as the credential rules need a flat pass. Recover only
 	// high-signal transport boundaries; a raw `includes('ip')` would take
 	// ordinary roster fields such as `zip`, `shipping`, `relationship`,
 	// `snippet`, `iphone` and `ipad`.
