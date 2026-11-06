@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 const ADVISORY = 'https://github.com/advisories/GHSA-gcqx-w48m-w2h4';
 const EXPIRES = '2026-11-30T00:00:00Z';
-const LOCK_DIGEST = '7eb336b6ac54bc25d572172c93678a8b84e05198be47083a82eee849bcee8bd9';
+const LOCK_DIGEST = '1ce41c7e56d7877f3a7b3ebf770eaaae4bd9c2f56296b88484a9bd9136d86879';
 
 // GHSA-gcqx-w48m-w2h4 (deepmerge prototype poisoning) reaches this tree only
 // through build tooling: Kit's Svelte plugin merges local configuration during

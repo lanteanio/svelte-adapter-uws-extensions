@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0-next.65] - 2026-11-06
+
+*Not published to npm; development candidate.*
+
 ### Breaking Changes
 
 - **The adapter peer floor is raised to `svelte-adapter-uws >= 0.6.0-next.97`, the release whose compatibility manifest names this version.** Upgrade both packages together.
